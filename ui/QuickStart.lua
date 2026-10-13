@@ -110,6 +110,8 @@ local function EnsureFrame()
     frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     frame:Hide()
 
+    -- Fallback if an older installation lacks the Theme module; StyleWindow
+    -- replaces this backdrop when the themed client is present.
     pcall(function()
         frame:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -120,12 +122,13 @@ local function EnsureFrame()
     end)
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    frame.title = title
     title:SetPoint("TOP", 0, -16)
-    title:SetText("|cff7fd5ffWelcome to Nexus|r")
+    title:SetText("Welcome to Nexus")
 
     local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.subtitle = subtitle
     subtitle:SetPoint("TOP", 0, -37)
-    subtitle:SetTextColor(0.7, 0.7, 0.7)
     subtitle:SetText("Plan your Echoes, then choose what to automate.")
 
     local body = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -188,6 +191,7 @@ local function EnsureFrame()
     orbs:SetSize(174,26);orbs:SetPoint("TOPRIGHT",-24,-250);orbs:SetText("Orbs / Lost Memories")
     orbs:SetScript("OnClick",function() Finish();if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end)
     local hint = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    frame.hint = hint
     hint:SetPoint("BOTTOMLEFT", 24, 22)
     hint:SetSize(290, 54)
     hint:SetJustifyH("LEFT")
@@ -199,13 +203,33 @@ local function EnsureFrame()
     close:SetText("Later")
     close:SetScript("OnClick", Finish)
 
+    local theme = Nexus.Theme
+    if theme then
+        if theme.StyleWindow then theme.StyleWindow(frame, 0.97) end
+        if theme.StyleTree then theme.StyleTree(frame) end
+        if theme.StyleLabel then
+            theme.StyleLabel(title, "accent")
+            theme.StyleLabel(subtitle, "muted")
+            theme.StyleLabel(body, "text")
+            theme.StyleLabel(hint, "muted")
+        end
+    end
+
     return frame
 end
 
-function M.Show() EnsureFrame():Show() end
+function M.Show()
+    if Nexus.OverwriteWarning and Nexus.OverwriteWarning.EnsureOnboarding() ~= "accepted" then return false end
+    EnsureFrame():Show()
+end
 
 -- Returns true when this window needs no further attention in this session.
 function M.ShowIfFirstTime()
+    if Nexus.OverwriteWarning then
+        local outcome = Nexus.OverwriteWarning.EnsureOnboarding()
+        if outcome == "pending" then return false end
+        if outcome == "declined" then return true end
+    end
     if dismissedThisSession then
         -- Closed earlier in this session, possibly before the saved-data
         -- owner was writable. Record it now if that is allowed by then. The

@@ -66,9 +66,9 @@ The live two-client test found different optional API availability: the full
 client's TradeSkillMaster compatibility shim removes hyphens and whitespace
 from `GetRealmName()`, returning `RogueLite(Live)`; the minimal client has no
 shim and sees `Rogue-Lite (Live)`. Both load the same private build. The sender's
-verified DPS payload preserves `valentiné@roguelite(live)`, but the recipient
+verified DPS payload preserves `origin@roguelite(live)`, but the recipient
 previously admitted it with `ownerKey=nil`, `ownerVerified=false`, and native
-transport `Valentiné-rogue-lite(live)`. The admission boundary discards the
+transport `Origin-rogue-lite(live)`. The admission boundary discards the
 unmatched owner claim; the serializer does not omit it.
 
 Native `WLD2` assembly now retains the actual game realm, independent of the

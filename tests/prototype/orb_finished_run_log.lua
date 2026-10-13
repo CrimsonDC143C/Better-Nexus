@@ -62,7 +62,8 @@ check(f.usage:GetText():find('10 / 10',1,true),'the completed usage stays visibl
 
 -- 3. The run log records every operation once, in order, with real fields.
 local before=H.Count('orb-spend')
-button('Run log',f):Click()
+-- The history is the window's own "Run history" page (it was a "Run log" button).
+button('Run history',f):Click()
 local log=assert(NexusOrbRunLog,'the run log window opens')
 check(log:IsShown(),'the run log is shown')
 check(H.Count('orb-spend')==before,'opening the log spends nothing')

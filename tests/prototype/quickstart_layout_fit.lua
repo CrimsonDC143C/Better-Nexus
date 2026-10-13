@@ -11,8 +11,8 @@ local T=dofile('tests/prototype/startup_support.lua');T.Load()
 local checks=0;local function check(v,m)assert(v,m);checks=checks+1 end
 
 local BODY="Already have a Saved Build? Assign the Wishlist you want it to follow. "..
- "|cffffd100With Auto ON, Nexus may replace the active Saved Build with a better finished run. "..
- "Keep Auto OFF to leave that slot unchanged.|r\n"..
+ "With Auto ON, Nexus may replace the active Saved Build with a better finished run. "..
+ "Keep Auto OFF to leave that slot unchanged.\n"..
  "Starting fresh? Import a Wishlist code or copy a Community build into an editable draft."
 local HINT="Reopen Help any time with /nexus help. Automation and Orb spending require separate explicit controls."
 local SUBTITLE="Plan your Echoes, then choose what to automate."
@@ -21,11 +21,16 @@ local BUTTONS={'Set up current build','Import / Create Wishlist','Browse Communi
 local MODELS={{name='default',char=5.5,line=12},{name='conservative',char=7.0,line=17}}
 
 Nexus.QuickStart.Show()
+H.Advance(5.01);NexusOverwriteWarning.yes:Click()
+Nexus.QuickStart.Show()
 local qs=assert(NexusQuickStart,'Quick Start window exists')
 local W,Ht=qs:GetWidth(),qs:GetHeight()
 local texts,buttons={},{}
 for _,c in ipairs(qs.children)do
- if c.kind=='FontString' then texts[c:GetText()]=c end
+ if c.kind=='FontString' then
+  local plain=c:GetText():gsub('|c%x%x%x%x%x%x%x%x',''):gsub('|r','')
+  texts[plain]=c
+ end
  if c.kind=='Button' then buttons[c:GetText()]=c end
 end
 local body,hint,subtitle=texts[BODY],texts[HINT],texts[SUBTITLE]

@@ -231,14 +231,21 @@ local function DB()
     -- Serving readiness can change without replacing the database or bundle
     -- (notably the startup seal). Do not retain its earlier read-only verdict.
     local catalog = Nexus and Nexus.BuildCatalog
-    local status = catalog and type(catalog.Status) == "function"
-        and catalog.Status() or nil
-    dbPolicyReadOnly = type(status) == "table" and status.readOnly == true
+    local readOnly, state
+    if catalog and type(catalog.ServingPolicy) == "function" then
+        readOnly, state = catalog.ServingPolicy()
+    else
+        local status = catalog and type(catalog.Status) == "function"
+            and catalog.Status() or nil
+        readOnly = type(status) == "table" and status.readOnly == true
+        state = type(status) == "table" and status.state or nil
+    end
+    dbPolicyReadOnly = readOnly == true
     if dbPolicyReadOnly then
         -- A root the catalog refuses (a catalog schema this build does not
         -- know, an invalid bundle) shows nothing. The copy is made once, when
         -- the catalog admits the root.
-        local admitted = status.state == "ROOT_ADMITTED"
+        local admitted = state == "ROOT_ADMITTED"
         if transientDbOwner ~= NexusDB
             or (admitted and dbBinding.projectedFor ~= NexusDB) then
             transientDbOwner = NexusDB
@@ -3514,6 +3521,18 @@ function DPS.GetCharacterBest(category, playerName, expectedOwnerKey,
     else
         row = playerName and FindCharacterRow(rows, name)
             or rows[CurrentCharacterKey(name)] or rows[PlayerKey(name)]
+        -- A normalized-realm shim may have appeared after this character's
+        -- native record was captured. Only the actual current native owner
+        -- may fill a missing default lookup; preserve both stored keys.
+        if not playerName and not row
+            and type(Identity.NativeChannelSender) == "function" then
+            local nativeSender = Identity.NativeChannelSender(name)
+            local nativeOwner = Identity.CanonicalOwnerFromTransport(nativeSender)
+            local nativeRow = nativeOwner and rows[nativeOwner] or nil
+            if nativeOwner and DPS.VerifiedOwnerKey(nativeRow) == nativeOwner then
+                row = nativeRow
+            end
+        end
     end
     if not row or (tonumber(row.dps) or 0) <= 0
         or not DPS.IsDurationEligible(category, row.duration) then return nil end

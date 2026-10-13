@@ -147,7 +147,8 @@ end
 -- database it serves and its binding generation (a rebind of the same
 -- object to another root or another binding changes the latter two), and
 -- the catalog's own agreement that this root still serves for the current
--- database and owner (ManualPreparationStatus().ownerAgrees). That agreement
+-- database and owner (SourceBinding, or ManualPreparationStatus().ownerAgrees
+-- on capability-less hosts). That agreement
 -- is the catalog's documented owner/source refusal: it is false once the
 -- saved root, one of its maps, the local owner, the binding or another
 -- admitted identity drifted from the admitted token
@@ -166,7 +167,14 @@ local function SourceOf(catalog)
         if not ok then return nil, "CATALOG_UNUSABLE" end
         database = value
     end
-    if type(catalog.ManualPreparationStatus) == "function" then
+    if type(catalog.SourceBinding) == "function" then
+        local ok, agrees, currentBinding, reason = pcall(catalog.SourceBinding)
+        if not ok then return nil, "CATALOG_UNUSABLE" end
+        if agrees ~= true then
+            return nil, tostring(reason or "OWNER_OR_GENERATION_MISMATCH")
+        end
+        binding = currentBinding
+    elseif type(catalog.ManualPreparationStatus) == "function" then
         local ok, status = pcall(catalog.ManualPreparationStatus)
         if not ok or type(status) ~= "table" then return nil, "CATALOG_UNUSABLE" end
         if status.ownerAgrees ~= true then
@@ -177,9 +185,11 @@ local function SourceOf(catalog)
     return {catalog=catalog, database=database, binding=binding}
 end
 
-local function SameSource(source)
+local function SameSource(source, current)
     if type(source) ~= "table" then return false end
-    local current = SourceOf(Catalog())
+    -- A caller may supply the passive snapshot it has just validated within
+    -- this operation. Never retain it for another read, pump or frame.
+    current = current or SourceOf(Catalog())
     return current ~= nil and current.catalog == source.catalog
         and current.database == source.database
         and current.binding == source.binding
@@ -723,7 +733,7 @@ local function CheckSource()
         return false
     end
     if (state.initialized or state.initializing) and not state.warmJob
-        and not SameSource(state.source) then
+        and not SameSource(state.source, current) then
         InvalidateSource()
     end
     return true

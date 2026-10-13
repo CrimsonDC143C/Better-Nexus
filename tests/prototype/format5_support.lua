@@ -26,6 +26,9 @@ end
 function F.Database(o)
  o=o or {}
  local db={settingsVersion=o.version or 5,
+  -- Existing data-contract fixtures represent already-acknowledged users.
+  -- Warning/reload tests explicitly remove these independent UI preferences.
+  overwriteWarnings={onboarding={version=1,suppressed=true},auto={version=1,suppressed=true}},
   settings={autoPick=false,autoSave=false,syncMode='manual',syncOnlyWhileResting=true,
    syncSuspendInCombat=true,syncSuspendedInstanceTypes={party=true,raid=true},
    syncDirectExperimental=false,communityRetentionTopAverage=40,communityRetentionMaxTotal=500,
@@ -73,6 +76,7 @@ function F.Boot(db,before,early)
   local s=Nexus.StartupStatus()
   if s.state~='pending' then break end
  end
+ if not H.keepOverwriteWarningPrompts then H.AcknowledgeOverwriteWarnings()end
  return H
 end
 -- Offline module reload with round-tripped literal data (not a client reload).

@@ -99,6 +99,8 @@ CreateFrame('ScrollFrame','ProjectEbonholdEchoJournalScroll',journal)
 CreateFrame('Button','ProjectEbonholdEchoJournalTab1',journal)
 assert(Nexus.JournalTab.TryInstall(function()return {sections={{title='Tome levers',lines={'lever 12345: disable'}}}}end))
 NexusJournalTab:Click();Nexus.JournalTab.Refresh()
+-- The provider sections sit behind the page's own Show details button.
+for _,b in ipairs(H.frames)do if b.kind=='Button' and b:GetText()=='Show details' then b:Click() end end
 check(texts():find("server's supported level and state",1,true),'T47 actual Journal note')
 check(texts():find('Echo availability controls',1,true) and texts():find('Echo-availability control #12345',1,true),'T28 Journal producer -> fontstrings')
 check(not texts():find('level-1-only',1,true),'incorrect categorical level claim absent')

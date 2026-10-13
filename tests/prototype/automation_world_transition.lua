@@ -31,6 +31,7 @@ local function Boot(before)
  local factory=Nexus.MainInternals.AutomationRuntime;local new=factory.New
  factory.New=function(...)H.runtime=new(...);return H.runtime end
  H.Fire('ADDON_LOADED','Nexus');H.Fire('PLAYER_ENTERING_WORLD');H.Advance(20,.05)
+ H.AcknowledgeOverwriteWarnings()
  assert(H.runtime,'runtime instance captured')
  assert(Nexus.GameAdapter.SetLoadoutWishlistIdentity(1,'Assigned plan',{{spellId=200001,quality=1,stacks=2}}),'assign the plan')
  -- Board actions the service accepted (the policy picks which one).

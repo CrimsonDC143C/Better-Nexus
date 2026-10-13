@@ -412,6 +412,45 @@ function AUTO_LABEL.Fit(force)
     return autoBtn._nexusFit
 end
 
+-- Only the new compact navigation label needs to share the existing Orb row.
+-- Cache its private font fit by base font, label and width; shared fonts and
+-- the Open Orbs control are unchanged. No measurement on an unchanged render.
+function M.FitOrbMiniButton(button)
+    local layout = Nexus.LayoutMetrics
+    local base = layout and _G[layout.FontObject("small")]
+    if not (button and base and type(base.GetFont) == "function") then return end
+    local ok, path, size, flags = pcall(base.GetFont, base)
+    size = ok and tonumber(size) or nil
+    if not (path and size) then return end
+    local budget = button:GetWidth() - 20
+    local label = button:GetText() or ""
+    local key = table.concat({path,tostring(size),flags or "",label,tostring(budget)}, "|")
+    if button._nexusMiniFitKey == key then return button._nexusMiniFit end
+    local font = button._nexusMiniFont
+    if not font and type(CreateFont) == "function" then
+        local made, value = pcall(CreateFont, "NexusHudOrbMiniFont")
+        if made and value then font = value; button._nexusMiniFont = font end
+    end
+    if not font then return end
+    local probe = button._nexusMiniProbe
+    if not probe then
+        probe = button:CreateFontString(nil, "OVERLAY")
+        probe:Hide(); button._nexusMiniProbe = probe
+    end
+    local fitSize, measured = size, 0
+    for _ = 1, 8 do
+        pcall(font.SetFont, font, path, fitSize, flags or "")
+        probe:SetFontObject(font); probe:SetText(label)
+        measured = tonumber(probe:GetStringWidth()) or 0
+        if measured <= budget or fitSize <= 8 then break end
+        fitSize = math.max(8, math.floor(fitSize * budget / measured))
+    end
+    SetOwnedButtonFont(button, font)
+    button._nexusMiniFitKey = key
+    button._nexusMiniFit = {width=measured,budget=budget,size=fitSize,fits=measured<=budget}
+    return button._nexusMiniFit
+end
+
 function M.ApplyOwnedFonts()
     local layout = Nexus.LayoutMetrics
     if not (layout and frame) then return false end
@@ -438,6 +477,7 @@ function M.ApplyOwnedFonts()
             leaderboardBtn,menuBtn,
         }) do SetOwnedButtonFont(widget, normal) end
         SetOwnedButtonFont(frame._orbsBtn, small)
+        SetOwnedButtonFont(frame._orbMiniBtn, small)
         -- The Auto button then takes its own fitted font (AUTO_LABEL.Fit);
         -- if none can be made it keeps the owned normal font above.
         AUTO_LABEL.Fit(true)
@@ -642,6 +682,8 @@ local function EnsureFrame()
     -- expand this into the primary status card so the familiar server metrics
     -- remain the most visible information.
     worldStatusBox = CreateFrame("Frame", nil, frame)
+    -- Protected card: no style or colour choice repaints it (Theme.Exempt).
+    worldStatusBox._nexusThemeExempt = true
     worldStatusBox:SetFrameLevel(frame:GetFrameLevel() + 3)
     pcall(function()
         worldStatusBox:SetBackdrop({
@@ -796,6 +838,23 @@ local function EnsureFrame()
     orbsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     orbsBtn:Hide()
     frame._orbsBtn = orbsBtn
+
+    local orbMiniBtn = CreateFrame("Button", nil, rollArea, "UIPanelButtonTemplate")
+    orbMiniBtn:SetSize(118, 17)
+    orbMiniBtn:SetPoint("RIGHT", orbsBtn, "LEFT", -6, 0)
+    orbMiniBtn:SetText("Orb mini panel")
+    orbMiniBtn:SetScript("OnClick", function()
+        if Nexus.OrbPanel and Nexus.OrbPanel.ShowMini then Nexus.OrbPanel.ShowMini() end
+    end)
+    orbMiniBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Orb mini panel", 1, 0.82, 0)
+        GameTooltip:AddLine("Opens compact Orb run status. It starts or spends nothing.", 0.85, 0.85, 0.85, true)
+        GameTooltip:Show()
+    end)
+    orbMiniBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    orbMiniBtn:Hide()
+    frame._orbMiniBtn = orbMiniBtn
 
     recText = rollArea:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     recText:SetPoint("TOPLEFT", 2, -64)
@@ -1130,6 +1189,15 @@ local function EnsureFrame()
             { text = "Orbs / Lost Memories", notCheckable = true,
               func = MenuAction(function() if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end) },
             {
+                -- Opens the style and colour choices as their own menu.
+                text = "Appearance: " .. ((Nexus.Theme and Nexus.Theme.Summary)
+                    and Nexus.Theme.Summary() or "default") .. "...",
+                notCheckable = true,
+                func = MenuAction(function()
+                    if Nexus.Theme and Nexus.Theme.ShowMenu then Nexus.Theme.ShowMenu(self) end
+                end),
+            },
+            {
                 -- Never disabled: the Releases page and the installed build are
                 -- available with no report, no peer and no Community catalog.
                 text = (Nexus.Updates and Nexus.Updates.Status)
@@ -1208,7 +1276,7 @@ local function EnsureFrame()
     menuBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
         GameTooltip:AddLine("Nexus Settings", 1, 1, 1)
-        GameTooltip:AddLine("Performance display, wishlist tools, HUD mode, and panel settings.", 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine("Performance display, wishlist tools, HUD mode, appearance, and panel settings.", 0.8, 0.8, 0.8, true)
         -- model.status (Main.lua's statusLine, including "error (see /nexus
         -- err)") was set on every render but never read anywhere in this file --
         -- surfaced here so a real error is visible without knowing the slash
@@ -1282,6 +1350,10 @@ local function EnsureFrame()
         frame:SetBackdropColor(0.035, 0.035, 0.05, 0.94)
         frame:SetBackdropBorderColor(0.28, 0.28, 0.34, 0.9)
     end)
+
+    -- The HUD shares appearance with the Orb windows. Its marked difficulty /
+    -- Soul Ash child keeps its own backdrop and never joins the theme registry.
+    if Nexus.Theme and Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(frame, 0.94) end
 
     frame._footerButtons = {
         auto=autoBtn,builds=buildsBtn,leaderboard=leaderboardBtn,
@@ -1661,6 +1733,14 @@ local function ApplyPanelLayout(layout, completed)
             button:ClearAllPoints()
             button:SetPoint("BOTTOMRIGHT", rollArea, "BOTTOMRIGHT", -inset, math.ceil(layout.gap/2))
             button:SetSize(layout.orbButtonW, layout.orbButtonH)
+            local miniButton = frame._orbMiniBtn
+            if miniButton then
+                miniButton:ClearAllPoints()
+                miniButton:SetPoint("RIGHT", button, "LEFT", -layout.orbMiniButtonGap, 0)
+                miniButton:SetSize(layout.orbMiniButtonW, layout.orbButtonH)
+                miniButton:SetText(layout.orbMiniButtonLabel)
+                M.FitOrbMiniButton(miniButton)
+            end
         end
         recText:ClearAllPoints()
         recText:SetPoint("TOPLEFT", rollArea, "TOPLEFT", inset, -recY)
@@ -1895,6 +1975,7 @@ local function ApplyModel(model, signatures, roll)
             frame._orbsBtn:Hide()
         end
     end
+    SetVisible(frame._orbMiniBtn, frame._orbsBtn and frame._orbsBtn:IsShown())
 
     missingNamesCache = type(pr.missing) == "table" and pr.missing or {}
     shedNamesCache = type(pr.shed) == "table" and pr.shed or {}

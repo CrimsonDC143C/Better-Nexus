@@ -1,6 +1,7 @@
 -- Nexus: ui/JournalTab.lua
--- An "Nexus Advisor" tab inside ProjectEbonhold's Echo Journal, rendering
--- plain text sections supplied by an injected dataProvider callback.
+-- A "Nexus Progress" tab (formerly "Nexus Advisor") inside ProjectEbonhold's
+-- Echo Journal: a read-only Build Progress summary first, then the plain text
+-- sections supplied by an injected dataProvider callback behind Show details.
 -- Structures relied on (captured live against this exact client):
 --   frame  ProjectEbonholdEchoJournal
 --   tabs   ProjectEbonholdEchoJournalTab1..N (CharacterFrameTabButton
@@ -36,6 +37,35 @@ local linePool, linesUsed = {}, 0
 local ASSET ="Interface\\AddOns\\ProjectEbonhold\\assets\\"
 local NOTE1 = "Compares the assigned Wishlist with the ACTIVE Saved Build."
 local NOTE2 = "|cff8a8a8aSet associations in My Builds. Saved Build activation requires the server's supported level and state.|r"
+-- Build Progress (the tab was "Nexus Advisor"): a short read-only intro, the
+-- takeaway and display-only Echo rows first, every provider section unchanged
+-- behind Show details. The full explanations sit in the intro tooltip and in
+-- the details. The page only reads.
+local TAB_LABEL = "Nexus Progress"
+local HEADER = "Build Progress"
+local INTRO = "Assigned Wishlist vs active Saved Build. Read-only."
+local PURPOSE = "See what your assigned Wishlist still needs. This page only shows information: opening it "
+    .. "does not roll, spend Orbs, lock Echoes, or save or activate a Saved Build."
+local FAMILY_NOTE = "Family coverage, not copies: a family counts as represented once one copy is known, "
+    .. "so it may still need more requested copies."
+local NO_TARGET = "No Wishlist is assigned. Assign one in My Builds to see its progress."
+local MISSING_EXPLAIN = "no known copy of this requested Echo family."
+local OFF_EXPLAIN = "in the active Saved Build, but the assigned Wishlist does not request this family."
+-- The off-Wishlist list is filled only from an active Saved Build whose
+-- contents are confirmed, and it arrives empty when none was. An empty list
+-- therefore shows nothing about the Saved Build, so it is never shown as 0.
+local OFF_LISTED = "Off Wishlist: families in the active Saved Build that the assigned Wishlist does not request."
+local OFF_NONE = "Off Wishlist: none listed. These families are listed only when the active Saved Build's "
+    .. "contents are confirmed, so an empty list can also mean nothing was compared yet (for example "
+    .. "on a first run). It does not show that there are none."
+local OFF_UNAVAILABLE = "Off Wishlist: unavailable. The list of these families could not be read, "
+    .. "so nothing is assumed about them."
+local NEUTRAL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+local ROW_H, TILE = 26, 24
+local detailsShown = false
+local detailsButton, buildsButton, introHover, countsHover
+local rowPool, rowsUsed = {}, 0
+local DeselectOurTab
 -- Assignment only records the target. The automatic save (Auto ON, autoSave,
 -- Ratchet.Dominates) is what may replace the active Saved Build. A changed
 -- assignment marks the projection dirty, so at level 80 with a finished run
@@ -73,21 +103,357 @@ local function AcquireLine()
     return fs
 end
 
+-- The provider section with this title (or title prefix), if any.
+local function Section(sections, title, prefix)
+    for i = 1, #sections do
+        local sec = sections[i]
+        local t = type(sec) == "table" and tostring(sec.title or "") or ""
+        if t == title or (prefix and t:sub(1, #title) == title) then return sec end
+    end
+end
+
+-- The provider's Target line, read only in the exact form JournalData writes
+-- it. Counts are taken from the anchored end, never from the Wishlist name.
+local TARGET_COUNTS = ": (%d+) Echo families %-%- (%d+) represented, (%d+) missing, "
+    .. "(%d+) off%-Wishlist families in the saved build$"
+local TARGET_TAGS = { [""] = true, [" (Echo Wishlist build)"] = true, [" (active loadout)"] = true }
+-- The explanations JournalData appends to an off-Wishlist family name.
+local OFF_SUFFIXES = { "  (not on the target plan; compare after the next run)",
+    "  (a later run may reduce these extras)" }
+local NOTES_FIRST = "Compares the assigned Wishlist with the active Saved Build; "
+    .. "planned locked targets are not proof of ownership."
+-- The estimate texts JournalData and Ratchet.RunsEstimate write when there is
+-- nothing to estimate: no Wishlist, no requested family, or no result.
+local NO_ESTIMATE = { ["no estimate (advisor mode)"] = true, ["estimate unavailable"] = true,
+    ["no wishlist target - advisor mode"] = true }
+local UNKNOWN_NO_PENDING = "the list of missing families was not received."
+local UNKNOWN_BAD_PENDING = "the list of missing families could not be read or does not match its count."
+local UNKNOWN_CONTRADICTORY = "the supplied counts and lists do not agree."
+local UNKNOWN_GRAMMAR = "the Wishlist summary line could not be read."
+
+-- A provider list, or nil unless it is a plain sequence of non-empty strings.
+local function TextLines(lines)
+    if type(lines) ~= "table" then return nil end
+    local count = 0
+    for _ in pairs(lines) do count = count + 1 end
+    if count ~= #lines then return nil end
+    for i = 1, #lines do
+        if type(lines[i]) ~= "string" or lines[i] == "" then return nil end
+    end
+    return lines
+end
+
+-- What the provider's sections establish, and nothing more. `known` needs the
+-- Target counts in their exact form, one Pending list matching its title and
+-- those counts, and an off-Wishlist list that does not contradict them. Any
+-- gap or disagreement leaves the family progress unknown. A family is
+-- represented when one copy is known; copies are never compared here.
+local function Summarize(sections)
+    local s = {}
+    local target = Section(sections, "Target")
+    local first = target and type(target.lines) == "table" and target.lines[1]
+    if type(first) ~= "string" or first == "" then return s end
+    if first:find("No wishlist set", 1, true) == 1 then s.noTarget = true return s end
+    s.targetLine = first
+
+    local pendingSec, pendingSections = nil, 0
+    for i = 1, #sections do
+        local sec = sections[i]
+        if type(sec) == "table" and tostring(sec.title or ""):sub(1, 7) == "Pending" then
+            pendingSec = pendingSec or sec
+            pendingSections = pendingSections + 1
+        end
+    end
+    local pending, n
+    if pendingSec then
+        n = tonumber(tostring(pendingSec.title):match("^Pending %((%d+)%)$"))
+        pending = TextLines(pendingSec.lines)
+    end
+    local offSec = Section(sections, "Extra copies compared with the plan")
+    local off = offSec and TextLines(offSec.lines)
+
+    local at, _, total, rep, miss, offN = first:find(TARGET_COUNTS)
+    local head = at and first:sub(1, at - 1)
+    local name, tag
+    if head then name, tag = head:match("^Wishlist '(.*)'(.*)$") end
+    total, rep, miss, offN = tonumber(total), tonumber(rep), tonumber(miss), tonumber(offN)
+    if pendingSections > 1 then s.problem = UNKNOWN_CONTRADICTORY
+    elseif not pendingSec then s.problem = UNKNOWN_NO_PENDING
+    elseif not (n and pending and #pending == n) then s.problem = UNKNOWN_BAD_PENDING
+    elseif not (name and TARGET_TAGS[tag]) then s.problem = UNKNOWN_GRAMMAR
+    elseif total ~= rep + miss or miss ~= n or (off and #off ~= offN) then
+        s.problem = UNKNOWN_CONTRADICTORY
+    else
+        s.known, s.title, s.pending, s.off = true, head, pending, off
+        s.total, s.represented, s.missing, s.offCount = total, rep, miss, offN
+    end
+    return s
+end
+
+-- The first line of the page: what is still missing, or why that is unknown.
+local function Takeaway(s)
+    if s.noTarget then return NO_TARGET end
+    if not s.targetLine then
+        return "Build Progress is unavailable: the Wishlist summary line is missing. "
+            .. "The lines that were received are under Show details."
+    end
+    if not s.known then
+        return "Family progress is unknown: " .. s.problem
+            .. " Nothing is treated as complete; the original lines are under Show details."
+    end
+    -- A Wishlist that requests no family has no family progress, so nothing
+    -- is said to be represented or missing.
+    if s.total == 0 then
+        return "This Wishlist requests no Echo families, so there is no family progress to show."
+    end
+    local names = s.pending
+    if #names == 0 then
+        return "No requested Echo family is missing: each has at least one known copy. "
+            .. "That is family coverage, not copy completeness; requested copies may still be missing."
+    end
+    local shown = {}
+    for i = 1, math.min(3, #names) do shown[i] = names[i] end
+    return "Still missing " .. #names .. (#names == 1 and " Echo family: " or " Echo families: ")
+        .. table.concat(shown, ", ") .. (#names > 3 and (" and " .. (#names - 3) .. " more") or "") .. "."
+end
+
+-- The Notes estimate, only in the exact two-line form JournalData writes. The
+-- raw Notes section stays unchanged in the details either way.
+local function EstimateLine(sections)
+    local notes = Section(sections, "Notes")
+    local lines = notes and TextLines(notes.lines)
+    if not (lines and #lines == 2 and lines[1] == NOTES_FIRST) then return nil end
+    local est = lines[2]
+    if NO_ESTIMATE[est] then return "Estimate: unavailable." end
+    return "Estimate, not a prediction: " .. est
+        .. ". Based only on what is known to be missing; no future offer is assumed."
+end
+
+-- An off-Wishlist line is a family name plus one of the provider's known
+-- explanations. With any other ending the whole line is the label.
+local function SplitOffLine(line)
+    for i = 1, #OFF_SUFFIXES do
+        local suffix = OFF_SUFFIXES[i]
+        if #line > #suffix and line:sub(-#suffix) == suffix then
+            return line:sub(1, #line - #suffix)
+        end
+    end
+    return line
+end
+
+local function CurrentCatalog()
+    local A = Nexus.GameAdapter
+    if not (A and type(A.Catalog) == "function") then return nil end
+    local ok, catalog = pcall(A.Catalog)
+    return ok and type(catalog) == "table" and catalog or nil
+end
+
+-- Row icons. A name resolves only when it is exactly one catalog family's
+-- name; the icon is the GetSpellInfo texture of a member linked back to that
+-- family. The name index is built once per catalog table (a rebuilt catalog
+-- is a new table), not on each refresh. Anything else, including a name two
+-- families share, gets the neutral tile. Nothing here requests or changes
+-- anything.
+local iconIndex = {}
+
+local function FamilyIcon(catalog, name)
+    if type(catalog) ~= "table" or type(name) ~= "string" or name == "" then return nil end
+    local names, members = catalog.familyName, catalog.familyMembers
+    local familyOf, rows = catalog.familyOf, catalog.rows
+    if type(names) ~= "table" or type(members) ~= "table" or type(familyOf) ~= "table"
+        or type(rows) ~= "table" then return nil end
+    if iconIndex.catalog ~= catalog then
+        local byName = {}
+        for key, familyName in pairs(names) do
+            if type(familyName) == "string" and familyName ~= "" then
+                byName[familyName] = byName[familyName] == nil and key or false
+            end
+        end
+        iconIndex.catalog, iconIndex.byName, iconIndex.icons = catalog, byName, {}
+    end
+    local icon = iconIndex.icons[name]
+    if icon == nil then
+        icon = false
+        local key = iconIndex.byName[name]
+        local list = key and members[key]
+        if type(list) == "table" and type(GetSpellInfo) == "function" then
+            for i = 1, #list do
+                local id = list[i]
+                local row = rows[id]
+                if type(id) == "number" and familyOf[id] == key and type(row) == "table" and row.spellId == id then
+                    local ok, _, _, texture = pcall(GetSpellInfo, id)
+                    if ok and ((type(texture) == "string" and texture ~= "") or type(texture) == "number") then
+                        icon = texture
+                        break
+                    end
+                end
+            end
+        end
+        iconIndex.icons[name] = icon
+    end
+    return icon or nil
+end
+
+-- Display-only Echo rows in the Orb history's visual language: a subtle
+-- separator, the icon tile on the left, the family text and a short status
+-- word. Frames and scripts are created once and reused on every refresh; the
+-- complete text is always in the row tooltip.
+local function RowEnter(self)
+    if self.hover then self.hover:Show() end
+    if not (GameTooltip and self.tipName) then return end
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine(self.tipName, 1, 1, 1, true)
+    GameTooltip:AddLine(self.tipStatus, 0.82, 0.82, 0.82, true)
+    if self.tipRaw then GameTooltip:AddLine("Source text: " .. self.tipRaw, 0.82, 0.82, 0.82, true) end
+    if self.tipIcon then GameTooltip:AddLine(self.tipIcon, 0.6, 0.6, 0.6, true) end
+    GameTooltip:Show()
+end
+
+local function RowLeave(self)
+    if self.hover then self.hover:Hide() end
+    if GameTooltip then GameTooltip:Hide() end
+end
+
+local function AcquireRow()
+    rowsUsed = rowsUsed + 1
+    local row = rowPool[rowsUsed]
+    if not row then
+        row = CreateFrame("Frame", nil, child)
+        row:SetHeight(ROW_H)
+        row:EnableMouse(true)
+        row.hover = row:CreateTexture(nil, "BACKGROUND")
+        row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.hover:SetAllPoints(row)
+        row.hover:SetVertexColor(0.30, 0.40, 0.52, 0.18)
+        row.separator = row:CreateTexture(nil, "BORDER")
+        row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.separator:SetHeight(1)
+        row.separator:SetPoint("BOTTOMLEFT", 0, 0)
+        row.separator:SetPoint("BOTTOMRIGHT", 0, 0)
+        row.separator:SetVertexColor(0.22, 0.24, 0.28, 0.55)
+        row.tile = row:CreateTexture(nil, "ARTWORK")
+        row.tile:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.tile:SetSize(TILE, TILE)
+        row.tile:SetPoint("LEFT", 2, 0)
+        row.tile:SetVertexColor(0.08, 0.10, 0.13, 0.95)
+        row.icon = row:CreateTexture(nil, "OVERLAY")
+        row.icon:SetSize(TILE - 4, TILE - 4)
+        row.icon:SetPoint("CENTER", row.tile, "CENTER", 0, 0)
+        row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+        row.status = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.status:SetPoint("RIGHT", -4, 0)
+        row.status:SetWidth(78)
+        row.status:SetJustifyH("RIGHT")
+        row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.label:SetPoint("LEFT", row.tile, "RIGHT", 6, 0)
+        row.label:SetPoint("RIGHT", row.status, "LEFT", -6, 0)
+        row.label:SetJustifyH("LEFT")
+        -- Both texts keep one line at the row's height, so neither can grow
+        -- into the next row; the row tooltip has the complete name.
+        if Nexus.LayoutMetrics then
+            pcall(Nexus.LayoutMetrics.OneLineLabel, row.label, nil, ROW_H - 6)
+            pcall(Nexus.LayoutMetrics.OneLineLabel, row.status, nil, ROW_H - 6)
+        end
+        row:SetScript("OnEnter", RowEnter)
+        row:SetScript("OnLeave", RowLeave)
+        rowPool[rowsUsed] = row
+    end
+    row.hover:Hide()
+    row:Show()
+    return row
+end
+
+-- The short intro keeps the full purpose and notes in its tooltip.
+local function IntroHover()
+    if introHover then return introHover end
+    introHover = CreateFrame("Frame", nil, child)
+    introHover:EnableMouse(true)
+    introHover:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine(HEADER, 1, 0.82, 0)
+        GameTooltip:AddLine(PURPOSE, 0.82, 0.82, 0.82, true)
+        GameTooltip:AddLine(NOTE1, 0.82, 0.82, 0.82, true)
+        GameTooltip:AddLine(NOTE2, 0.82, 0.82, 0.82, true)
+        GameTooltip:AddLine(FAMILY_NOTE, 0.82, 0.82, 0.82, true)
+        GameTooltip:Show()
+    end)
+    introHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return introHover
+end
+
+-- The counts line explains itself in a tooltip, including what an empty or
+-- unreadable off-Wishlist list does and does not show.
+local function CountsHover()
+    if countsHover then return countsHover end
+    countsHover = CreateFrame("Frame", nil, child)
+    countsHover:EnableMouse(true)
+    countsHover:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Wishlist family counts", 1, 0.82, 0)
+        GameTooltip:AddLine(FAMILY_NOTE, 0.82, 0.82, 0.82, true)
+        if self.offTip then GameTooltip:AddLine(self.offTip, 0.82, 0.82, 0.82, true) end
+        GameTooltip:Show()
+    end)
+    countsHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return countsHover
+end
+
+-- The page's two buttons, created once in the scrolled content.
+local function PageButton(kind)
+    local b = kind == "details" and detailsButton or buildsButton
+    if b then return b end
+    b = CreateFrame("Button", nil, child, "UIPanelButtonTemplate")
+    if kind == "details" then
+        detailsButton = b
+        b:SetSize(112, 22)
+        b:SetScript("OnClick", function()
+            detailsShown = not detailsShown
+            M.Refresh()
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine(detailsShown and "Hide details" or "Show details", 1, 1, 1)
+            GameTooltip:AddLine("The full page notes and every section as received, unchanged: target, pending, "
+                .. "extra copies, Echo availability controls, notes, estimate and version.", 0.82, 0.82, 0.82, true)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    else
+        buildsButton = b
+        b:SetSize(150, 22)
+        b:SetText("Assign in My Builds")
+        b:SetScript("OnClick", function()
+            pcall(function() if panel and panel:IsShown() then DeselectOurTab(true) end end)
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Assign in My Builds", 1, 1, 1)
+            GameTooltip:AddLine("Closes this page onto the Journal's own assignment controls. " .. ASSIGN_NOTE,
+                0.82, 0.82, 0.82, true)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    end
+    return b
+end
+
 local function DoRefresh()
-    local data
+    local data, failed
     if type(provider) == "function" then
         local okP, res = pcall(provider)
-        if okP and type(res) == "table" then data = res end
+        if okP and type(res) == "table" then data = res elseif not okP then failed = true end
     end
 
-    linesUsed = 0
+    linesUsed, rowsUsed = 0, 0
     local width = math.floor((scroll and scroll:GetWidth()) or 0)
     if width < 100 then width = 292 end
     width = width - 12
     local cy = -6
+    local catalog, catalogRead = nil, false
 
-    local function AddLine(text, font, indent)
-        text=Nexus.UserText and Nexus.UserText.Message(text) or text
+    -- `plain` keeps provider names exactly as supplied (no public rewording).
+    local function AddLine(text, font, indent, plain)
+        if not plain then text = Nexus.UserText and Nexus.UserText.Message(text) or text end
         indent = indent or 0
         local fs = AcquireLine()
         fs:SetFontObject(font or "GameFontHighlightSmall")
@@ -101,37 +467,148 @@ local function DoRefresh()
         local h = fs:GetStringHeight()
         if not h or h < 12 then h = 12 end
         cy = cy - h - 2
+        return fs
     end
 
-    AddLine(NOTE1, "GameFontNormalSmall")
-    AddLine(NOTE2)
-    cy = cy - 6
+    -- One display-only row for a supplied family name. `name` is looked up
+    -- for an icon by exact family name only; `raw` is the provider's line.
+    local function AddRow(name, status, explain, raw)
+        if not catalogRead then catalog, catalogRead = CurrentCatalog(), true end
+        local icon = FamilyIcon(catalog, name)
+        local row = AcquireRow()
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", child, "TOPLEFT", 6, cy)
+        row:SetWidth(width)
+        row.icon:SetTexture(icon or NEUTRAL_ICON)
+        row.icon:SetAlpha(icon and 1 or 0.5)
+        row.label:SetText(name)
+        row.status:SetText(status)
+        if status == "Missing" then row.status:SetTextColor(1, 0.63, 0.25)
+        else row.status:SetTextColor(0.62, 0.70, 0.80) end
+        row.tipName, row.tipStatus = name, status .. ": " .. explain
+        row.tipRaw = raw ~= name and raw or nil
+        row.tipIcon = not icon and "No single Echo family has exactly this name, so a neutral icon is shown."
+            or nil
+        cy = cy - ROW_H
+    end
+
+    AddLine(HEADER, "GameFontNormal")
+    local intro = AddLine(INTRO)
+    local hover = IntroHover()
+    hover:ClearAllPoints()
+    hover:SetPoint("TOPLEFT", intro, "TOPLEFT", 0, 0)
+    hover:SetPoint("BOTTOMRIGHT", intro, "BOTTOMRIGHT", 0, 0)
+    hover:Show()
+    cy = cy - 4
 
     local sections = data and data.sections
-    if type(sections) ~= "table" or #sections == 0 then
-        AddLine("|cff8a8a8ano data yet|r")
+    local hasSections = type(sections) == "table" and #sections > 0
+    local s = hasSections and Summarize(sections) or {}
+    local noTarget = s.noTarget == true
+    local countsShown = false
+    if hasSections then
+        AddLine(Takeaway(s), "GameFontNormalSmall", nil, true)
+        if s.known and #s.pending > 0 then AddLine("|cff8a8a8a" .. FAMILY_NOTE .. "|r") end
+        if s.known then
+            AddLine(s.title, nil, 8, true)
+            -- A listed count is shown as supplied; an empty list is "none
+            -- listed", never 0 (see OFF_NONE).
+            local off, offTip = "|cff9eb2c8Off Wishlist:|r unavailable", OFF_UNAVAILABLE
+            if s.off and #s.off > 0 then off, offTip = "|cff9eb2c8Off Wishlist|r " .. s.offCount, OFF_LISTED
+            elseif s.off then off, offTip = "|cff9eb2c8Off Wishlist:|r none listed", OFF_NONE end
+            local counts = AddLine("|cff7fd17fRepresented|r " .. s.represented .. " of " .. s.total
+                .. "   |cffffa040Missing|r " .. s.missing .. "   " .. off, nil, 8, true)
+            local hit = CountsHover()
+            hit:ClearAllPoints()
+            hit:SetPoint("TOPLEFT", counts, "TOPLEFT", 0, 0)
+            hit:SetPoint("BOTTOMRIGHT", counts, "BOTTOMRIGHT", 0, 0)
+            hit.offTip = offTip
+            hit:Show()
+            countsShown = true
+        elseif s.targetLine then
+            -- Unknown form or contradicted counts: the raw line, as supplied.
+            AddLine(s.targetLine, nil, 8, true)
+        end
+    elseif failed then
+        AddLine("|cff8a8a8aBuild Progress data could not be read. Nothing is assumed.|r")
     else
-        for i = 1, #sections do
-            local sec = sections[i]
-            if type(sec) == "table" then
-                AddLine(tostring(sec.title or ""), "GameFontNormalSmall")
-                local lines = sec.lines
-                if type(lines) == "table" then
-                    for j = 1, #lines do
-                        AddLine(tostring(lines[j] or ""), nil, 8)
+        AddLine("|cff8a8a8ano data yet|r")
+    end
+    if countsHover and not countsShown then countsHover:Hide() end
+
+    -- Only the families the provider names. The represented families are a
+    -- count in the line above: the provider does not list them.
+    if s.known and #s.pending > 0 then
+        cy = cy - 4
+        AddLine("Missing (" .. #s.pending .. ")", "GameFontNormalSmall")
+        for i = 1, #s.pending do AddRow(s.pending[i], "Missing", MISSING_EXPLAIN, s.pending[i]) end
+    end
+    if s.known and s.off and #s.off > 0 then
+        cy = cy - 4
+        AddLine("Off Wishlist (" .. #s.off .. ")", "GameFontNormalSmall")
+        for i = 1, #s.off do AddRow(SplitOffLine(s.off[i]), "Off Wishlist", OFF_EXPLAIN, s.off[i]) end
+    end
+    local estimate = s.targetLine and EstimateLine(sections)
+    if estimate then
+        cy = cy - 4
+        AddLine("|cff8a8a8a" .. estimate .. "|r", nil, nil, true)
+    end
+    cy = cy - 4
+
+    -- Show details keeps the full notes, every provider section, the estimate
+    -- and the version; Assign in My Builds closes this page onto the Journal's
+    -- own assignment controls, exactly like a second click on the tab.
+    local toggle = PageButton("details")
+    toggle:ClearAllPoints()
+    toggle:SetPoint("TOPLEFT", child, "TOPLEFT", 6, cy)
+    toggle:SetText(detailsShown and "Hide details" or "Show details")
+    toggle:Show()
+    local builds = PageButton("builds")
+    if noTarget then
+        builds:ClearAllPoints()
+        builds:SetPoint("TOPLEFT", child, "TOPLEFT", 124, cy)
+        builds:Show()
+    else
+        builds:Hide()
+    end
+    cy = cy - 30
+
+    if detailsShown then
+        AddLine("About this page", "GameFontNormalSmall")
+        AddLine(PURPOSE, nil, 8)
+        AddLine(NOTE1, nil, 8)
+        AddLine(NOTE2, nil, 8)
+        AddLine(FAMILY_NOTE, nil, 8)
+        AddLine("Change the assigned Wishlist in My Builds.", nil, 8)
+        cy = cy - 6
+        if not hasSections then
+            AddLine(failed and "|cff8a8a8aBuild Progress data could not be read, so there are no sections to show.|r"
+                or "|cff8a8a8aNo sections were received.|r")
+        end
+        if hasSections then
+            for i = 1, #sections do
+                local sec = sections[i]
+                if type(sec) == "table" then
+                    AddLine(tostring(sec.title or ""), "GameFontNormalSmall")
+                    local lines = sec.lines
+                    if type(lines) == "table" then
+                        for j = 1, #lines do
+                            AddLine(tostring(lines[j] or ""), nil, 8)
+                        end
                     end
+                    cy = cy - 4
                 end
-                cy = cy - 4
             end
+        end
+
+        if data and data.version ~= nil then
+            cy = cy - 2
+            AddLine("|cff8a8a8a" .. tostring(data.version) .. "|r")
         end
     end
 
-    if data and data.version ~= nil then
-        cy = cy - 2
-        AddLine("|cff8a8a8a" .. tostring(data.version) .. "|r")
-    end
-
     for i = linesUsed + 1, #linePool do linePool[i]:Hide() end
+    for i = rowsUsed + 1, #rowPool do rowPool[i]:Hide() end
     child:SetWidth(width + 12)
     child:SetHeight(-cy + 8)
 end
@@ -792,7 +1269,7 @@ local function SelectOurTab()
     M.Refresh()
 end
 
-local function DeselectOurTab(showAssociation)
+function DeselectOurTab(showAssociation)
     if ourTab and PanelTemplates_DeselectTab then
         pcall(PanelTemplates_DeselectTab, ourTab)
     end
@@ -880,7 +1357,7 @@ local function Install()
     -- A second Install after a partial failure reuses every frame and hook.
     ourTab = ourTab or CreateFrame("Button", "NexusJournalTab",
         journal, "CharacterFrameTabButtonTemplate")
-    ourTab:SetText("Nexus Advisor")
+    ourTab:SetText(TAB_LABEL)
     Attach.target, Attach.mode = nil, "none"
     Attach.Apply()
     -- A fresh template tab shows BOTH texture sets until its state is

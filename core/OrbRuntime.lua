@@ -373,7 +373,7 @@ end
 function M.SetLimit(n)
     init();n=tonumber(n)
     if not integer(n,1,10000) then return nil,"Choose a whole-number Orb limit from 1 to 10,000." end
-    if run.running or run.pending or run.state=="PAUSED" or run.state=="LIMIT" then return nil,"Use Increase limit while paused, or finish this run first." end
+    if run.running or run.pending or run.state=="PAUSED" or run.state=="LIMIT" then return nil,"The maximum cannot change during a run. Stop this run, then start a new run with a higher maximum." end
     local before=copy(config);config.maxOrbs=n
     local ok,err=changedConfig(before)
     -- A saved typed maximum is the player's own amount: tracking stops.
@@ -2087,7 +2087,7 @@ function M.Resume()
         if not run.pending.spendConfirmed then return nil,"The spend outcome remains unknown. No action will be repeated." end
         run.pending.ambiguous=nil
     end
-    if not run.pending and run.spent+run.reserved>=run.limit then return nil,"The approved limit is reached. Confirm an increased limit or stop." end
+    if not run.pending and run.spent+run.reserved>=run.limit then return nil,"The approved maximum is reached. Stop, then start a new run with a higher maximum." end
     if not run.token then return nil,"This run no longer owns the action. Stop and approve a new run after settlement." end
     local off,e=turnAutoOff();if not off then return nil,e end
     run.running=true;setState(run.pending and "WAIT_OFFER" or "READY","Resuming the approved run without resetting its usage.")
