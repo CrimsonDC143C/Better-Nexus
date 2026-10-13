@@ -378,6 +378,7 @@ local refusedRerollSig = nil
 -- observed leave is not classified and revokes Auto.
 local actionHold = { externalUntil = 0, worldLeaving = false,
     worldSettleUntil = nil, worldSettle = 3, worldPending = nil,
+    worldNoticePending = nil,
     -- Rolling-policy selection and the open decision's recorder link. Kept on
     -- this table: the factory has no free local slot. `set` is false until the
     -- first read; `inForce` changes only while no action intent exists.
@@ -499,7 +500,7 @@ local function AutoAllowed()
     if actionHold.worldPending then
         -- Auto off and on ends this hold, but not the adapter's own
         -- unresolved Select: the text must not promise more than that. Its
-        -- exact grant is named as the end of this hold only for the Select
+        -- exact grant and pending-flag clearance end this hold only for the Select
         -- this hold tracks (its ordinal) while a grant can still settle it:
         -- after a same-Echo overlap ("ambiguous") or a run boundary ("run")
         -- none can. Read refreshes are named only while they could settle
@@ -515,12 +516,14 @@ local function AutoAllowed()
             .. (ownSelect and ((noGrant
                         and "a grant can no longer settle the Echo selection already sent; Auto off and on ends only this hold, not the wait for that selection"
                     or actionHold.worldPending.ordinal == ownSelect
-                        and "it ends with the exact grant of the Echo selection already sent"
+                        and "it ends only after the exact grant of the Echo selection already sent and the client's pending Select flag clears"
                     or "the Echo selection already sent still waits for its exact grant; Auto off and on ends only this hold")
                 .. ((wait == "grant" or wait == "latch")
                     and " (Nexus re-reads the granted Echoes while Auto is ON and nothing else pauses it; nothing is resent)"
                     or " (nothing is resent)"))
-                or "turn Auto off and on to continue")
+                or (actionHold.worldPending.rerollOrdinal
+                    and "Nexus checks the same run's server reroll count and new offer; if it cannot match this request, turn Auto off and on to continue"
+                    or "turn Auto off and on to continue"))
     end
     if GetTime() < actionHold.externalUntil then return false, "user acting" end
     if Adapter.RivalDetected() then return false, "Another Echo automation addon is loaded -- disable it" end
@@ -2877,6 +2880,8 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         local ok = Adapter.Reroll()
         if ok then
             lastDecision = immutable
+            intent.rerollOrdinal = Adapter.RerollOrdinal
+                and Adapter.RerollOrdinal() or nil
             MarkIntentSubmitted(intent)
             lastBoardForRerollWatch = board
             if immutable.reason == "bracket fishing: reroll filler guarantee" then
@@ -3180,6 +3185,7 @@ local function ResetRunBoundary()
         actionHold.rolling.decisionId, actionHold.rolling.sig = nil, nil
     end
     actionHold.worldPending = nil -- the dead run's pending action ends here
+    actionHold.worldNoticePending = nil
     lastDecision = nil
     lastLoggedSig = nil
     lastBoardForRerollWatch = nil
@@ -3348,6 +3354,20 @@ local function DispatchLevelStep(level, plan, slots, owned, flags,
         actionHold.worldPending = nil
         if actionIntent and actionIntent.crossedWorld then
             FinishActionIntent("confirmed", "grant_observed", false)
+        end
+    end
+    -- Only a single crossed, own reroll can use the adapter's same-run
+    -- server-counter settlement. The ordinal is local provenance, never a
+    -- request ID. Ambiguous or external requests keep the world hold.
+    held = actionHold.worldPending
+    if held and held.rerollOnly and held.rerollOrdinal
+        and Adapter.RerollOutcome
+        and Adapter.RerollOutcome(held.rerollOrdinal) == "proven" then
+        actionHold.worldPending = nil
+        if actionIntent and actionIntent.crossedWorld
+            and actionIntent.action.type == "reroll"
+            and actionIntent.rerollOrdinal == held.rerollOrdinal then
+            FinishActionIntent("confirmed", "reroll_run_data_observed", false)
         end
     end
     if level == 1 then
@@ -3792,6 +3812,28 @@ actionHold.SelectPoll = function()
     end
 end
 
+-- Called after the poll's full step (or when no step is due). A same-poll
+-- grant or run boundary must get the first chance to end the world hold.
+actionHold.ShowWorldNotice = function(now)
+    if not actionHold.worldNoticePending then return end
+    local ok, err = pcall(function()
+        if not actionHold.worldPending then
+            actionHold.worldNoticePending = nil
+            return
+        end
+        if not autoEnabled or actionHold.worldLeaving
+            or (actionHold.worldSettleUntil
+                and now < actionHold.worldSettleUntil)
+            or not Adapter.Ready() then return end
+        actionHold.worldNoticePending = nil
+        -- The gate's wording distinguishes an unresolved Echo selection,
+        -- whose own wait may outlive the world hold and an Auto toggle.
+        local _, reason = AutoAllowed()
+        Print("Auto is ON but paused: " .. reason)
+    end)
+    if not ok then RecordError("AutomationRuntime.WorldNotice", err) end
+end
+
 -- Effective: memory only, for the HUD, M.EffectiveState and the support
 -- report. The Auto selection is autoEnabled; this says what it is doing now
 -- and why. It reads no client data, no clock, requests nothing and calls no
@@ -3897,44 +3939,69 @@ end
     function M.AutoEnabled() return autoEnabled end
     function M.AutoAllowed() return AutoAllowed() end
     function M.ToggleAuto()
-        if not autoEnabled and Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary() then
+        local function CommitToggle()
+            autoEnabled = not autoEnabled
+            if Nexus.RollRecorder then
+                Nexus.RollRecorder.Boundary("auto", autoEnabled and "on" or "off")
+            end
+            if autoEnabled then
+                -- Authorization changed, represented data did not. Coalesce one
+                -- bounded decision evaluation without invalidating static state.
+                authorizationStepPending = true
+                -- New player input ends the hold of an action that a loading
+                -- screen left unresolved. Its result stays unknown: it is
+                -- recorded as uncertain, never as confirmed.
+                actionHold.worldPending = nil
+                actionHold.worldNoticePending = nil
+                if actionIntent and actionIntent.crossedWorld then
+                    FinishActionIntent("uncertain", "player_resumed", false)
+                end
+            else
+                authorizationStepPending = false
+                actionHold.worldNoticePending = nil
+                if actionIntent and actionIntent.state == "prepared" then
+                    local revokedDeadline = actionIntent.readyAt
+                    FinishActionIntent("superseded", "authorization_changed", false)
+                    if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
+                        nextStepAt = nil
+                        ScheduleKnownDeadlines()
+                    end
+                end
+            end
+            return autoEnabled
+        end
+        local warning = Nexus.OverwriteWarning
+        if autoEnabled then
+            if warning and warning.CancelAuto then warning.CancelAuto(M) end
+            return CommitToggle()
+        end
+        if Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary() then
             SetStatus("Ordinary Automation stays OFF while the Orb operation is active or unresolved.")
             return false
         end
-        autoEnabled = not autoEnabled
-        if Nexus.RollRecorder then
-            Nexus.RollRecorder.Boundary("auto", autoEnabled and "on" or "off")
+        if not warning or type(warning.RequestAuto) ~= "function" then
+            SetStatus("Auto stays OFF: its overwrite warning is unavailable.")
+            return false
         end
-        if autoEnabled then
-            -- Authorization changed, represented data did not. Coalesce one
-            -- bounded decision evaluation without invalidating static state.
-            authorizationStepPending = true
-            -- New player input ends the hold of an action that a loading
-            -- screen left unresolved. Its result stays unknown: it is
-            -- recorded as uncertain, never as confirmed.
-            actionHold.worldPending = nil
-            if actionIntent and actionIntent.crossedWorld then
-                FinishActionIntent("uncertain", "player_resumed", false)
-            end
-        else
-            authorizationStepPending = false
-            if actionIntent and actionIntent.state == "prepared" then
-                local revokedDeadline = actionIntent.readyAt
-                FinishActionIntent("superseded", "authorization_changed", false)
-                if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
-                    nextStepAt = nil
-                    ScheduleKnownDeadlines()
-                end
-            end
-        end
-        return autoEnabled
+        return warning.RequestAuto(M, function()
+            -- Approval belongs to this still-OFF request. Recheck interruption
+            -- and Orb exclusion rather than authorizing a stale UI callback.
+            if autoEnabled or (Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary()) then return false end
+            local enabled = CommitToggle()
+            if Nexus.Panel and Nexus.Panel.SetAuto then Nexus.Panel.SetAuto(enabled) end
+            return enabled
+        end)
     end
     -- Called by Main before the lifecycle sees the event. Returns "held",
     -- "resuming", "revoked" or "off" (Auto was not selected).
     function M.OnWorldEvent(event)
+        if Nexus.OverwriteWarning and Nexus.OverwriteWarning.CancelAuto then
+            Nexus.OverwriteWarning.CancelAuto(M)
+        end
         if event == "PLAYER_LEAVING_WORLD" then
             actionHold.worldLeaving = true
             actionHold.worldSettleUntil = nil
+            actionHold.worldNoticePending = nil
             -- A prepared (unsubmitted) action is dropped, not kept for after
             -- the loading screen. A sent action without a result is marked:
             -- nothing is resent, and it stays unresolved (ResolveActionIntent,
@@ -4000,18 +4067,26 @@ end
                     and only.source ~= "latch"
                     and (not crossed or (actionIntent.action.type == "take"
                         and tonumber(actionIntent.action.spellId) == only.spellId))
+                local byReroll = crossed and actionIntent.action.type == "reroll"
+                    and actionIntent.rerollOrdinal
+                    and (#pendingNow == 0 or (only and only.kind == "reroll"
+                        and only.source == "own"))
                 -- `ordinal`: the adapter's own Select keeps its local
                 -- provenance, so only that request's settlement ends the hold.
                 if not held then
                     held = { kinds = {}, label = "",
                         spellId = byGrant and only.spellId or nil,
                         baseline = byGrant and only.baseline or nil,
-                        ordinal = byGrant and only.ordinal or nil }
+                        ordinal = byGrant and only.ordinal or nil,
+                        rerollOrdinal = byReroll and actionIntent.rerollOrdinal or nil }
                     actionHold.worldPending = held
                 elseif held.spellId and #pendingNow > 0
                     and not (byGrant and only.spellId == held.spellId
                         and only.ordinal == held.ordinal) then
                     held.spellId, held.baseline, held.ordinal = nil, nil, nil
+                end
+                if held.rerollOrdinal and not byReroll then
+                    held.rerollOrdinal = nil
                 end
                 -- Requests per kind, for a truthful reason. A crossed Take is
                 -- the adapter's own tracked Select ("own"/"grant") when one is
@@ -4038,6 +4113,11 @@ end
                 for kind, n in pairs(counts) do
                     if n > (held.kinds[kind] or 0) then held.kinds[kind] = n end
                 end
+                held.rerollOnly = held.rerollOrdinal ~= nil
+                    and held.kinds.reroll == 1
+                for kind in pairs(held.kinds) do
+                    if kind ~= "reroll" then held.rerollOnly = false end
+                end
                 local names, labels = {}, {}
                 for kind in pairs(held.kinds) do names[#names + 1] = kind end
                 table.sort(names)
@@ -4063,9 +4143,11 @@ end
         if closesTransition then
             actionHold.worldSettleUntil = GetTime() + actionHold.worldSettle
             if not autoEnabled then return "off" end
+            actionHold.worldNoticePending = actionHold.worldPending ~= nil or nil
             RequestStepAt(actionHold.worldSettleUntil)
             return "resuming"
         end
+        actionHold.worldNoticePending = nil
         -- Logout, or an entry this session cannot classify (no leave seen).
         if not autoEnabled then return "off" end
         M.ToggleAuto()
@@ -4316,6 +4398,7 @@ end
                 or authorizationStepPending or isDirty or autoLockDirty
                 or deadlineDue or autoLockDeadlineDue or retrying) then
                 recomputeStats.skipped = recomputeStats.skipped + 1
+                actionHold.ShowWorldNotice(now)
                 return
             end
             fallbackStatic = fallbackRepair
@@ -4326,6 +4409,7 @@ end
             or isDirty or autoLockDirty or deadlineDue
             or autoLockDeadlineDue or fallbackRepair or retrying) then
             recomputeStats.skipped = recomputeStats.skipped + 1
+            actionHold.ShowWorldNotice(now)
             return
         end
         if deadlineDue then nextStepAt = nil end
@@ -4385,6 +4469,7 @@ end
             recomputeStats.stepRetries = recomputeStats.stepRetries + 1
         end
         local stepSucceeded = RunFullStep(trigger, "Main.Step", work)
+        actionHold.ShowWorldNotice(now)
         if not stepSucceeded then
             if retrying then
                 recomputeStats.stepRetryExhausted =

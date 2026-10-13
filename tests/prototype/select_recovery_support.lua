@@ -27,6 +27,7 @@ function R.Boot(oldCopy)
  local factory=Nexus.MainInternals.AutomationRuntime;local original=factory.New
  factory.New=function(...)H.runtime=original(...);return H.runtime end
  H.Fire('ADDON_LOADED','Nexus');H.Fire('PLAYER_ENTERING_WORLD');H.Advance(20,.05)
+ H.AcknowledgeOverwriteWarnings()
  assert(Nexus.StartupStatus().coreReady,'fixture startup')
  assert(H.runtime,'fixture runtime capture')
  assert(Nexus.GameAdapter.SetLoadoutWishlistIdentity(1,'Synthetic recovery plan',target),'fixture assignment')

@@ -1196,8 +1196,13 @@ local CharMigration = {
     KEY_WIDTH=183, DEPTH=6,
     -- Local native startup correction: WishlistKey serializes the complete
     -- wishlist. A normal 79-row key can be 710 bytes, not a catalog ID.
-    -- Only the immediate character lock-design map gets this bounded width.
+    -- The immediate lock-design map and the validated legacy relay-pair map
+    -- use this bound; other character maps keep the 183-byte general rule.
     WISHLIST_KEY_WIDTH=2048,
+    -- Nexus 1.19.1 also persisted a wishlist identity at
+    -- chars[name].relayPairs[key] after a verified inactive save. The current
+    -- runtime no longer reads that map, but must retain its bounded legacy
+    -- slot-pair records when admitting an existing format-5 character row.
     -- Local native startup correction, 2026-09-23. The lock-attempt record map
     -- is keyed by the automation producer's own compound key, which EMBEDS a
     -- wishlist key, so it is routinely wider than the general rule and is NOT
@@ -1238,6 +1243,19 @@ local CharMigration = {
     },
 }
 
+function CharMigration.LegacyRelayPairValue(value)
+    if type(value) ~= "table" then return false end
+    local a, b = rawget(value, "slotA"), rawget(value, "slotB")
+    if type(a) ~= "number" or type(b) ~= "number"
+        or a < 1 or b < 1 or a >= math.huge or b >= math.huge
+        or a ~= math.floor(a) or b ~= math.floor(b) then return false end
+    local first = next(value)
+    local second = first ~= nil and next(value, first) or nil
+    return (first == "slotA" or first == "slotB")
+        and (second == "slotA" or second == "slotB")
+        and next(value, second) == nil
+end
+
 -- A bounded, sanitized description of ONE refused key, built from the frame
 -- that refused it. It names no key, no character, no wishlist and no record
 -- content: only the schema path, the measured width and the rule that applied.
@@ -1247,6 +1265,7 @@ local CharMigration = {
 -- report. A name that is not on this list is reported as its depth alone.
 local SCHEMA_NAMES = {
     autoLockAttempts=true, records=true, lockDesignTargetsBySlot=true,
+    relayPairs=true,
     tomeTogglePending=true, flagDemotions=true, recordedPicks=true,
     loadoutWishlists=true, wishlistRoleChoices=true, firstRunWishlist=true,
     priorAutoAccept=true,
@@ -1341,6 +1360,14 @@ function CharMigration.ChargeSlice(work)
                 -- the record itself is still validated by its own owner.
                 keyLimit = CharMigration.ATTEMPT_KEY_WIDTH
                 keyException = "lock-attempt"
+            elseif work.settingsCharged and frame.depth == 2
+                and stack[1].key == "relayPairs"
+                and type(key) == "string"
+                and CharMigration.LegacyRelayPairValue(value) then
+                -- Exact legacy owner path and two-slot record only; the same
+                -- wishlist-key ceiling applies, with all graph caps intact.
+                keyLimit = CharMigration.WISHLIST_KEY_WIDTH
+                keyException = "legacy-relay"
             end
             if #keyText > keyLimit then
                 work.failure = "SOURCE_KEY_WIDTH_EXCEEDED"

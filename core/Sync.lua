@@ -423,16 +423,28 @@ function Responder.SupportsRequestContext(requestId)
     return type(requestId) == "string" and requestId:sub(1, 3) == "c1-"
 end
 
-function Responder.RequestContext(requester, requestId, bucket)
-    if not Responder.SupportsRequestContext(requestId)
-        or not ValidPeerName(requester)
-        or not ValidIdentifier(requestId, MAX_REQUEST_ID_BYTES) then
-        return nil
+function Responder.ResponseScope(requester, requestId, bucket)
+    if not ValidPeerName(requester) then return nil end
+    if not ValidIdentifier(requestId, MAX_REQUEST_ID_BYTES) then
+        -- Reconciler's generated ID is local ownership, not a wire field.
+        -- Valid names can contain UTF-8/realm punctuation; bind their exact
+        -- bounded legacy prefix and clock without widening wire-ID grammar.
+        local prefix = "legacy-" .. requester .. "-"
+        if not ValidField(requestId, #prefix + 24, false)
+            or requestId:sub(1, #prefix) ~= prefix
+            or not Protocol.ValidIntegerText(requestId:sub(#prefix + 1), 0) then
+            return nil
+        end
     end
     bucket = bucket ~= nil and tonumber(bucket) or nil
     if bucket ~= nil and (bucket ~= math.floor(bucket)
         or bucket < 1 or bucket > BUILD_BUCKETS) then return nil end
     return {requester=requester,requestId=requestId,bucket=bucket}
+end
+
+function Responder.RequestContext(requester, requestId, bucket)
+    if not Responder.SupportsRequestContext(requestId) then return nil end
+    return Responder.ResponseScope(requester, requestId, bucket)
 end
 
 function Responder.ContextSuffix(context, includeBucket)
@@ -562,6 +574,22 @@ local function CurrentOwnerKey()
     local ownerKey = Identity.OwnerKey(MyName(), realm)
     if ownerKey and not ownerKey:match("@unknown$") then return ownerKey end
     return nil
+end
+
+-- DPS rows captured before an optional normalized-realm shim keep their
+-- original native owner. Use the same fresh native proof as channel ingress;
+-- this does not make the two realm spellings interchangeable elsewhere.
+local function CurrentDpsOwnerAgrees(ownerKey)
+    local owner = Identity.CanonicalOwnerKey(ownerKey)
+    if not owner then return false end
+    if owner == CurrentOwnerKey() then return true end
+    if type(Identity.NativeChannelSender) ~= "function"
+        or type(Identity.NativeChannelDpsOwnerSender) ~= "function" then
+        return false
+    end
+    local nativeSender = Identity.NativeChannelSender(MyName())
+    local ownerSender = Identity.NativeChannelDpsOwnerSender(nativeSender, owner)
+    return Identity.TransportOwns(owner, ownerSender)
 end
 
 CurrentTransportSender = function()
@@ -1088,9 +1116,17 @@ Transport = TransportFactory.New({
     -- The saved Sync mode (core/SyncModePolicy.lua): the same decision the
     -- wire asks again at submission.
     permit=function(metadata)
+        if Nexus.SyncWire and type(metadata)=="table"
+            and Nexus.SyncWire.IsPeerBlocked(metadata.requester) then return false,"peer offline" end
         local policy=Nexus.SyncModePolicy
         if not policy then return true end
         return policy.Allows("packet",metadata)
+    end,
+    housekeepWire=function()
+        if Nexus.SyncWire then Nexus.SyncWire.Housekeep() end
+    end,
+    noteOfflineNotice=function(text)
+        return Nexus.SyncWire and Nexus.SyncWire.NoteOfflineNotice(text)
     end,
     canDispatch=function(payload,metadata)
         local wire=Nexus.SyncWire
@@ -1227,6 +1263,7 @@ Reconciler = ReconcilerFactory.New({
             })
     end,
     permitResponse=function(requester, buildId)
+        if Nexus.SyncWire and Nexus.SyncWire.IsPeerBlocked(requester) then return false end
         local policy=Nexus.SyncModePolicy
         if not policy then return true end
         return policy.Allows("packet",{requester=requester,buildId=buildId})
@@ -2631,8 +2668,7 @@ function Responder.ValidatePreparedDps(payload, originVerified)
     local canonicalOwner = D and type(D.HasCanonicalOwnerIdentity) == "function"
         and D.HasCanonicalOwnerIdentity(payload) == true
     local directOwner = originVerified == true
-        and CurrentOwnerKey() ~= nil
-        and Identity.CanonicalOwnerKey(payload.o) == CurrentOwnerKey()
+        and CurrentDpsOwnerAgrees(payload.o)
     local relayContext = payload.x
     local relayValid = not directOwner and originVerified == true
         and ValidDpsRelayContext({n=relayContext and relayContext.n,
@@ -2680,17 +2716,19 @@ local function PreparedDpsProof(prepared, responseMode)
     local okPayload, payload = pcall(Codec.JSONEncode, prepared.payload)
     local okContext, context = pcall(Codec.JSONEncode,
         prepared.context or false)
-    if not okPayload or not okContext then return nil end
+    local okScope, scope = pcall(Codec.JSONEncode,
+        prepared.responseScope or false)
+    if not okPayload or not okContext or not okScope then return nil end
     return table.concat({
         responseMode and "1" or "0",
         prepared.originVerified == true and "1" or "0",
-        payload, context, tostring(#messages), table.concat(messages, "\0"),
+        payload, context, scope, tostring(#messages), table.concat(messages, "\0"),
     }, "\1")
 end
 
 local function SamePreparedDpsContext(preparedContext, responseContext)
     local current = type(responseContext) == "table"
-        and Responder.RequestContext(responseContext.requester,
+        and Responder.ResponseScope(responseContext.requester,
             responseContext.requestId, responseContext.bucket) or nil
     if preparedContext == nil or current == nil then
         return preparedContext == nil and current == nil
@@ -2729,8 +2767,7 @@ local function CurrentPreparedDpsAuthority(record, payload, responseMode,
         verifiedOwner, fingerprint, current.buildId)
     local currentLocked = D.GetEchoKey(current.lockedEchoes) or "0"
     local payloadLocked = D.GetEchoKey(payload.lk) or "0"
-    local currentOwner = CurrentOwnerKey()
-    local directOwner = currentOwner ~= nil and verifiedOwner == currentOwner
+    local directOwner = CurrentDpsOwnerAgrees(verifiedOwner)
     if not directOwner then
         if not responseMode or record._originVerified ~= true then
             return false, "relay_authorization"
@@ -2778,6 +2815,14 @@ end
 function Sync.BroadcastDpsRecord(record, prepared, responseMode,
         responseContext, responseBudget)
     if type(prepared) ~= "table" then prepared = nil end
+    -- A legacy response has no c1 wire envelope, but still belongs to its
+    -- exact local requester. Keep that queue/cache ownership independently.
+    local responseScope = type(responseContext) == "table"
+        and Responder.ResponseScope(responseContext.requester,
+            responseContext.requestId, responseContext.bucket) or nil
+    if responseContext ~= nil and not responseScope then
+        return false, "outside_request"
+    end
     if responseMode and Responder.Backpressured() then
         return false, "sync queue full", prepared
     end
@@ -2791,8 +2836,8 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
         local expectedProof = preparedDpsProofs[prepared]
         if expectedProof == nil
             or PreparedDpsProof(prepared, responseMode) ~= expectedProof
-            or not SamePreparedDpsContext(prepared.context,
-                responseContext) then
+            or not SamePreparedDpsContext(prepared.responseScope,
+                responseScope) then
             return false, "relay_authorization"
         end
     end
@@ -2826,9 +2871,9 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
             return false, "sync queue full", prepared
         end
         local queued, queueWhy = Transport.EnqueueBatch(prepared.messages, {
-            requester=prepared.context and prepared.context.requester
+            requester=prepared.responseScope and prepared.responseScope.requester
                 or prepared.payload.x and prepared.payload.x.n or nil,
-            requestId=prepared.context and prepared.context.requestId
+            requestId=prepared.responseScope and prepared.responseScope.requestId
                 or prepared.payload.x and prepared.payload.x.i or nil,
             transferId=tostring(prepared.payload.p) .. ":"
                 .. tostring(prepared.payload.t) .. ":"
@@ -2890,8 +2935,7 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
     local computed = D and D.GetEchoKey and D.GetEchoKey(record.echoes) or nil
     local verifiedOwner = type(D.VerifiedOwnerKey) == "function"
         and D.VerifiedOwnerKey(record) or nil
-    local directOwner = CurrentOwnerKey() ~= nil
-        and verifiedOwner == CurrentOwnerKey()
+    local directOwner = CurrentDpsOwnerAgrees(verifiedOwner)
     local relayContext
     if not directOwner then
         if not responseMode then return false, "owner_sender" end
@@ -2970,6 +3014,7 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
         Reconciler.NoteStat("chunkMessagesBuilt", #messages)
     end
     prepared = {messages=messages, payload=payload,context=envelopeContext,
+        responseScope=responseScope,
         originVerified=directOwner
             or (verifiedOwner ~= nil and record._originVerified == true)}
     preparedDpsProofs[prepared] = PreparedDpsProof(prepared, responseMode)
@@ -2983,9 +3028,9 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
         return false, "sync queue full", prepared
     end
     local queued, queueWhy = Transport.EnqueueBatch(messages, {
-        requester=envelopeContext and envelopeContext.requester
+        requester=responseScope and responseScope.requester
             or relayContext and relayContext.n or nil,
-        requestId=envelopeContext and envelopeContext.requestId
+        requestId=responseScope and responseScope.requestId
             or relayContext and relayContext.i or nil,
         transferId=transferId,buildId=tostring(payload.b or ""),
         dpsId=tostring(payload.f or ""),queueClass="bulk",
@@ -3994,11 +4039,15 @@ Session = SessionFactory.New({
     ensureChannel=function() return Sync.EnsureChannel() end,
     sendWhisper=function(message, target)
         -- The diagnostic probe whisper bypasses the queue and the wire, so it
-        -- asks the saved Sync mode itself (refused under Off).
+        -- asks the saved Sync mode and existing peer guard at submission.
         local policy=Nexus.SyncModePolicy
         if policy then
             local allowed, why = policy.Allows("whisper")
             if not allowed then return false, why end
+        end
+        local wire=Nexus.SyncWire
+        if wire and wire.IsWhisperTargetBlocked(target) then
+            return false, "peer offline"
         end
         return SendChatMessage(message, "WHISPER", nil, target)
     end,
@@ -4111,6 +4160,7 @@ end
 -- Safe while catalog/hash readiness gates the full update. This cannot
 -- prepare requests, retry transfers, admit packets, or send network traffic.
 function Sync.Housekeep()
+    if Nexus.SyncWire then Nexus.SyncWire.Housekeep() end
     -- Passive expiry only: a deferred inbound item is never submitted here.
     Responder.Admission.Expire()
     ExpireHotBuilds()
@@ -4376,7 +4426,14 @@ function Sync.Init(codec, adapter)
     Codec, Adapter = codec, adapter
     if Nexus.SyncWire then Nexus.SyncWire.Init(function(text,sender)
         return Inbound.HandleIncoming(text,sender)
-    end) end
+    end,{
+        connected=function() return FindSyncChannel()~=nil end,
+        onPeerRemoved=function(peer,reason)
+            -- Remove producers before their queued packets and latest attempt.
+            Reconciler.CancelPeer(peer,reason)
+            Transport.CancelPeer(peer,reason)
+        end,
+    }) end
     -- Explicit Init remains the destructive session boundary. Publish exact
     -- terminal ownership before clearing queues; ordinary world transitions
     -- use OnWorldEntry and never enter this path.

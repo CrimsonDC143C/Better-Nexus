@@ -306,7 +306,9 @@ function M.Overflows(fontString)
 end
 
 -- A fixed multi-line text box keeps its size; while its text overflows, a
--- hover area over it shows the complete text in a tooltip.
+-- hover area over it shows the complete text in a tooltip. An owner that
+-- shortened a value itself stores the complete text in _nexusFullText, which
+-- the tooltip then shows even when the shortened text fits.
 function M.FullTextTooltip(fontString, parent, anchor)
     local hit = CreateFrame("Frame", nil, parent)
     hit:SetAllPoints(fontString)
@@ -314,9 +316,10 @@ function M.FullTextTooltip(fontString, parent, anchor)
     hit._nexusText = fontString
     hit:SetScript("OnEnter", function(self)
         local label = self._nexusText
-        if not (GameTooltip and M.Overflows(label)) then return end
+        local full = label._nexusFullText
+        if not (GameTooltip and (full or M.Overflows(label))) then return end
         GameTooltip:SetOwner(self, anchor or "ANCHOR_TOP")
-        GameTooltip:AddLine(tostring(label:GetText() or ""), 1, 1, 1, true)
+        GameTooltip:AddLine(tostring(full or label:GetText() or ""), 1, 1, 1, true)
         GameTooltip:Show()
         self._nexusTip = true
     end)
@@ -420,6 +423,13 @@ function M.Panel(spec)
             local char, line = M.ConservativeText(scale)
             layout.orbButtonH = math.max(small + 6, line)
             layout.orbButtonW = math.min(width-24, math.ceil(12 * char) + 20)
+            -- The optional mini-panel access shares this row, immediately
+            -- left of Open Orbs. Keep the existing window/button geometry.
+            layout.orbMiniButtonGap = 6
+            local available = width - 24 - layout.orbButtonW - layout.orbMiniButtonGap
+            local fullWidth = math.ceil(14 * char) + 20
+            layout.orbMiniButtonW = math.max(1, math.min(fullWidth, available))
+            layout.orbMiniButtonLabel = fullWidth <= available and "Orb mini panel" or "Mini"
             height = height + layout.orbButtonH + math.ceil(gap/2)
         end
         local rows = tonumber(spec.guidanceRows) or 0

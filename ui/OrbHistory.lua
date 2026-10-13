@@ -76,22 +76,70 @@ M.RUN_STATES = RUN_STATES
 
 M.SESSION_NOTE = "History clears on reload or logout."
 
--- Display-only sanitising for a recorded label. A pipe is doubled because a
--- FontString interprets pipe sequences; control characters become spaces. The
--- value itself is never rewritten, only its projection.
+-- Recorded values bounded for rows, headers and reports, in bytes of the
+-- displayed text. Tooltips and details get the complete value instead.
+local NAME_BYTES, REASON_BYTES, WISHLIST_BYTES = 60, 40, 48
+
+-- The byte after the character that starts at byte i. A lead byte owns only
+-- the continuation bytes that follow it, so malformed text still advances and
+-- a well-formed multi-byte letter is never split.
+local function nextChar(text, i)
+    local b = text:byte(i)
+    local size = b >= 240 and 4 or b >= 224 and 3 or b >= 192 and 2 or 1
+    local j = i + 1
+    while j < i + size do
+        local c = text:byte(j)
+        if not c or c < 128 or c > 191 then break end
+        j = j + 1
+    end
+    return j
+end
+
+-- Display-only sanitising for a recorded label. Control characters become
+-- spaces, and a pipe is doubled because a FontString interprets pipe
+-- sequences. Without a limit the whole value is kept. A limit is a byte budget
+-- for the displayed text: a longer value is cut on a character boundary and
+-- ends in "...", so it says that it was shortened. Pipes are doubled after the
+-- cut, so a cut never falls inside a multi-byte letter or an escaped "||".
+-- Returns the text and whether it was shortened. The value itself is never
+-- rewritten, only its projection.
 local function display(value, limit)
-    return (tostring(value or ""):gsub("|", "||"):gsub("%c", " "))
-        :sub(1, limit or 60)
+    local text = (tostring(value or ""):gsub("%c", " "))
+    local shortened = false
+    limit = tonumber(limit)
+    if limit then
+        limit = math.max(4, math.floor(limit))
+        local _, pipes = text:gsub("|", "")
+        if #text + pipes > limit then
+            local i, size, keep = 1, 0, 0
+            while i <= #text do
+                local j = nextChar(text, i)
+                local width = text:sub(i, j - 1) == "|" and 2 or j - i
+                if size + width > limit - 3 then break end
+                size, keep, i = size + width, j - 1, j
+            end
+            text, shortened = text:sub(1, keep) .. "...", true
+        end
+    end
+    return (text:gsub("|", "||")), shortened
 end
 M.Display = display
 
 -- A cell shows what fits and says that it was shortened; the caller keeps the
--- whole value for the tooltip and the details.
+-- whole value for the tooltip and the details. The limit counts characters and
+-- a cut never splits one. Nothing is escaped here: a caller doubles pipes after
+-- the cut.
 function M.Ellipsis(value, limit)
     local text = tostring(value or "")
-    limit = math.max(4, tonumber(limit) or 32)
-    if #text <= limit then return text, false end
-    return text:sub(1, limit - 3) .. "...", true
+    limit = math.max(4, math.floor(tonumber(limit) or 32))
+    local i, count, keep = 1, 0, 0
+    while i <= #text do
+        count = count + 1
+        if count > limit then return text:sub(1, keep) .. "...", true end
+        i = nextChar(text, i)
+        if count == limit - 3 then keep = i - 1 end
+    end
+    return text, false
 end
 
 function M.Rarity(quality)
@@ -133,11 +181,14 @@ end
 -- One Echo cell. resolve(spellId) is an optional bounded, read-only lookup of
 -- that exact id supplied by the caller; it may return a label and an icon.
 -- A name that cannot be resolved stays usable: "Unknown Echo (200728)".
+-- label is bounded for rows and reports, full is the complete name for
+-- tooltips and details, and text is the complete name unescaped, for a caller
+-- that shortens its own cell and escapes after the cut.
 function M.Echo(key, entry, resolve)
     local spellId, quality = M.Identity(key)
     if not spellId then
-        return { known = false, label = "Not recorded",
-            rarity = M.Rarity(nil), recorded = false }
+        return { known = false, label = "Not recorded", full = "Not recorded",
+            text = "Not recorded", rarity = M.Rarity(nil), recorded = false }
     end
     local label, icon = recordedName(entry, key, spellId), nil
     local source = label and "recorded" or nil
@@ -149,9 +200,11 @@ function M.Echo(key, entry, resolve)
         local _, foundIcon = resolve(spellId)
         icon = foundIcon
     end
+    local name = label or ("Unknown Echo (" .. spellId .. ")")
     return {
         known = true, recorded = true, spellId = spellId, key = key,
-        label = label and display(label) or ("Unknown Echo (" .. spellId .. ")"),
+        label = display(name, NAME_BYTES), full = display(name),
+        text = (name:gsub("%c", " ")),
         resolved = label ~= nil, labelSource = source or "unresolved",
         icon = icon, rarity = M.Rarity(quality),
     }
@@ -174,16 +227,18 @@ local function reasonOf(entry)
     local kind = entry and entry.selectionKind
     local mapped = kind and REASONS[tostring(kind):upper()]
     if mapped then
-        return { label = mapped.label, detail = mapped.detail,
+        return { label = mapped.label, full = mapped.label, detail = mapped.detail,
             recorded = entry.selectionReason }
     end
     -- A recorded reason with no recognised kind is shown as it was recorded,
-    -- never re-worded into one of the mapped labels.
+    -- never re-worded into one of the mapped labels: bounded in its cell,
+    -- complete in the tooltip and the details.
     if entry and entry.selectionReason then
-        return { label = display(entry.selectionReason, 40),
+        return { label = display(entry.selectionReason, REASON_BYTES),
+            full = display(entry.selectionReason),
             recorded = entry.selectionReason, verbatim = true }
     end
-    return { label = "Reason unavailable" }
+    return { label = "Reason unavailable", full = "Reason unavailable" }
 end
 M.Reason = reasonOf
 
@@ -202,9 +257,11 @@ function M.Rows(view, resolve)
             replacement = M.Echo(entry.selectedKey, entry, resolve)
             replacement.proposed = true
             replacement.label = replacement.label .. " (proposed)"
+            replacement.full = replacement.full .. " (proposed)"
         else
+            local label = result.refused and "No replacement" or "Not recorded"
             replacement = { known = false, recorded = false,
-                label = result.refused and "No replacement" or "Not recorded",
+                label = label, full = label, text = label,
                 rarity = M.Rarity(nil) }
         end
         rows[#rows + 1] = {
@@ -256,7 +313,7 @@ function M.Details(entry, resolve, runStartedAt)
         -- It is NOT a count of copies sacrificed, and is not labelled as one.
         eligibleSurplus = entry.sourceCopies,
         recycled = entry.recycle == true,
-        note = entry.reason and display(entry.reason, 240) or nil,
+        note = entry.reason and display(entry.reason) or nil,
         technical = {
             state = entry.state, sourceKey = entry.sourceKey,
             sourceQuality = entry.sourceQuality,
@@ -297,7 +354,8 @@ function M.Header(view)
         title = "Orb history",
         which = view.which,
         runLabel = "Run " .. tostring(view.runId),
-        wishlist = display(view.wishlist or "none", 48),
+        wishlist = display(view.wishlist or "none", WISHLIST_BYTES),
+        wishlistFull = display(view.wishlist or "none"),
         status = RUN_STATES[view.state] or tostring(view.state or "unknown"),
         usage = "Orbs used: " .. spent .. " / " .. limit,
         increased = view.increased == true,

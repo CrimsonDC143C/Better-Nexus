@@ -1,9 +1,23 @@
 -- One assigned target and one explicit Start. Reading either view is passive.
+-- One window, NexusOrbPanel, holds two pages: the run controls and the
+-- read-only history (NexusOrbRunLog, a child page, not its own window).
+-- Switching pages only shows and hides frames: it starts, resumes, confirms
+-- and cancels nothing. Closing the window (Close or Escape) is the one place
+-- an armed new-run review is cancelled, exactly as before.
 Nexus=Nexus or {}
 local UI={};Nexus.OrbPanel=UI
 local frame,advanced=nil,false
 local sourcePage=1
+local page="run"
+local refreshFailing=false
 local CLOSE_NOTICE="Closing the window does not stop an approved run. Use Pause or Stop."
+local MINI_OPEN_TIP="Shows a small movable panel with this run's status and Pause, Resume and Stop. Opening it starts, resumes and spends nothing."
+-- Page sizes. The run page keeps its measured sizes; the history page is
+-- taller so its footer sits below the details instead of over them. Both fit
+-- a 768-unit-high UI (1280x720 or 1366x768 at the largest UI scale).
+local RUN_W,RUN_H,RUN_H_ADVANCED=620,445,660
+local LOG_TOP=40
+local LOG_W,LOG_H=760,588
 local function text(parent,x,y,w,h,value)
     local f=parent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     f:SetPoint("TOPLEFT",x,y);f:SetSize(w,h);f:SetJustifyH("LEFT");f:SetJustifyV("TOP")
@@ -15,6 +29,60 @@ local function button(parent,x,y,w,label,fn)
     b:SetFrameLevel(parent:GetFrameLevel()+2);b:EnableMouse(true);return b
 end
 local function enable(b,on)if on then b:Enable()else b:Disable()end end
+local function selected(b,on)
+    if Nexus.Theme and Nexus.Theme.SetSelected then Nexus.Theme.SetSelected(b,on) end
+end
+local function styled(window,alpha)
+    if not Nexus.Theme then return end
+    if Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(window,alpha) end
+    if Nexus.Theme.StyleTree then Nexus.Theme.StyleTree(window) end
+end
+-- A size change keeps the top-left corner where it is, so the control the
+-- player just pressed stays under the pointer. GetLeft/GetTop and anchor
+-- offsets share the frame's own scale.
+local function pinTopLeft(f)
+    local left,top=f:GetLeft(),f:GetTop()
+    if not left or not top then return end
+    f:ClearAllPoints();f:SetPoint("TOPLEFT",UIParent,"BOTTOMLEFT",left,top)
+end
+-- The whole window stays on the visible UI. A page taller or wider than the
+-- UI is scaled down (LayoutMetrics.FitToScreen: never below 0.5, scale 1 when
+-- it fits). Because GetLeft/GetTop and anchor offsets are in the frame's own
+-- scale, a scale change converts the corner the player sees to the new scale,
+-- then keeps every edge on the UI. Four size reads per refresh; nothing
+-- moves unless the UI size or the page size changed.
+local fitSeen={}
+local function fitWindow()
+    local LM=Nexus.LayoutMetrics
+    if not (frame and LM and LM.FitToScreen and UIParent) then return end
+    local sw,sh=tonumber(UIParent:GetWidth()),tonumber(UIParent:GetHeight())
+    local w,h=tonumber(frame:GetWidth()),tonumber(frame:GetHeight())
+    if fitSeen.sw==sw and fitSeen.sh==sh and fitSeen.w==w and fitSeen.h==h then return end
+    fitSeen.sw,fitSeen.sh,fitSeen.w,fitSeen.h=sw,sh,w,h
+    local before=tonumber(frame:GetScale()) or 1
+    local left,top=frame:GetLeft(),frame:GetTop()
+    -- nil: no plausible UI size was reported, so nothing is moved.
+    local scale=LM.FitToScreen(frame)
+    if not (scale and left and top and w and h) then return end
+    local x,y=left*before,top*before
+    local cx=math.max(0,math.min(x,sw-w*scale))
+    local cy=math.min(sh,math.max(y,h*scale))
+    if math.abs(scale-before)>0.001 or math.abs(cx-x)>0.5 or math.abs(cy-y)>0.5 then
+        frame:ClearAllPoints();frame:SetPoint("TOPLEFT",UIParent,"BOTTOMLEFT",cx/scale,cy/scale)
+    end
+end
+-- The runtime still names a limit-increase step that no window offers. Until
+-- that runtime text changes, the window states the step that does exist.
+local OBSOLETE_TEXT={
+    ["Use Increase limit while paused, or finish this run first."]=
+        "The maximum cannot change during a run. Stop this run, then start a new run with a higher maximum.",
+    ["The approved limit is reached. Confirm an increased limit or stop."]=
+        "The approved maximum is reached. Stop, then start a new run with a higher maximum.",
+}
+local function truthful(value)
+    if value==nil then return nil end
+    return OBSOLETE_TEXT[value] or value
+end
 -- Legacy EditBox has no Button Enable/Disable API. Lock both input routes and
 -- release focus so an approved maximum cannot remain editable during a run.
 local function editLimit(on)
@@ -26,11 +94,26 @@ local function inactiveControls()
     editLimit(false)
     if frame.cont then frame.cont:Hide()end
     for _,b in ipairs(frame.mutations)do b:Disable()end
-    frame.advanced:Hide();frame:SetHeight(445)
+    frame.advanced:Hide();frame:SetHeight(RUN_H)
 end
-local function name(s)return tostring(s or ""):gsub("|","||"):gsub("[%c]"," "):sub(1,100)end
+-- A recorded name on one line: at most 100 characters, cut on a character
+-- boundary (never inside a multi-byte letter or an escaped "||"). whole keeps
+-- the complete value for the box's tooltip.
+local function name(s,whole)
+    local v=tostring(s or ""):gsub("[%c]"," ")
+    if not whole then
+        if Nexus.LayoutMetrics and Nexus.LayoutMetrics.Truncate then v=Nexus.LayoutMetrics.Truncate(v,100)
+        elseif #v>100 then v=v:sub(1,100):gsub("[\192-\255][\128-\191]*$","") end
+    end
+    return (v:gsub("|","||"))
+end
+-- Sets a box's text. When a name in it was shortened, its tooltip
+-- (LayoutMetrics.FullTextTooltip) carries the complete text.
+local function setFull(fs,shown,full)
+    fs:SetText(shown);fs._nexusFullText=(full and full~=shown) and full or nil
+end
 local function notify(ok,err)
-    if frame then frame.notice:SetText(err or (ok and "" or "No change."))end
+    if frame then frame.notice:SetText(truthful(err) or (ok and "" or "No change."))end
     UI.Refresh()
 end
 local function primary(limit,tracked)
@@ -59,7 +142,7 @@ local confirmNewRun=false
 -- example a tracked balance that changed) needs a new review.
 local confirmAmount=nil
 
--- Read-only Orb history window. It renders one fixed row pool, reads only the
+-- Read-only Orb history page. It renders one fixed row pool, reads only the
 -- page it shows plus the operation whose details are open, and performs no Orb
 -- action: opening, paging, selecting and copying spend nothing, select nothing
 -- and write nothing. All presentation lives in Nexus.OrbHistory, which reads
@@ -68,7 +151,7 @@ local LOG_ROWS=8
 -- One column layout for the header AND the body. A heading that keeps its own
 -- offsets drifts away from the values it labels the moment either side is
 -- touched, so both read these measurements and nothing else. ROW_X is where a
--- row starts inside the window, so the header sits on the same origin.
+-- row starts inside the page, so the header sits on the same origin.
 local LOG_ROW_X,LOG_ROW_W=20,720
 local LOG_COLUMNS={
     {key="index",label="#",x=0,w=28},
@@ -77,12 +160,21 @@ local LOG_COLUMNS={
     {key="reason",label="Why selected",x=456,w=150},
     {key="result",label="Result",x=612,w=105},
 }
+-- Vertical bands of the history page, top to bottom, each starting below the
+-- previous one: run selector and header, warning, headings, rows, details,
+-- footer, note.
+local LOG_BANDS={
+    header={y=-2,h=50},warning={y=-56,h=20},headings={y=-80,h=18},
+    rows={y=-102,h=40},details={y=-428,h=96},footer={y=-530,h=24},
+    note={y=-558,h=20},
+}
 local logFrame,logView,logPage=nil,"current",1
 local logSelection=nil
 local logCopyFrame=nil
 local logCopy={key=nil,text=nil}
 local logSeen={}
 local logRendered=nil
+local ensureLog,refreshLog
 -- Labels resolved for the ids this page actually shows. Cleared whenever the
 -- history revision changes, so a stale label cannot outlive its page.
 local logLabels={key=nil,byId={}}
@@ -127,22 +219,50 @@ local function logResolve(spellId)
     return label,icon
 end
 local function logHistory() return assert(Nexus.OrbHistory,"Orb history projection unavailable") end
+-- Pages share the one window. Only frames are shown and hidden here.
+local function showPage(name)
+    if page==name then return end
+    page=name
+    local onRun=name=="run"
+    for _,w in ipairs(frame.runWidgets)do if onRun then w:Show()else w:Hide()end end
+    selected(frame.runTab,onRun);selected(frame.historyTab,not onRun)
+    pinTopLeft(frame)
+    if onRun then
+        if logFrame then logFrame:Hide()end
+        frame:SetWidth(RUN_W);frame:SetHeight(advanced and RUN_H_ADVANCED or RUN_H)
+    else
+        -- A hidden box must not keep the keyboard. Typed text is already the
+        -- runtime's draft, so nothing is lost.
+        frame.limit:ClearFocus()
+        ensureLog()
+        frame:SetWidth(LOG_W);frame:SetHeight(LOG_TOP+LOG_H)
+        logFrame:Show()
+    end
+    fitWindow()
+end
 local function refresh()
     if not frame or not frame:IsShown()then return end
+    -- The history page is read-only and reads its own data; the run controls
+    -- are hidden, so they are not rendered.
+    if page~="run" then return end
     local ready=Nexus.StartupStatus and Nexus.StartupStatus()
     if not ready or not ready.coreReady then
-        frame.plan:SetText("Restoring assigned Wishlist...")
-        frame.status:SetText("Reading local saved data. Shared-library loading is not required.")
+        setFull(frame.plan,"Restoring assigned Wishlist...")
+        setFull(frame.status,"Reading local saved data. Shared-library loading is not required.")
         frame.balance:SetText("Orb balance: loading")
         frame.targets:SetText("");frame.permanent:SetText("");frame.usage:SetText("")
         inactiveControls()
+        -- No run can be read yet, so the compact status is not offered either.
+        frame.miniPanel:Disable()
         return
     end
+    frame.miniPanel:Enable()
     -- One display read per refresh; the source list is prepared only for Advanced.
     -- The snapshot authorizes nothing: Start, Resume and every spend read again.
     local s=Nexus.OrbRuntime.Status(advanced);frame.snapshot=s
     local a=s.assignment or {};local busy=s.running or s.pending or s.state=="PAUSED" or s.state=="LIMIT"
-    frame.plan:SetText(a.state=="restoring" and "Restoring assigned Wishlist..." or ("Assigned Wishlist: "..name(a.name or "none")))
+    if a.state=="restoring" then setFull(frame.plan,"Restoring assigned Wishlist...")
+    else setFull(frame.plan,"Assigned Wishlist: "..name(a.name or "none"),"Assigned Wishlist: "..name(a.name or "none",true)) end
     -- A ready assignment whose read was refused is still assigned: its progress
     -- is unavailable (the reason is in the status line), not unassigned.
     local targets
@@ -183,18 +303,22 @@ local function refresh()
     frame.usage:SetText("Orbs used: "..s.spent.." / "..((busy or s.limit>0)and s.limit or (shown~="" and shown or "-"))
         ..(s.reserved>0 and ("; unresolved exposure: "..s.reserved)or ""))
     local reason=(s.running or s.pending or s.state=="PAUSED")and s.reason or (s.startReason or s.reason)
-    frame.status:SetText((phases[s.state]or s.state).."\n"..(reason or s.error or ""))
+    setFull(frame.status,(phases[s.state]or s.state).."\n"..(truthful(reason) or s.error or ""))
     if confirmNewRun and s.state=="FINISHED" then
         frame.status:SetText(frame.status:GetText().."\nPress Confirm new run to start a new run of up to "
             ..tostring(frame.limit:GetText()).." Orb(s). Close this window to cancel.")
     end
-    if s.targetChanged then frame.status:SetText(frame.status:GetText().."\nOriginal operation: "..name(s.operationName))end
+    if s.targetChanged then
+        local base=frame.status:GetText().."\nOriginal operation: "
+        setFull(frame.status,base..name(s.operationName),base..name(s.operationName,true))
+    end
     frame.assignmentNote:SetText(a.mirrorNote or "")
     if advanced then
         local rows=s.sources or {};sourcePage=math.max(1,math.min(sourcePage,math.max(1,math.ceil(#rows/4))))
         for i,r in ipairs(frame.sourceRows)do
             local v=rows[(sourcePage-1)*4+i];r.key=v and v.key
-            r.label:SetText(v and (name(v.name).." (quality "..v.quality.."): "..v.excess.." safe excess")or "")
+            local tail=v and (" (quality "..v.quality.."): "..v.excess.." safe excess")
+            setFull(r.label,v and (name(v.name)..tail) or "",v and (name(v.name,true)..tail))
             enable(r.exclude,v~=nil and not busy)
         end
         enable(frame.clearExclusions,not busy)
@@ -204,29 +328,40 @@ local function refresh()
     do
         local cv=Nexus.OrbRuntime.ContinueView()
         local stage=cv.stage
+        frame.cont:SetText(stage=="done" and "Review outcome..."
+            or stage=="refused" and "Review check..."
+            or stage=="checking" and "Check progress..." or "Continue...")
         if cv.eligible==true or stage=="checking" or stage=="ready" or stage=="refused" or stage=="done" then frame.cont:Show()else frame.cont:Hide()end
     end
     if advanced then frame.advanced:Show()else frame.advanced:Hide()end
-    frame:SetHeight(advanced and 660 or 445)
+    selected(frame.advancedToggle,advanced)
+    frame:SetHeight(advanced and RUN_H_ADVANCED or RUN_H)
+    return true -- A complete run-status read/render, not a history/loading pass.
 end
 function UI.Refresh()
     if not frame or not frame:IsShown()then return end
     local ok,err=pcall(refresh)
     if not ok then
         inactiveControls()
-        frame.status:SetText("Orb panel refresh failed. Controls are unavailable.")
+        setFull(frame.status,"Orb panel refresh failed. Controls are unavailable.")
+        -- Keep controls unavailable on every failed read, but report only the
+        -- first error in an episode. A successful read permits a new report.
+        if refreshFailing then return end
+        refreshFailing=true
         error(err,0)
     end
+    if err==true then refreshFailing=false end
+    -- Advanced, a page change or a new UI scale or screen size.
+    fitWindow()
 end
 local function ensure()
     if frame then return end
-    frame=CreateFrame("Frame","NexusOrbPanel",UIParent);frame:Hide();frame:SetSize(620,445);frame:SetPoint("CENTER",UIParent,"CENTER",0,0)
+    frame=CreateFrame("Frame","NexusOrbPanel",UIParent);frame:Hide();frame:SetSize(RUN_W,RUN_H);frame:SetPoint("CENTER",UIParent,"CENTER",0,0)
     frame:SetFrameStrata("DIALOG");frame:SetFrameLevel(30);frame:EnableMouse(true);frame:SetMovable(true);frame:SetClampedToScreen(true)
     frame:RegisterForDrag("LeftButton");frame:SetScript("OnDragStart",function(self)self:StartMoving()end)
     frame:SetScript("OnDragStop",function(self)self:StopMovingOrSizing()end)
     frame:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",edgeSize=14,insets={left=4,right=4,top=4,bottom=4}})
     frame:SetBackdropColor(.035,.04,.05,1)
-    text(frame,20,-16,560,24,"Orbs / Lost Memories")
     frame.plan=text(frame,20,-48,440,32)
     frame.assigned=button(frame,469,-48,130,"My Builds",function()
         if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then Nexus.JournalTab.OpenBuilds()
@@ -235,6 +370,7 @@ local function ensure()
     frame.targets=text(frame,20,-82,580,26);frame.permanent=text(frame,20,-112,580,28);frame.balance=text(frame,20,-144,580,34)
     frame.limitLabel=text(frame,20,-190,170,24,"Maximum Orbs this run:")
     frame.limit=CreateFrame("EditBox",nil,frame,"InputBoxTemplate");frame.limit:SetSize(65,25);frame.limit:SetPoint("TOPLEFT",196,-188)
+    if Nexus.Theme and Nexus.Theme.StyleInput then Nexus.Theme.StyleInput(frame.limit) end
     frame.limit:SetFrameLevel(32);frame.limit:SetAutoFocus(false);frame.limit:SetNumeric(true);frame.limit:SetMaxLetters(5)
     frame.limit:SetScript("OnEditFocusGained",function(self)if not self.editable or not frame:IsShown()then self:ClearFocus()end end)
     frame.limit:SetScript("OnEnterPressed",function(self)
@@ -312,14 +448,37 @@ local function ensure()
     if Nexus.LayoutMetrics then
         frame.statusHit=Nexus.LayoutMetrics.FullTextTooltip(frame.status,frame)
         frame.noticeHit=Nexus.LayoutMetrics.FullTextTooltip(frame.notice,frame)
+        frame.balanceHit=Nexus.LayoutMetrics.FullTextTooltip(frame.balance,frame)
+        frame.targetsHit=Nexus.LayoutMetrics.FullTextTooltip(frame.targets,frame)
+        frame.planHit=Nexus.LayoutMetrics.FullTextTooltip(frame.plan,frame)
     end
     -- 035: only while an unresolved action can be continued, or a check is in progress, or its result is shown.
     frame.cont=button(frame,470,-364,130,"Continue...",function()UI.ShowContinue()end)
     frame.cont:Hide()
     frame.closeNotice=text(frame,20,-393,580,20,CLOSE_NOTICE)
     button(frame,20,-414,85,"Help",function()Nexus.Help.Show("orbs")end)
-    button(frame,115,-414,95,"Advanced",function()advanced=not advanced;UI.Refresh()end)
-    button(frame,220,-414,95,"Run log",function()UI.ShowLog()end)
+    frame.advancedToggle=button(frame,115,-414,95,"Advanced",function()
+        advanced=not advanced;pinTopLeft(frame);UI.Refresh()
+    end)
+    frame.appearance=button(frame,220,-414,110,"Appearance",function(self)
+        if Nexus.Theme and Nexus.Theme.ShowMenu then Nexus.Theme.ShowMenu(self)end
+    end)
+    frame.appearance:SetScript("OnEnter",function(self)
+        if not (GameTooltip and Nexus.Theme) then return end
+        GameTooltip:SetOwner(self,"ANCHOR_TOP")
+        GameTooltip:SetText("Appearance: "..Nexus.Theme.Summary(),1,1,1,1,true)
+        GameTooltip:AddLine(Nexus.Theme.HELP,.9,.9,.9,true)
+        GameTooltip:Show()
+    end)
+    frame.appearance:SetScript("OnLeave",function()if GameTooltip then GameTooltip:Hide()end end)
+    -- The optional compact status (UI.ShowMini). It only shows that panel:
+    -- this window stays as it is, and nothing is started or changed.
+    frame.miniPanel=button(frame,340,-414,110,"Mini panel",function()UI.ShowMini()end)
+    frame.miniPanel:SetScript("OnEnter",function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self,"ANCHOR_TOP");GameTooltip:SetText(MINI_OPEN_TIP,1,1,1,1,true);GameTooltip:Show()
+    end)
+    frame.miniPanel:SetScript("OnLeave",function()if GameTooltip then GameTooltip:Hide()end end)
     button(frame,515,-414,85,"Close",function()frame:Hide()end)
     frame.advanced=CreateFrame("Frame",nil,frame);frame.advanced:Hide();frame.advanced:SetSize(590,205);frame.advanced:SetPoint("TOPLEFT",15,-446);frame.advanced:SetFrameLevel(31)
     local af=frame.advanced
@@ -328,6 +487,7 @@ local function ensure()
     frame.sourceRows={}
     for i=1,4 do
         local r={};r.label=text(af,5,-38-(i-1)*28,455,25)
+        if Nexus.LayoutMetrics then r.hit=Nexus.LayoutMetrics.FullTextTooltip(r.label,af) end
         r.exclude=button(af,468,-35-(i-1)*28,100,"Exclude",function()if r.key then notify(Nexus.OrbRuntime.Exclude(r.key,true))end end)
         frame.sourceRows[i]=r
     end
@@ -337,10 +497,36 @@ local function ensure()
     frame.assignmentNote=text(af,5,-180,565,31)
     frame.mutations={frame.start,frame.stop,frame.assigned,frame.clearExclusions,frame.max}
     for _,r in ipairs(frame.sourceRows)do frame.mutations[#frame.mutations+1]=r.exclude end
+    -- Only the run text and child controls belong to this page. Root Texture
+    -- regions can be window backdrop/decorative artwork and must remain shown
+    -- on history. The title, tabs and history are created after this capture.
+    frame.runWidgets={}
+    do
+        local seen={}
+        for _,list in ipairs({{frame:GetRegions()},{frame:GetChildren()}})do
+            for _,w in ipairs(list)do
+                if not seen[w] and (w:GetObjectType()~="Texture") then
+                    seen[w]=true;frame.runWidgets[#frame.runWidgets+1]=w
+                end
+            end
+        end
+    end
+    frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    frame.title:SetPoint("TOPLEFT",20,-17);frame.title:SetSize(320,20);frame.title:SetJustifyH("LEFT")
+    frame.title:SetText("Orbs / Lost Memories")
+    frame.runTab=button(frame,352,-12,116,"Run controls",function()showPage("run");UI.Refresh()end)
+    frame.historyTab=button(frame,474,-12,110,"Run history",function()UI.ShowLog()end)
+    selected(frame.runTab,true)
     inactiveControls()
     frame:SetScript("OnShow",function()UI.Refresh()end)
-    frame:SetScript("OnHide",function()editLimit(false);confirmNewRun=false;confirmAmount=nil end)
+    -- Closing the window is the one place an armed review is cancelled; it
+    -- also closes the history page and its copy view.
+    frame:SetScript("OnHide",function()
+        editLimit(false);confirmNewRun=false;confirmAmount=nil
+        if logFrame then logFrame:Hide()end
+    end)
     local elapsed=0;frame:SetScript("OnUpdate",function(_,dt)elapsed=elapsed+(dt or 0);if elapsed>=.25 then elapsed=0;UI.Refresh()end end)
+    styled(frame,0.96)
     frame:Hide();UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusOrbPanel"
 end
 local RESULT_TONE={Confirmed={.55,.85,.55},["Not sent"]={.95,.5,.45},
@@ -355,15 +541,24 @@ local function logCell(fs,label,color)
     fs:SetText(label or "")
     if color then pcall(fs.SetTextColor,fs,color[1],color[2],color[3]) end
 end
+-- Character-safe shortening, so a cut never splits a multi-byte letter.
+local function shorten(value,limit)
+    if Nexus.LayoutMetrics and Nexus.LayoutMetrics.Truncate then
+        return Nexus.LayoutMetrics.Truncate(value,limit)
+    end
+    return (Nexus.OrbHistory.Ellipsis(value,limit))
+end
 -- Two lines per Echo cell: the name, then the rarity word. The colour repeats
--- the rarity; it is never the only cue.
+-- the rarity; it is never the only cue. A proposed replacement keeps its
+-- marker on the rarity line, so shortening a long name cannot drop it. The
+-- name is cut from the unescaped recorded text and its pipes are doubled
+-- after the cut, so the cut never splits a letter or an escaped "||".
 local CELL_LETTERS=30
 local function logEchoText(cell)
     if not cell then return "" end
-    local history=Nexus.OrbHistory
-    local shown=history.Ellipsis(cell.label,CELL_LETTERS)
+    local shown=(shorten(tostring(cell.text or ""),CELL_LETTERS):gsub("|","||"))
     if cell.recorded==false then return shown end
-    return shown.."\n"..cell.rarity.label
+    return shown.."\n"..cell.rarity.label..(cell.proposed and " - proposed" or "")
 end
 local function logDetailText(details,history)
     if not details then return "Select an operation to see what was offered and why it was chosen." end
@@ -374,19 +569,19 @@ local function logDetailText(details,history)
         local parts={}
         for _,offer in ipairs(details.offers) do
             local mark=offer.confirmed and " [received]" or (offer.selected and " [selected]" or "")
-            parts[#parts+1]=offer.label.." ("..offer.rarity.label..")"..mark
+            parts[#parts+1]=offer.full.." ("..offer.rarity.label..")"..mark
         end
         add("Offered: "..table.concat(parts,"   "))
     else
         add("Offered: "..tostring(details.offersNote))
     end
-    add("Why: "..details.reason.label..(details.reason.detail and (" - "..details.reason.detail) or ""))
+    add("Why: "..details.reason.full..(details.reason.detail and (" - "..details.reason.detail) or ""))
     if details.proposedSource then
-        add("Proposed source: "..details.proposedSource.label
+        add("Proposed source: "..details.proposedSource.full
             .." ("..details.proposedSource.rarity.label..")"
             .."; no consumed source is recorded for this operation.")
     elseif details.consumed then
-        add("Consumed source: "..details.consumed.label
+        add("Consumed source: "..details.consumed.full
             .." ("..details.consumed.rarity.label..")")
     end
     if details.eligibleSurplus~=nil then
@@ -404,7 +599,26 @@ local function logDetailText(details,history)
         ..(details.sinceStart and ("; "..string.format("%.1f",details.sinceStart).."s after the run started") or ""))
     return table.concat(lines,"\n")
 end
-local function refreshLog(force)
+-- The whole recorded row for its tooltip: complete names, the proposed
+-- marker, the reason with its explanation, the result and any recorded note.
+local function logRowTip(model,history)
+    local lines={}
+    local replacement=model.replacement
+    lines[#lines+1]="Replaced Echo: "..model.source.full.." ("..model.source.rarity.label..")"
+    if replacement.recorded~=false then
+        lines[#lines+1]="Replacement: "..replacement.full.." ("..replacement.rarity.label..")"
+            ..(replacement.proposed and " - selected, not received" or "")
+    else
+        lines[#lines+1]="Replacement: "..replacement.full
+    end
+    lines[#lines+1]="Why selected: "..model.reason.full
+    if model.reason.detail then lines[#lines+1]=model.reason.detail end
+    lines[#lines+1]="Result: "..model.result.label
+    local note=model.entry and model.entry.reason
+    if note then lines[#lines+1]="Recorded note: "..history.Display(note) end
+    return lines
+end
+function refreshLog(force)
     if not logFrame or not logFrame:IsShown() then return end
     local history=logHistory()
     local run=logPageView(logPage)
@@ -417,17 +631,23 @@ local function refreshLog(force)
         logPage=pages;logSelection=nil;run=logPageView(logPage);key=logKey(run)
     end
     local header=history.Header(run)
-    logFrame.header:SetText(header.empty and header.status
-        or (header.runLabel.." - "..header.wishlist.."\n"..header.status.."\n"..header.usage
-            ..(header.increased and " (maximum was increased)" or "")))
+    -- A shortened Wishlist name is complete in the header's tooltip.
+    local function headerText(wishlist)
+        return header.runLabel.." - "..wishlist.."\n"..header.status.."\n"..header.usage
+            ..(header.increased and " (maximum was increased)" or "")
+    end
+    if header.empty then setFull(logFrame.header,header.status)
+    else setFull(logFrame.header,headerText(header.wishlist),headerText(header.wishlistFull)) end
     local warnings={}
     if header.pending then warnings[#warnings+1]=header.pending end
     if header.truncated then warnings[#warnings+1]=header.truncated end
     logFrame.warning:SetText(table.concat(warnings,"  "))
+    -- The run shown is marked by a bar as well as by its disabled button.
     enable(logFrame.current,logView~="current")
     enable(logFrame.previous,logView~="previous" and header.hasPrevious)
+    selected(logFrame.current,logView=="current");selected(logFrame.previous,logView=="previous")
     local rows=history.Rows(run,logResolve)
-    local selected=nil
+    local selectedModel=nil
     for index,row in ipairs(logFrame.rows) do
         local model=rows[index]
         row.serial=model and model.serial or nil
@@ -439,28 +659,29 @@ local function refreshLog(force)
             logCell(row.reason,model.reason.label)
             logCell(row.result,model.result.label,logRowTone(model.result))
             row.detail=model.reason.detail
-            row.full=model.source.label.." ("..model.source.rarity.label..")"
-                .."  ->  "..model.replacement.label
+            row.full=model.source.full.." ("..model.source.rarity.label..")"
+                .."  ->  "..model.replacement.full
                 ..(model.replacement.recorded~=false
                     and (" ("..model.replacement.rarity.label..")") or "")
+            row.tip=logRowTip(model,history)
             row.icon:SetTexture(model.source.icon or "")
             row.resultIcon:SetTexture(model.replacement.icon or "")
             if logSelection and model.serial==logSelection then
-                selected=model;row.highlight:Show()
+                selectedModel=model;row.highlight:Show()
             else row.highlight:Hide() end
         else
-            row:Hide();row.highlight:Hide();row.detail=nil;row.full=nil
+            row:Hide();row.highlight:Hide();row.detail=nil;row.full=nil;row.tip=nil
             logCell(row.index,"");logCell(row.source,"");logCell(row.replacement,"")
             logCell(row.reason,"");logCell(row.result,"")
         end
     end
-    if logSelection and not selected then logSelection=nil end
-    local details=selected and history.Details(selected.entry,logResolve,run and run.startedAt) or nil
+    if logSelection and not selectedModel then logSelection=nil end
+    local details=selectedModel and history.Details(selectedModel.entry,logResolve,run and run.startedAt) or nil
     logFrame.details:SetText(logDetailText(details,history))
-    -- The scrolled child is as tall as the measured details, so every line
-    -- of a long operation is reachable.
+    -- The scrolled child is as tall as the measured details, and the footer
+    -- sits below the viewport, so every line of a long operation is reachable.
     if Nexus.LayoutMetrics then
-        logFrame.detailChild:SetHeight(Nexus.LayoutMetrics.WrapHeight(logFrame.details,680,96))
+        logFrame.detailChild:SetHeight(Nexus.LayoutMetrics.WrapHeight(logFrame.details,680,LOG_BANDS.details.h))
     end
     logFrame.page:SetText(history.PageLabel(total,logPage,LOG_ROWS,run and run.truncated))
     enable(logFrame.prev,logPage>1)
@@ -493,19 +714,18 @@ local function logReportText(technical)
     end
     return logCopy.text
 end
+-- The copy view is a panel over the history page of the same window. It
+-- closes with that page and with the window.
 local function ensureCopyView()
     if logCopyFrame then return logCopyFrame end
-    local f=CreateFrame("Frame","NexusOrbHistoryCopy",UIParent);f:Hide()
+    local f=CreateFrame("Frame","NexusOrbHistoryCopy",logFrame);f:Hide()
     logCopyFrame=f
-    f:SetSize(640,460);f:SetPoint("CENTER",UIParent,"CENTER",0,0)
-    f:SetFrameStrata("DIALOG");f:SetFrameLevel(60);f:EnableMouse(true)
-    f:SetMovable(true);f:SetClampedToScreen(true);f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart",function(self)self:StartMoving()end)
-    f:SetScript("OnDragStop",function(self)self:StopMovingOrSizing()end)
+    f:SetSize(640,460);f:SetPoint("CENTER",logFrame,"CENTER",0,0)
+    f:SetFrameLevel(logFrame:GetFrameLevel()+20);f:EnableMouse(true)
     f:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",edgeSize=14,insets={left=4,right=4,top=4,bottom=4}})
     f:SetBackdropColor(.035,.04,.05,1)
     text(f,20,-14,600,22,"Copy this report")
-    text(f,20,-36,600,32,"Select the text and copy it. Opening this view sends nothing anywhere.")
+    text(f,20,-36,600,32,"Press Select all, then copy with Ctrl+C. Opening this view sends nothing anywhere.")
     f.check=CreateFrame("CheckButton","NexusOrbHistoryTechnical",f,"UICheckButtonTemplate")
     f.check:SetSize(22,22);f.check:SetPoint("TOPLEFT",20,-68)
     f.checkLabel=text(f,46,-72,400,20,"Include technical details")
@@ -526,53 +746,57 @@ local function ensureCopyView()
     f.editBox:SetWidth(566)
     f.editBox:SetScript("OnEscapePressed",function(self)self:ClearFocus()end)
     f.scroll:SetScrollChild(f.editBox)
-    button(f,20,-410,110,"Clear focus",function()f.editBox:ClearFocus()end)
+    button(f,20,-410,110,"Select all",function()f.editBox:SetFocus();f.editBox:HighlightText()end)
+    button(f,140,-410,110,"Clear focus",function()f.editBox:ClearFocus()end)
     button(f,515,-410,85,"Close",function()f:Hide()end)
     f:SetScript("OnHide",function()f.editBox:ClearFocus()end)
-    UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusOrbHistoryCopy"
+    styled(f,0.98)
     return f
 end
-local function ensureLog()
+function ensureLog()
     if logFrame then return end
-    logFrame=CreateFrame("Frame","NexusOrbRunLog",UIParent);logFrame:Hide()
-    logFrame:SetSize(760,560);logFrame:SetPoint("CENTER",UIParent,"CENTER",40,-20)
-    logFrame:SetFrameStrata("DIALOG");logFrame:SetFrameLevel(40);logFrame:EnableMouse(true)
-    logFrame:SetMovable(true);logFrame:SetClampedToScreen(true);logFrame:RegisterForDrag("LeftButton")
-    logFrame:SetScript("OnDragStart",function(self)self:StartMoving()end)
-    logFrame:SetScript("OnDragStop",function(self)self:StopMovingOrSizing()end)
-    logFrame:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",edgeSize=14,insets={left=4,right=4,top=4,bottom=4}})
-    logFrame:SetBackdropColor(.035,.04,.05,1)
-    text(logFrame,20,-14,400,24,"Orb history")
-    logFrame.current=button(logFrame,20,-42,120,"Current run",function()
+    logFrame=CreateFrame("Frame","NexusOrbRunLog",frame);logFrame:Hide()
+    logFrame:SetSize(LOG_W,LOG_H);logFrame:SetPoint("TOPLEFT",frame,"TOPLEFT",0,-LOG_TOP)
+    logFrame:SetFrameLevel(frame:GetFrameLevel()+1);logFrame:EnableMouse(true)
+    logFrame.current=button(logFrame,20,-4,120,"Current run",function()
         if logView=="current" then return end
         logView="current";logPage=1;logSelection=nil;refreshLog()
     end)
-    logFrame.previous=button(logFrame,146,-42,120,"Previous run",function()
+    logFrame.previous=button(logFrame,146,-4,120,"Previous run",function()
         if logView=="previous" then return end
         logView="previous";logPage=1;logSelection=nil;refreshLog()
     end)
-    logFrame.header=text(logFrame,280,-40,460,50)
-    logFrame.warning=text(logFrame,20,-72,720,20)
+    logFrame.header=text(logFrame,280,LOG_BANDS.header.y,460,LOG_BANDS.header.h)
+    logFrame.warning=text(logFrame,20,LOG_BANDS.warning.y,720,LOG_BANDS.warning.h)
+    if Nexus.LayoutMetrics then
+        logFrame.headerHit=Nexus.LayoutMetrics.FullTextTooltip(logFrame.header,logFrame)
+        logFrame.warningHit=Nexus.LayoutMetrics.FullTextTooltip(logFrame.warning,logFrame)
+    end
     -- The heading row is a frame on the row origin, and each heading is one
     -- font string at its own column's x and width. Same numbers, one source.
     logFrame.columns=CreateFrame("Frame",nil,logFrame)
-    logFrame.columns:SetSize(LOG_ROW_W,18)
-    logFrame.columns:SetPoint("TOPLEFT",LOG_ROW_X,-96)
+    logFrame.columns:SetSize(LOG_ROW_W,LOG_BANDS.headings.h)
+    logFrame.columns:SetPoint("TOPLEFT",LOG_ROW_X,LOG_BANDS.headings.y)
     logFrame.columnHeadings={}
     for _,column in ipairs(LOG_COLUMNS) do
-        local heading=text(logFrame.columns,column.x,0,column.w,18,column.label)
+        local heading=text(logFrame.columns,column.x,0,column.w,LOG_BANDS.headings.h,column.label)
         heading:SetJustifyV("MIDDLE")
         logFrame.columnHeadings[column.key]=heading
     end
     logFrame.rows={}
+    local rowH=LOG_BANDS.rows.h
     for i=1,LOG_ROWS do
         local row=CreateFrame("Button",nil,logFrame)
-        row:SetSize(LOG_ROW_W,40);row:SetPoint("TOPLEFT",LOG_ROW_X,-118-(i-1)*40)
+        row:SetSize(LOG_ROW_W,rowH);row:SetPoint("TOPLEFT",LOG_ROW_X,LOG_BANDS.rows.y-(i-1)*rowH)
         row:SetFrameLevel(logFrame:GetFrameLevel()+1)
         row.highlight=row:CreateTexture(nil,"BACKGROUND")
         row.highlight:SetTexture("Interface\\Buttons\\WHITE8X8")
         row.highlight:SetAllPoints(row);row.highlight:SetVertexColor(.16,.24,.29,.5)
         row.highlight:Hide()
+        -- Pointer feedback: the client shows this layer only under the mouse.
+        row.hover=row:CreateTexture(nil,"HIGHLIGHT")
+        row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.hover:SetAllPoints(row);row.hover:SetVertexColor(.30,.40,.52,.18)
         row.separator=row:CreateTexture(nil,"BACKGROUND")
         row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
         row.separator:SetSize(LOG_ROW_W,1);row.separator:SetPoint("BOTTOMLEFT",0,0)
@@ -595,11 +819,17 @@ local function ensureLog()
             refreshLog()
         end)
         row:SetScript("OnEnter",function(self)
-            -- A shortened cell keeps its whole recorded value here.
+            -- A shortened cell keeps its whole recorded value here, wrapped.
             if not GameTooltip or (not self.detail and not self.full) then return end
             GameTooltip:SetOwner(self,"ANCHOR_TOP")
-            GameTooltip:SetText(self.full or "Why this Echo was selected")
-            if self.detail then GameTooltip:AddLine(self.detail,1,1,1,true) end
+            local lines=self.tip
+            if lines and lines[1] then
+                GameTooltip:SetText(lines[1],1,1,1,1,true)
+                for index=2,#lines do GameTooltip:AddLine(lines[index],.9,.9,.9,true) end
+            else
+                GameTooltip:SetText(self.full or "Why this Echo was selected",1,1,1,1,true)
+                if self.detail then GameTooltip:AddLine(self.detail,1,1,1,true) end
+            end
             GameTooltip:Show()
         end)
         row:SetScript("OnLeave",function() if GameTooltip then GameTooltip:Hide() end end)
@@ -608,28 +838,30 @@ local function ensureLog()
     end
     logFrame.detailScroll=CreateFrame("ScrollFrame","NexusOrbHistoryDetailScroll",
         logFrame,"UIPanelScrollFrameTemplate")
-    logFrame.detailScroll:SetPoint("TOPLEFT",20,-444)
-    logFrame.detailScroll:SetSize(700,96)
+    logFrame.detailScroll:SetPoint("TOPLEFT",20,LOG_BANDS.details.y)
+    logFrame.detailScroll:SetSize(700,LOG_BANDS.details.h)
     logFrame.detailChild=CreateFrame("Frame",nil,logFrame.detailScroll)
-    logFrame.detailChild:SetSize(680,96)
+    logFrame.detailChild:SetSize(680,LOG_BANDS.details.h)
     logFrame.details=text(logFrame.detailChild,0,0,680,400)
     logFrame.detailScroll:SetScrollChild(logFrame.detailChild)
-    logFrame.page=text(logFrame,20,-512,300,22)
-    logFrame.prev=button(logFrame,320,-510,85,"Previous",function()
+    local footerY=LOG_BANDS.footer.y
+    logFrame.page=text(logFrame,20,footerY-2,300,22)
+    logFrame.prev=button(logFrame,320,footerY,85,"Previous",function()
         if logPage<=1 then return end
         logPage=logPage-1;logSelection=nil;refreshLog()
     end)
-    logFrame.next=button(logFrame,410,-510,85,"Next",function()
+    logFrame.next=button(logFrame,410,footerY,85,"Next",function()
         logPage=logPage+1;logSelection=nil;refreshLog()
     end)
-    button(logFrame,500,-510,115,"Copy report",function()
+    button(logFrame,500,footerY,115,"Copy report",function()
         local view=ensureCopyView()
         view:Show()
         view.editBox:SetText(logReportText(view.check:GetChecked() and true or false))
         view.editBox:SetCursorPosition(0)
     end)
-    button(logFrame,625,-510,95,"Close",function()logFrame:Hide()end)
-    logFrame.note=text(logFrame,20,-536,720,20,Nexus.OrbHistory and Nexus.OrbHistory.SESSION_NOTE or "")
+    -- Close closes the whole Orb window, like Escape.
+    button(logFrame,625,footerY,95,"Close",function()frame:Hide()end)
+    logFrame.note=text(logFrame,20,LOG_BANDS.note.y,720,LOG_BANDS.note.h,Nexus.OrbHistory and Nexus.OrbHistory.SESSION_NOTE or "")
     logFrame:SetScript("OnShow",function()refreshLog()end)
     logFrame:SetScript("OnHide",function() if logCopyFrame then logCopyFrame:Hide() end end)
     local elapsed=0
@@ -637,10 +869,15 @@ local function ensureLog()
         -- Nothing runs while hidden; visible, this is one bounded header read.
         elapsed=elapsed+(dt or 0);if elapsed>=.5 then elapsed=0;logVisibleCheck() end
     end)
-    UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusOrbRunLog"
+    if Nexus.Theme and Nexus.Theme.StyleTree then Nexus.Theme.StyleTree(logFrame) end
 end
+UI.LOG_BANDS,UI.LOG_SIZE,UI.RUN_SIZE={},{w=LOG_W,h=LOG_H,top=LOG_TOP},{w=RUN_W,h=RUN_H,advanced=RUN_H_ADVANCED}
+for key,band in pairs(LOG_BANDS)do UI.LOG_BANDS[key]={y=band.y,h=band.h}end
+-- The page shown now: "run" or "history".
+function UI.Page() return page end
+-- Opens the window on its history page. Reading only.
 function UI.ShowLog()
-    ensureLog();logFrame:Show();refreshLog();return logFrame
+    ensure();showPage("history");frame:Show();logFrame:Show();refreshLog();return logFrame
 end
 
 -- 035: Continue with an unconfirmed outcome. Reading and opening this window send nothing.
@@ -706,12 +943,14 @@ local function ensureContinue()
     end)
     local elapsed=0
     f:SetScript("OnUpdate",function(_,dt)elapsed=elapsed+(dt or 0);if elapsed>=.25 then elapsed=0;contRefresh()end end)
+    styled(f,0.96)
     UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusOrbContinue"
 end
 function UI.ShowContinue()
     ensureContinue();contFrame:Show();contRefresh();return contFrame
 end
-function UI.Show()ensure();frame:Show();UI.Refresh();return frame end
+-- Opens the window on its run page.
+function UI.Show()ensure();showPage("run");frame:Show();UI.Refresh();return frame end
 function UI.Hide()if frame then frame:Hide()end end
 
 -- Compact main-panel controls remain usable when the detailed window is hidden.
@@ -741,3 +980,343 @@ function UI.AttachMainPanel(parent)
     parent:HookScript("OnUpdate",function(_,dt)elapsed=elapsed+(dt or 0);if elapsed>=.25 then elapsed=0;f.refresh()end end)
     f.refresh();return f
 end
+
+-- Optional compact run status. NexusOrbMini is a small movable window that
+-- only the player opens (UI.ShowMini, or Mini panel on the run page). It is
+-- created on first use, is hidden in every new session and keeps its place
+-- until a reload; nothing about it is saved. While it is shown its only run
+-- read is OrbRuntime.CompactStatus, four times a second, made only once local
+-- saved data is restored (the run page's own Restoring check); hidden, it
+-- does no work. Its actions are Pause, Resume and Stop, each gated again on a
+-- fresh read at the click (the runtime keeps its own final checks), and Open
+-- Orbs, which is UI.Show. It never starts, prepares, confirms, changes a
+-- maximum or advances a run. Close and Escape only hide it: an approved run
+-- keeps running.
+local mini,miniRefresh
+local miniBusy,miniFailing=false,false
+-- The outcome of the panel's last action and the state it was shown for.
+local miniNotice={}
+local miniSeen={}
+local MINI_W,MINI_H,MINI_PAD,MINI_LINE=356,196,12,17
+local MINI_TEXT_W=MINI_W-2*MINI_PAD
+-- A shown line holds at most this many characters: one line of the
+-- conservative 7 px model (docs/UI_TEXT_LAYOUT.md). A longer value is cut on
+-- a character boundary and is complete in the line's tooltip.
+local MINI_CHARS=math.floor(MINI_TEXT_W/7)
+-- Line tops, top to bottom; every line is one MINI_LINE box.
+local MINI_Y={state=-30,reason=-48,usage=-68,pending=-86,missing=-104,notice=-124,note=-142}
+local MINI_BUTTON_Y=-164
+-- Counts are whole numbers from 0 to the runtime's own bound (the default of
+-- its integer()); anything else is unavailable, never 0.
+local MINI_MAX_COUNT=1000000
+local MINI_ACTIONS={pause="Pause",resume="Resume",stop="Stop"}
+local MINI_UNREAD={missing="The Orb runtime is not loaded.",error="Reading the run status failed.",
+    malformed="The run status has an unexpected form."}
+local MINI_UNREAD_TEXT="Could not read the run. Open Orbs for details."
+local function miniCount(v)
+    if type(v)=="number" and v>=0 and v<=MINI_MAX_COUNT and v==math.floor(v) then return v==0 and 0 or v end
+    return nil
+end
+local function miniNumber(v) return string.format("%d",v) end
+-- One line of display text: control characters become spaces, a value longer
+-- than the line is cut on a character boundary ("..." included), and pipes
+-- are doubled after the cut so they show as written. Returns the shown text
+-- and the complete text.
+local function miniText(value)
+    local v=tostring(value or ""):gsub("%c"," ")
+    local cut=v
+    if Nexus.LayoutMetrics and Nexus.LayoutMetrics.Truncate then cut=Nexus.LayoutMetrics.Truncate(v,MINI_CHARS)
+    elseif #v>MINI_CHARS then cut=v:sub(1,MINI_CHARS-3):gsub("[\192-\255][\128-\191]*$","").."..." end
+    return (cut:gsub("|","||")),(v:gsub("|","||"))
+end
+-- One compact read: what the panel shows and offers. kind is "run" (a
+-- well-formed status), "none" (no run was approved in this session),
+-- "loading" (local saved data is not restored yet), "missing" (no runtime),
+-- "error" (the read failed) or "malformed". A run needs a text state, boolean
+-- flags and whole-number counts; remaining (the rolled target copies still
+-- missing) and the reason may be absent.
+local function miniView()
+    -- Before saved data is restored the runtime cannot know of a run or of a
+    -- result restored from it, so it is not asked and nothing reads "none".
+    -- This is the run page's Restoring check: a scalar read that pumps and
+    -- admits nothing.
+    local okReady,ready=true,nil
+    if type(Nexus.StartupStatus)=="function" then okReady,ready=pcall(Nexus.StartupStatus) end
+    if not okReady then return {kind="error",error=ready} end
+    if type(ready)~="table" or not ready.coreReady then return {kind="loading"} end
+    local runtime=Nexus.OrbRuntime
+    if type(runtime)~="table" or type(runtime.CompactStatus)~="function" then return {kind="missing"} end
+    local ok,s=pcall(runtime.CompactStatus)
+    if not ok then return {kind="error",error=s} end
+    if s==nil then return {kind="none"} end
+    if type(s)~="table" then return {kind="malformed"} end
+    local v={kind="run",spent=miniCount(s.spent),limit=miniCount(s.limit),reserved=miniCount(s.reserved),
+        remaining=miniCount(s.remaining),state=type(s.state)=="string" and s.state or nil,
+        reason=type(s.reason)=="string" and s.reason or nil}
+    for _,key in ipairs({"running","pending","canResume"}) do
+        if type(s[key])=="boolean" then v[key]=s[key] end
+    end
+    if not (v.state and v.spent and v.limit and v.reserved) or v.running==nil or v.pending==nil
+        or v.canResume==nil then v.kind="malformed" end
+    return v
+end
+-- Pause while running; Resume only for a paused run the runtime offers to
+-- resume (an unknown state never offers it); Stop as the main panel offers
+-- it. Anything that is not a well-formed run offers nothing.
+local function miniGates(v)
+    if v.kind~="run" then return false,false,false end
+    return v.running,v.state=="PAUSED" and v.canResume and not v.running,
+        v.running or v.pending or v.state=="PAUSED" or v.state=="LIMIT"
+end
+local function miniStateText(v)
+    if v.kind=="none" then return "No approved Orb run" end
+    if v.kind=="loading" then return "Run status loading..." end
+    if v.kind~="run" then return "Run status unavailable" end
+    local label=phases[v.state] or ("Unknown state: "..v.state)
+    if v.running then return "Running - "..label end
+    -- Paused, and Resume is not offered: an earlier submitted action (restored
+    -- after a reload, already chosen, or for a changed assignment) must settle.
+    if v.state=="PAUSED" and not v.canResume then return "Paused - a pending result must settle first" end
+    return label
+end
+local function miniReason(v)
+    if v.kind=="none" then return miniText("Open Orbs to review a maximum and start a run.") end
+    if v.kind=="loading" then return miniText("Reading local saved data.") end
+    if v.kind~="run" then
+        local _,detail=miniText(MINI_UNREAD[v.kind]..(v.error~=nil and (" "..tostring(v.error)) or ""))
+        return MINI_UNREAD_TEXT,MINI_UNREAD_TEXT.." "..detail
+    end
+    return miniText(truthful(v.reason))
+end
+local function miniUsage(v)
+    if v.kind=="none" then return "Orbs used: no run approved this session" end
+    local spent,limit=v.spent and miniNumber(v.spent),v.limit and miniNumber(v.limit)
+    if spent and limit then return "Orbs used: "..spent.." of "..limit.." approved" end
+    if limit then return "Orbs used: unavailable (approved limit "..limit..")" end
+    if spent then return "Orbs used: "..spent.." (approved limit unavailable)" end
+    return "Orbs used and approved limit: unavailable"
+end
+local function miniPending(v)
+    if v.kind=="none" then return "Pending: none" end
+    if v.reserved==nil or v.pending==nil then return "Pending: unavailable" end
+    if v.reserved>0 then
+        return "Pending: "..miniNumber(v.reserved)..(v.reserved==1 and " Orb" or " Orbs").." requested, not confirmed yet"
+    end
+    return v.pending and "Pending: the last Orb action is not settled" or "Pending: none"
+end
+-- Copies, not families: CompactStatus.remaining is the run's rolled target
+-- copies still missing at its latest check. Absent is unavailable, never 0.
+local function miniMissing(v)
+    return "Rolled target copies missing: "..(v.remaining and miniNumber(v.remaining) or "unavailable")
+end
+local function miniKey(v)
+    return table.concat({v.kind,tostring(v.state),tostring(v.running),tostring(v.pending),tostring(v.canResume)},"|")
+end
+-- A new UI size moves the panel back inside the UI. The panel is smaller
+-- than any UI this client supports (FitToScreen treats less than 640x480 as
+-- implausible), so it keeps its scale; the client's own clamping keeps a drag
+-- on screen. Two size reads per refresh; nothing moves otherwise.
+local function clampMini()
+    if not UIParent then return end
+    local sw,sh=tonumber(UIParent:GetWidth()),tonumber(UIParent:GetHeight())
+    if not (sw and sh) or (miniSeen.sw==sw and miniSeen.sh==sh) then return end
+    local left,top=mini:GetLeft(),mini:GetTop()
+    local w,h=tonumber(mini:GetWidth()),tonumber(mini:GetHeight())
+    if not (left and top and w and h) then return end
+    miniSeen.sw,miniSeen.sh=sw,sh
+    local s=tonumber(mini:GetScale()) or 1
+    local x,y=left*s,top*s
+    local cx=math.max(0,math.min(x,sw-w*s))
+    local cy=math.min(sh,math.max(y,h*s))
+    if math.abs(cx-x)>0.5 or math.abs(cy-y)>0.5 then
+        mini:ClearAllPoints();mini:SetPoint("TOPLEFT",UIParent,"BOTTOMLEFT",cx/s,cy/s)
+    end
+end
+-- Returns the read error, if the read failed, so it can be reported once.
+local function miniRender()
+    local v=miniView()
+    setFull(mini.state,miniText(miniStateText(v)))
+    setFull(mini.reason,miniReason(v))
+    setFull(mini.usage,miniText(miniUsage(v)))
+    setFull(mini.pending,miniText(miniPending(v)))
+    setFull(mini.missing,miniText(miniMissing(v)))
+    -- An outcome belongs to the state it was shown for; a later change of that
+    -- state retires it, so it never describes a newer state.
+    local key=miniKey(v)
+    if miniNotice.text~=nil then
+        if miniNotice.key==nil then miniNotice.key=key
+        elseif miniNotice.key~=key then miniNotice.text,miniNotice.key=nil,nil end
+    end
+    setFull(mini.notice,miniText(miniNotice.text))
+    local pause,resume,stop=miniGates(v)
+    enable(mini.pause,pause and not miniBusy);enable(mini.resume,resume and not miniBusy)
+    enable(mini.stop,stop and not miniBusy)
+    clampMini()
+    if v.kind=="error" then return tostring(v.error) end
+end
+-- A failure goes to the client's error handler, which may itself raise.
+local function miniReport(failure)
+    local handler=type(geterrorhandler)=="function" and geterrorhandler() or nil
+    if type(handler)=="function" then pcall(handler,failure) end
+end
+miniRefresh=function()
+    if not (mini and mini:IsShown()) then return end
+    local ok,failure=pcall(miniRender)
+    if ok and failure==nil then miniFailing=false;return end
+    if not ok then
+        -- Fail closed: nothing shown or offered may rest on an earlier read.
+        enable(mini.pause,false);enable(mini.resume,false);enable(mini.stop,false)
+        local _,detail=miniText(failure)
+        setFull(mini.state,"Run status unavailable")
+        setFull(mini.reason,MINI_UNREAD_TEXT,MINI_UNREAD_TEXT.." "..detail)
+        setFull(mini.usage,"Orbs used and approved limit: unavailable")
+        setFull(mini.pending,"Pending: unavailable")
+        setFull(mini.missing,"Rolled target copies missing: unavailable")
+    end
+    -- Reported once per failure, not four times a second.
+    if miniFailing then return end
+    miniFailing=true
+    miniReport(failure)
+end
+-- key, when given, is the state the outcome was worded from; otherwise the
+-- next refresh binds it to the state it shows.
+local function miniSay(message,key) miniNotice.text,miniNotice.key=message,key end
+local function miniRefusal(kind,v)
+    local unread=v.kind~="run" and v.kind~="none"
+    if kind=="pause" then
+        return unread and "Not paused: the run status could not be read." or "Not paused: the run is not running."
+    elseif kind=="resume" then
+        if unread then return "Not resumed: the run status could not be read." end
+        if v.kind=="none" then return "Not resumed: there is no approved run." end
+        if v.running then return "Not resumed: the run is already running." end
+        if v.state=="PAUSED" then return "Not resumed: a pending result must settle." end
+        return "Not resumed: only a paused run can resume."
+    end
+    if unread then return "Not stopped: the run status could not be read." end
+    if v.kind=="none" then return "Not stopped: there is no approved run." end
+    return "Not stopped: no run is active or pending."
+end
+-- Resume answers true even when its own first step at once paused or ended
+-- the run again (an Echo board open, no Orbs left), so its success is worded
+-- from the read taken after it (after): "Resumed" only for a running run.
+local function miniOutcome(kind,done,why,after)
+    if kind=="pause" then return done and "Paused." or "Not paused: the run was not running." end
+    if not done then
+        return (kind=="resume" and "Not resumed: " or "Not stopped: ")..(truthful(why) or "Orb mode refused it.")
+    end
+    if kind=="stop" then return "Stopped." end
+    if not (after and after.kind=="run") then return "Resume accepted." end
+    return after.running and "Resumed with the same approved maximum." or "Resume accepted; the run is not running now."
+end
+-- One action at a time. The click reads again and acts only if that read
+-- offers the action; the runtime then applies its own final checks.
+local function miniAct(kind)
+    if miniBusy or not mini then return end
+    miniBusy=true
+    -- While it runs no control reads as available, so a nested click or
+    -- refresh cannot act on the read taken before it.
+    enable(mini.pause,false);enable(mini.resume,false);enable(mini.stop,false)
+    local ok,err=pcall(function()
+        local v=miniView()
+        local pause,resume,stop=miniGates(v)
+        local allowed=(kind=="pause" and pause) or (kind=="resume" and resume) or (kind=="stop" and stop)
+        if not allowed then miniSay(miniRefusal(kind,v));return end
+        local done,why=Nexus.OrbRuntime[MINI_ACTIONS[kind]]()
+        -- An accepted Resume is worded from a fresh read and belongs to the
+        -- state that read shows.
+        local after=kind=="resume" and done and miniView() or nil
+        miniSay(miniOutcome(kind,done,why,after),after and miniKey(after))
+    end)
+    miniBusy=false
+    -- A short notice here; the error itself goes to the error handler, once
+    -- for this action. The refresh then offers only what a new read allows.
+    if not ok then miniSay(MINI_ACTIONS[kind].." failed: an error occurred.") end
+    miniRefresh()
+    if not ok then miniReport(err) end
+end
+local function miniTip(widget,tip)
+    widget:SetScript("OnEnter",function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self,"ANCHOR_TOP");GameTooltip:SetText(tip,1,1,1,1,true);GameTooltip:Show()
+    end)
+    widget:SetScript("OnLeave",function()if GameTooltip then GameTooltip:Hide()end end)
+end
+-- One line and its hover area. The line never wraps: text the client draws
+-- wider than the box, even within MINI_CHARS, is shortened there instead of
+-- spilling out of its MINI_LINE box. Hovering a line that holds text always
+-- shows its complete text (flattened and escaped, as shown) and, when given,
+-- what the line means.
+local function miniLine(f,key,about)
+    local fs=text(f,MINI_PAD,MINI_Y[key],MINI_TEXT_W,MINI_LINE)
+    if Nexus.LayoutMetrics then Nexus.LayoutMetrics.OneLineLabel(fs,nil,MINI_LINE) end
+    local hit=CreateFrame("Frame",nil,f);hit:SetAllPoints(fs);hit:EnableMouse(true)
+    hit:SetScript("OnEnter",function(self)
+        local full=fs._nexusFullText or fs:GetText() or ""
+        if not (GameTooltip and (full~="" or about)) then return end
+        GameTooltip:SetOwner(self,"ANCHOR_TOP")
+        GameTooltip:SetText(full,1,1,1,1,true)
+        if about then GameTooltip:AddLine(about,.9,.9,.9,true) end
+        GameTooltip:Show()
+    end)
+    hit:SetScript("OnLeave",function()if GameTooltip then GameTooltip:Hide()end end)
+    f[key],f[key.."Hit"]=fs,hit
+end
+local function ensureMini()
+    if mini then return mini end
+    local f=CreateFrame("Frame","NexusOrbMini",UIParent);f:Hide()
+    f:SetSize(MINI_W,MINI_H);f:SetPoint("TOPLEFT",UIParent,"TOPLEFT",16,-150)
+    -- Below the Orb window and Help (DIALOG): a status panel, not a dialog.
+    f:SetFrameStrata("HIGH");f:SetFrameLevel(20);f:EnableMouse(true);f:SetMovable(true);f:SetClampedToScreen(true)
+    f:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",edgeSize=14,insets={left=4,right=4,top=4,bottom=4}})
+    f:SetBackdropColor(.035,.04,.05,1)
+    f.title=f:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    f.title:SetPoint("TOPLEFT",MINI_PAD,-9);f.title:SetSize(262,18);f.title:SetJustifyH("LEFT")
+    f.title:SetText("Orb run status")
+    -- The title bar moves the panel. Its place lasts for this session only:
+    -- the client is asked not to keep it in its layout cache.
+    f.drag=CreateFrame("Frame",nil,f);f.drag:SetPoint("TOPLEFT",6,-4);f.drag:SetSize(274,24)
+    f.drag:SetFrameLevel(f:GetFrameLevel()+1);f.drag:EnableMouse(true);f.drag:RegisterForDrag("LeftButton")
+    f.drag:SetScript("OnDragStart",function()f:StartMoving()end)
+    f.drag:SetScript("OnDragStop",function()
+        f:StopMovingOrSizing()
+        if f.SetUserPlaced then pcall(f.SetUserPlaced,f,false) end
+    end)
+    miniTip(f.drag,"Drag to move this panel. It stays where you put it until you reload; nothing is saved.")
+    f.close=button(f,MINI_W-MINI_PAD-58,-7,58,"Close",function()f:Hide()end);f.close:SetHeight(20)
+    miniTip(f.close,"Hides this panel only. An approved run keeps running: use Pause or Stop. Mini panel in the Orb window shows it again.")
+    miniLine(f,"state");miniLine(f,"reason")
+    miniLine(f,"usage","Orbs this run has used, against the maximum approved when it started. The maximum cannot change during a run. Unavailable means it could not be read; it is not 0.")
+    miniLine(f,"pending","An Orb requested whose spend is not confirmed yet, or an Orb action whose result has not settled. It counts against the approved maximum until it settles.")
+    miniLine(f,"missing","Copies, not Echo families: the rolled target copies this run still needed at its latest check. Locked targets are not counted, because Orbs cannot change locked Echoes. Unavailable is not 0, and 0 does not mean the whole build is complete.")
+    miniLine(f,"notice");miniLine(f,"note")
+    f.note:SetText("Closing this panel does not stop the run.")
+    -- Pause and Resume are separate buttons in fixed places, so a repeated
+    -- press of one can never become the other.
+    f.pause=button(f,MINI_PAD,MINI_BUTTON_Y,66,"Pause",function()miniAct("pause")end)
+    f.resume=button(f,MINI_PAD+72,MINI_BUTTON_Y,74,"Resume",function()miniAct("resume")end)
+    f.stop=button(f,MINI_PAD+152,MINI_BUTTON_Y,60,"Stop",function()miniAct("stop")end)
+    f.open=button(f,MINI_W-MINI_PAD-96,MINI_BUTTON_Y,96,"Open Orbs",function()UI.Show()end)
+    miniTip(f.pause,"Pause holds the run before its next Orb. An Orb already requested cannot be undone. Offered only while the run is running.")
+    miniTip(f.resume,"Resume continues this paused run with the same approved maximum; its usage is not reset. It is not offered while an earlier action must settle first: one restored after a reload, one whose offer was already chosen, or one for a changed assignment. Orb mode checks again before it continues.")
+    miniTip(f.stop,"Stop ends this run: no further Orb is spent. An action already submitted may still finish; resolve its offer in the game.")
+    miniTip(f.open,"Opens the full Orb window. Opening it starts, resumes and spends nothing.")
+    f.pause:Disable();f.resume:Disable();f.stop:Disable()
+    local elapsed=0
+    f:SetScript("OnShow",function()elapsed=0;miniRefresh()end)
+    -- An outcome is not carried into the next opening.
+    f:SetScript("OnHide",function()miniNotice.text,miniNotice.key=nil,nil end)
+    f:SetScript("OnUpdate",function(_,dt)elapsed=elapsed+(dt or 0);if elapsed>=.25 then elapsed=0;miniRefresh()end end)
+    styled(f,0.94)
+    UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusOrbMini"
+    mini=f
+    return f
+end
+-- Shows the compact run status. Reading only; repeated calls reuse it.
+function UI.ShowMini()
+    ensureMini()
+    if mini:IsShown() then miniRefresh() else mini:Show() end
+    return mini
+end
+-- Hides it, as Close and Escape do. An approved run keeps running.
+function UI.HideMini() if mini then mini:Hide() end end
+function UI.MiniShown() return mini~=nil and mini:IsShown() and true or false end

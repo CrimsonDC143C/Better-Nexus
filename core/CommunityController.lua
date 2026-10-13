@@ -2766,7 +2766,7 @@ function Controller.New(options)
                 -- may change that after the exact local ticket commits; it is
                 -- not a change of player/database/catalog binding. Readiness
                 -- is checked separately before the one local submission.
-                return current and current.binding == operation.binding or false
+                return current and current.binding == operation.binding or false, current
             end
             return true
         end
@@ -2914,13 +2914,19 @@ function Controller.New(options)
         local operation = pendingShare
         if not operation then return PumpPendingRemoval() end
         if operation.submitted then return true, false end
-        if not operation.sameOwner() then
+        local sameOwner, preparation = operation.sameOwner()
+        if not sameOwner then
             operation.complete(false, "Share stopped: the player or catalog changed.")
             return false, false
         end
         local catalog = operation.catalog
-        local preparation = type(catalog.ManualPreparationStatus) == "function"
-            and catalog.ManualPreparationStatus() or nil
+        -- SameOwner's fresh witness also answers readiness in this synchronous
+        -- turn. A legacy nil binding did not query it, so keep that fallback.
+        -- Submission and completion retain their separate fresh proofs.
+        if operation.binding == nil then
+            preparation = type(catalog.ManualPreparationStatus) == "function"
+                and catalog.ManualPreparationStatus() or nil
+        end
         if not preparation or preparation.ready ~= true then return true, false end
         operation.submit()
         return pendingShare ~= nil, true

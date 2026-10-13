@@ -27,8 +27,8 @@ local function Run(actual,expected,route,verifiedSeed)
  -- Seed the retained claim through the same receive path, from a relay.
  local seed=verifiedSeed and 'Origin-TestRealm' or 'Relay-TestRealm'
  if route=='addon' then
-  peer.H.Fire('CHAT_MSG_ADDON',N.SyncWire.PREFIX,'ACK1','WHISPER',seed)
-  peer.H.Fire('CHAT_MSG_ADDON',N.SyncWire.PREFIX,'ACK1','WHISPER',actual)
+  P.NegotiateAddon(peer,seed)
+  P.NegotiateAddon(peer,actual)
  end
  Send(seed,seed,1)
  Send(seed,seed,2)

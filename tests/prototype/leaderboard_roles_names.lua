@@ -11,7 +11,7 @@ local F=dofile('tests/prototype/format5_support.lua')
 local L=dofile('tests/prototype/leaderboard_fixture_support.lua')
 local checks=0;local function check(v,m)assert(v,m);checks=checks+1 end
 local HISTORICAL='historical locked evidence is not current copy authority'
-local VAL='Valentin\195\169' -- UTF-8 "Valentine" with an accent
+local VAL='Ren\195\169' -- synthetic UTF-8 accented name
 
 local fx=L.New({players={
  {name=VAL,class='MAGE',variant=1,dps={dummy=61000},locked=6},       -- roles unknown

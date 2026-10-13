@@ -4608,17 +4608,38 @@ function Candidate.StepProgress(handle)
     return done, total
 end
 
+-- Accounting only. Read the session counter without checking root authority
+-- or readiness; callers must still obtain those from their normal fresh query.
+function Catalog.PreparationPumpCount()
+    return ST.debugStats.rootPumps
+end
+
 -- Scalar, read-only dependency description. The separate empty identity has
 -- no authority fields; editing it cannot change a candidate. Neither this
 -- query nor identity comparison admits, invalidates or advances any root.
-function Catalog.ManualPreparationStatus()
-    local root, handle = ServingCatalogRoot(), ST.candidate
+function Candidate.ManualSourceAgrees(root, handle)
     local token = handle and handle.token or root and root.token
-    local agrees = token ~= nil and token.databaseIdentity == ST.db
+    return token ~= nil and token.databaseIdentity == ST.db
         and (type(NexusDB) ~= "table" or NexusDB == ST.db)
         and token.ownerIdentity == CurrentOwnerKey()
         and token.bindingGeneration == ST.bindingGeneration
         and TokenDrifted(token) == nil and not ST.rebindRequired and not ST.exhausted
+        or false
+end
+
+-- Fresh source proof for consumers that need only agreement and binding. Use
+-- the same passive proof as the description; never retain it across calls.
+function Catalog.SourceBinding()
+    local root, handle = ServingCatalogRoot(), ST.candidate
+    local agrees = Candidate.ManualSourceAgrees(root, handle)
+    return agrees, ST.bindingGeneration,
+        not agrees and "OWNER_OR_GENERATION_MISMATCH" or nil
+end
+
+function Catalog.ManualPreparationStatus()
+    local root, handle = ServingCatalogRoot(), ST.candidate
+    local agrees = Candidate.ManualSourceAgrees(root, handle)
+    local token = handle and handle.token or root and root.token
     local relevant = agrees and ST.rootState == "ROOT_ADMITTED" and root ~= nil
         and handle ~= nil and handle.mode == "mutation"
         and handle.originalRoot == root and token == root.token
@@ -4923,6 +4944,13 @@ end
 function Catalog.Count()
     local root = Gate()
     return root and root.counts.available or 0
+end
+
+-- Read the current serving/storage policy without allocating its diagnostic
+-- description. Gate still runs on every call, including its exact refusals.
+function Catalog.ServingPolicy()
+    local root = Gate()
+    return root == nil or Candidate.ReadOnlySource(ST.db), ST.rootState
 end
 
 function Catalog.Status()

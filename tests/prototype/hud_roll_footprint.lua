@@ -1,5 +1,5 @@
 -- HUD footprint through an ordinary automatic-rolling cycle
--- (BN-CONTROL-CRIMSON-HUD-STABILITY-001). Reported: while Auto rolls, the
+-- (BN-CONTROL-HUD-STABILITY-001). Reported: while Auto rolls, the
 -- panel repeatedly collapses between Echo choices and expands again, moving
 -- the title and the footer buttons. The recording was not received; these are
 -- synthetic transitions through the real runtime, adapter, policy and Panel:
@@ -34,6 +34,7 @@ local function Boot(plan)
   end
  end
  H.Fire('ADDON_LOADED','Nexus');H.Fire('PLAYER_ENTERING_WORLD');H.Advance(20,.05)
+ H.AcknowledgeOverwriteWarnings()
  assert(Nexus.GameAdapter.SetLoadoutWishlistIdentity(1,'Synthetic plan',plan or PLAN),'assign the plan')
  if _G.NexusQuickStart and _G.NexusQuickStart:IsShown() then _G.NexusQuickStart:Hide();H.Advance(.2) end
  granted={}

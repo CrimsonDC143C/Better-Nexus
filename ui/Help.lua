@@ -179,6 +179,10 @@ local function ensure()
     b(430,95,"Start page",function()index=1;refresh()end)
     b(533,100,"Close",function()frame:Hide()end)
     frame.page=frame:CreateFontString(nil,"OVERLAY","GameFontDisableSmall");frame.page:SetPoint("BOTTOM",0,26)
+    -- Register the completed window once, including its owned navigation
+    -- controls. Palette changes then repaint the same frame through Theme.
+    if Nexus.Theme and Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(frame,0.94) end
+    if Nexus.Theme and Nexus.Theme.StyleTree then Nexus.Theme.StyleTree(frame) end
     frame:Hide();UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusHelpWindow"
 end
 function H.Show(id)

@@ -111,7 +111,9 @@ local lockedProjectionRevision = 0
 local leverProjectionRevision = 0
 local wishlistProjectionRevision = 0
 local wishlistEvidenceObservations = {}
-local ledger = { banish = nil, reroll = nil, freeze = nil, runDataRef = nil, banishThisPush = false }
+local ledger = { banish = nil, reroll = nil, freeze = nil, runDataRef = nil,
+    banishThisPush = false,
+    rerollRecovery = { ordinal = 0, record = nil, externalEpoch = 0 } }
 local selfFreezeSig, selfFreezeIndex
 local lastBuildOpAt = -10
 local ownedSyncedFlag, ownedRequestAt, ownedRetries = false, nil, 0
@@ -1034,6 +1036,10 @@ function A.RunBoundaryReset()
         end
     end
     awaitingGrant = nil
+    -- A run boundary voids the previous run's reroll evidence, never proves
+    -- that a request sent in that run succeeded.
+    ledger.rerollRecovery.record = nil
+    ledger.rerollRecovery.externalEpoch = 0
     ownedProjectionRevision = ownedProjectionRevision + 1
     pendingOwnPick, pendingOwnBaseline = nil, nil
     ownedGeneration = ownedGeneration + 1
@@ -4111,17 +4117,84 @@ function A.Reroll()
     if A.InFlight() then return false, "in flight" end
     local ch = A.Charges()
     if ch.reroll <= 0 then return false, "no charges" end
+    -- Capture raw server-derived run data before the client service call.
+    -- Charges() has an optimistic local ledger and cannot confirm a spend.
+    local recovery = ledger.rerollRecovery
+    local prior = recovery.record
+    local priorOutcome = prior and A.RerollOutcome(prior.ordinal) or nil
+    local d = RawRunData()
+    local used = d and NonNegativeInteger(d.usedRerolls)
+    local total = d and NonNegativeInteger(d.totalRerolls)
+    local board = A.Board()
+    local attributable = used ~= nil and total ~= nil
+        and board ~= nil and board.idSignature ~= nil
+        -- A prior player/rival reroll can have advanced the board before its
+        -- run-data push arrives. Without a request ID, later +1 is ambiguous.
+        and recovery.externalEpoch == 0
+        and (not prior or (priorOutcome == "proven"
+            and used == prior.used + 1 and total == prior.total))
     local svc = PS()
     selfCalling = true
     local ok = svc and SafeCall(svc.RequestReroll)
     selfCalling = false
     if ok then
+        recovery.ordinal = recovery.ordinal + 1
+        recovery.record = { ordinal = recovery.ordinal,
+            runGeneration = ownedGeneration, dataRef = d,
+            used = used, total = total,
+            boardIdSignature = board and board.idSignature or nil,
+            externalEpoch = recovery.externalEpoch,
+            attributable = attributable, outcome = "waiting" }
         ledger.reroll = math.max(0, (ledger.reroll or 1) - 1)
         local b = A.Board()
         inFlightKind, inFlightSig = "reroll", b and b.signature or ""
         return true
     end
     return false, "refused"
+end
+
+-- Session-only, read-only settlement of an own reroll. A fresh server run
+-- record with exactly one additional used reroll, a changed offer, a clear
+-- client latch, the same run, and no competing reroll are all required. The
+-- service supplies no request ID, so uncertain cases stay uncertain; this
+-- never sends, refunds, or manufactures a charge.
+function A.RerollOutcome(ordinal)
+    local recovery = ledger.rerollRecovery
+    local own = recovery.record
+    if not own or own.ordinal ~= ordinal then return nil end
+    if own.outcome ~= "waiting" then return own.outcome end
+    if ownedGeneration ~= own.runGeneration then
+        own.outcome = "voided"
+        return own.outcome
+    end
+    if not own.attributable or recovery.externalEpoch ~= own.externalEpoch then
+        own.outcome = "ambiguous"
+        return own.outcome
+    end
+    local d = RawRunData()
+    local used = d and NonNegativeInteger(d.usedRerolls)
+    local total = d and NonNegativeInteger(d.totalRerolls)
+    if d == own.dataRef or used == nil or total == nil then return "waiting" end
+    if total ~= own.total or used < own.used or used > own.used + 1 then
+        own.outcome = "ambiguous"
+        return own.outcome
+    end
+    -- Unrelated server refreshes may replace this table before the spend
+    -- appears. Do not turn a delayed matching +1 into a permanent failure.
+    if used == own.used then return "waiting" end
+    local p = PerksTbl()
+    local board = A.Board()
+    if type(p) ~= "table" or p.pendingReroll ~= nil or not board then
+        return "waiting"
+    end
+    if board.idSignature == own.boardIdSignature then return "waiting" end
+    own.outcome = "proven"
+    return own.outcome
+end
+
+function A.RerollOrdinal()
+    local own = ledger.rerollRecovery.record
+    return own and own.ordinal or nil
 end
 
 -- FreezePerk emits no success signal of its own [mirrors BanishPerk/
@@ -5247,8 +5320,9 @@ local function InstallHooks()
         hooksecurefunc(svc, "RequestReroll", function()
             pcall(function()
                 boardDirty = true
-                if not selfCalling and (not inFlightKind
-                    or (inFlightKind == "select" and deadLatch.select)) then
+                if not selfCalling then
+                    ledger.rerollRecovery.externalEpoch =
+                        ledger.rerollRecovery.externalEpoch + 1
                     externalActionSeen = true
                     A._lastUserAction = { kind = "RequestReroll",
                         t = GetTime() }
@@ -5669,6 +5743,15 @@ function A.Poll()
     end
     lastAutoAcceptState, lastRivalState = autoAcceptState, rivalState
     ResolveInFlight()
+    -- Run-data pushes do not emit an Echo-board dirty event. Detect an own
+    -- reroll settlement here so a delayed server count can wake the runtime
+    -- after its normal action deadline has passed. This is read-only and
+    -- schedules no resend.
+    local ownReroll = ledger.rerollRecovery.record
+    if ownReroll and ownReroll.outcome == "waiting"
+        and A.RerollOutcome(ownReroll.ordinal) == "proven" then
+        dataDirty = true
+    end
     ConfirmAwaitingGrant()
     WatchLatches()
     ReconcileTomePending()

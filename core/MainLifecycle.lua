@@ -1156,8 +1156,11 @@ function Lifecycle.New(options)
             return
         end
         local preparationPumps = 0
-        if Nexus.BuildCatalog and type(Nexus.BuildCatalog.ManualPreparationStatus)=="function" then
-            preparationPumps = Nexus.BuildCatalog.ManualPreparationStatus().totalPumps
+        local catalog = Nexus.BuildCatalog
+        if catalog and type(catalog.PreparationPumpCount)=="function" then
+            preparationPumps = catalog.PreparationPumpCount()
+        elseif catalog and type(catalog.ManualPreparationStatus)=="function" then
+            preparationPumps = catalog.ManualPreparationStatus().totalPumps
         end
         local preparationStarted = StartupClock()
         -- One authority rebind slice per scheduler turn, before any consumer

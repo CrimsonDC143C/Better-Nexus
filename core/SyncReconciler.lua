@@ -185,7 +185,7 @@ function Reconciler.New(options)
         recentRequests[entry.key] = {
             buildHash=tostring(entry.peerBuildWireHash or "0"),
             dpsHash=tostring(entry.peerDpsHash or "0"),
-            recordedAt=now(),outcome=tostring(outcome or "complete"),
+            recordedAt=now(),requester=entry.requester,outcome=tostring(outcome or "complete"),
         }
     end
 
@@ -1014,6 +1014,30 @@ function Reconciler.New(options)
             end
         else
             bucket.remaining = why == "sync queue full" and 1 or 0
+        end
+    end
+
+    function R.CancelPeer(requester,reason)
+        if type(requester)~="string" or requester=="" then return end
+        continuations[requester]=nil
+        -- Exact requester metadata avoids prefix/realm aliases and request ID
+        -- collisions. Clear old progress, then retain terminal receipts for
+        -- cancelled response IDs so delayed duplicate requests cannot replay.
+        for key,receipt in pairs(recentRequests) do
+            if receipt.requester==requester then recentRequests[key]=nil end
+        end
+        for key,entry in pairs(pendingResponses) do
+            if entry.requester==requester then
+                RememberRequest(entry,reason or "peer unavailable")
+                cancelRequest(entry.requestId,requester)
+                pendingResponses[key]=nil
+            end
+        end
+        for key,entry in pairs(pendingLoadouts) do
+            if entry.requester==requester then
+                cancelRequest(entry.requestId,requester)
+                pendingLoadouts[key]=nil
+            end
         end
     end
 
