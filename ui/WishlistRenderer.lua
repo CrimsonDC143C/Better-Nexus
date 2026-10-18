@@ -2562,6 +2562,18 @@ end
                     .. "every Saved Build's Wishlist choice as it is."
             end
         else
+            -- The name this Create will really use (the title names it too):
+            -- a copy name when the typed one is taken, or that existing names
+            -- could not be checked yet. Existing Wishlists are never renamed.
+            local requested = type(data) == "table" and data.requestedName or nil
+            if requested ~= nil and requested ~= data.name then
+                parts[#parts + 1] = "A Wishlist named '" .. (DisplayUntrusted(requested, 1024, false) or "?")
+                    .. "' already exists, so this new one is named '"
+                    .. (DisplayUntrusted(data.name, 1024, false) or "?") .. "'. Existing Wishlists keep their names."
+            elseif type(data) == "table" and data.namesUnknown then
+                parts[#parts + 1] = "Existing Wishlist names are not loaded yet, so this name could not be "
+                    .. "checked against them."
+            end
             if kind == "savedBuild" then
                 parts[#parts + 1] = "After a successful save it is assigned to " .. label
                     .. ", the destination this editor captured when the draft began."
@@ -2627,6 +2639,8 @@ end
             ["no echoes"] = "the plan has no Echoes",
             ["no valid echoes"] = "none of the plan's Echoes look valid",
             invalid_locked_design = "the locked-target design is invalid or no longer matches the Echo catalog",
+            name_taken = "a Wishlist with this name exists now; press Create Wishlist again to see the name it will get",
+            name_unavailable = "no free name was found for this Wishlist; choose another name",
         }
         local plain = words[tostring(reason or "")]
         if plain then return plain end

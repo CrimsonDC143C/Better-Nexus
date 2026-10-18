@@ -293,6 +293,8 @@ NAMES += ['journal_pending_summary_dedup']
 NAMES += ['ux_save_assignment_result','ux_captured_destination_labels']
 # UX M2: replayable setup, manual recommendation marker/charges consumer, direct Help pages and chooser routes (EXPECT fails on accepted M1 by design).
 NAMES += ['ux_setup_replay','ux_manual_recommendation','ux_help_navigation']
+# Priority user bug: one logical Wishlist Create uploads once; new same-name Wishlists get copy names (EXPECT fails on delivered1704 and pre-fix current by design).
+NAMES += ['wishlist_create_once','wishlist_unique_names']
 
 # Wall-clock limit for one test process. It is a runner limit only: no test, timer or budget reads it.
 DEFAULT_TIMEOUT_SECONDS=45
