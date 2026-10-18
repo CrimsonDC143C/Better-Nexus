@@ -188,15 +188,16 @@ local function ApplyPending()
     local data, mode = Controller.PrepareApply(text)
     if not data then
         if mode == "name" and wishlistNameBox then wishlistNameBox:SetFocus() end
+        M.RenderSaveResult()
         return
     end
     local displayName = DisplayUntrusted(data.name, 1024, false) or "Wishlist"
     if mode == "update" then
         StaticPopup_Show("WISHLISTREALIZER_UPDATE_WISHLIST",
-            EchoListTotal(data.echoes), displayName, data)
+            displayName, M.ConfirmationText(data, mode), data)
     else
         StaticPopup_Show("WISHLISTREALIZER_CREATE_WISHLIST",
-            displayName, EchoListTotal(data.echoes), data)
+            displayName, M.ConfirmationText(data, mode), data)
     end
 end
 
@@ -1757,6 +1758,7 @@ local function EnsureFrame()
         GameTooltip:Show()
     end)
     applyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    M.EnsureSaveResultRow()
 
     -- Cosmetic only, deliberately last: every functional widget above
     -- already exists regardless of whether this succeeds (this exact
@@ -2128,6 +2130,11 @@ local function RefreshView(catalogRevision)
                     editingContext.loadoutName, 1024, false)
                 or (editingContext.loadoutSlot and ("Saved Build " .. tostring(editingContext.loadoutSlot)))
                 or "None"
+            -- The opened first-run plan has no Saved Build of its own; its
+            -- save updates the first-run target (controller destination).
+            if editingContext.destination == "first" and not editingContext.loadoutSlot then
+                buildLabel = buildLabel .. " (first-run target)"
+            end
             local displayWishlistName = DisplayUntrusted(
                 editingContext.name, 1024, false) or "Wishlist"
             editContextText:SetText("Wishlist: |cff7fd5ff" .. displayWishlistName
@@ -2457,6 +2464,8 @@ end
         applyBtn:SetText(saving and "Saving..." or
             (Controller.IsEditing() and "Save Wishlist" or "Create Wishlist"))
         if saving or blocked then applyBtn:Disable() else applyBtn:Enable() end
+        -- Every refresh, warm or not: the result row survives it unchanged.
+        M.RenderSaveResult()
     end
 
     local function RefreshTheme()
@@ -2492,6 +2501,291 @@ end
 
     function M.SetApplySaved()
         if applyBtn then applyBtn:SetText("Saved") end
+    end
+
+    ------------------------------------------------------------------------
+    -- Save result row and named confirmations (UX-03, UX-04). Presentation
+    -- only: the controller's SaveResult says what the last save actually
+    -- did; nothing here uploads, assigns, activates or changes Auto. The
+    -- functions live on M (Renderer.New and EnsureFrame are near the Lua 5.1
+    -- local/upvalue limits).
+    ------------------------------------------------------------------------
+
+    -- The destination a descriptor names, for display: a Saved Build by its
+    -- captured name with the slot as second identity, or the first-run
+    -- target of the character. Nil when there is no destination.
+    function M.DestinationLabel(destination)
+        if type(destination) ~= "table" then return nil end
+        if destination.kind == "savedBuild" then
+            local slot = tonumber(destination.slot)
+            local fallback = "Saved Build " .. tostring(slot or "?")
+            local name = DisplayUntrusted(destination.name, 1024, false)
+            if not name or name == fallback then return fallback end
+            return "Saved Build '" .. name .. "' (slot " .. tostring(slot) .. ")"
+        elseif destination.kind == "firstRun" then
+            return "the first-run target for "
+                .. (DisplayUntrusted(destination.character, 1024, false) or "this character")
+        end
+        return nil
+    end
+
+    -- Auto's current state, read only for wording.
+    function M.AutoIsOn()
+        if type(Nexus.RecomputeStats) ~= "function" then return false end
+        local ok, stats = pcall(Nexus.RecomputeStats)
+        return ok and type(stats) == "table" and stats.autoEnabled == true
+    end
+
+    -- The second line of the Save/Create confirmation: the planned count,
+    -- the destination this editor captured (never the Saved Build active
+    -- now) and, for a Saved Build destination with Auto ON, its conditional
+    -- consequence. An unbound Save names no Saved Build and promises nothing
+    -- about one.
+    function M.ConfirmationText(data, mode)
+        local destination = type(data) == "table" and data.destination or nil
+        local kind = type(destination) == "table" and destination.kind or "unknown"
+        local label = M.DestinationLabel(destination)
+        local parts = {string.format("%d of 79 rolled copies planned; planned locked targets are saved separately.",
+            EchoListTotal(type(data) == "table" and data.echoes or {}))}
+        if mode == "update" then
+            parts[#parts + 1] = "Updates this server Wishlist."
+            if kind == "savedBuild" then
+                parts[#parts + 1] = "Saving also updates its assignment to " .. label
+                    .. ", the Saved Build this editor opened. Nothing is activated, and that Saved Build's Echoes do not change."
+            elseif kind == "firstRun" then
+                parts[#parts + 1] = "Saving also updates " .. label
+                    .. " (used until a Saved Build with Echoes is active)."
+            else
+                parts[#parts + 1] = "This Wishlist has no Saved Build here, and saving changes no Saved Build's Wishlist."
+            end
+        else
+            if kind == "savedBuild" then
+                parts[#parts + 1] = "After a successful save it is assigned to " .. label
+                    .. ", the destination this editor captured when the draft began."
+            elseif kind == "firstRun" then
+                parts[#parts + 1] = "After a successful save it becomes " .. label
+                    .. ", used until a Saved Build with Echoes is active."
+            elseif kind == "unknown" then
+                parts[#parts + 1] = "Saved Build data is not loaded yet, so it will be saved without an assignment."
+            else
+                parts[#parts + 1] = "No Saved Build was open when this draft began, so it will be saved without "
+                    .. "an assignment. You can assign it afterwards in the Echo Journal."
+            end
+            parts[#parts + 1] = "Existing Wishlists are not overwritten. Nothing is rolled, spent or activated."
+        end
+        if kind == "savedBuild" and M.AutoIsOn() then
+            parts[#parts + 1] = "Auto is ON: when " .. label .. " is active and a finished run at level 80 "
+                .. "passes Auto's save checks, Nexus may replace that Saved Build with the run; this save can "
+                .. "make Auto check again. Turn Auto OFF to keep the Saved Build unchanged."
+        end
+        return table.concat(parts, "\n")
+    end
+
+    -- Plain words for a refusal or a failed assignment; the code itself is
+    -- kept only as a hover detail when no plain wording is known.
+    function M.PlainSaveReason(kind, reason, detail, label)
+        local where = label or "the Saved Build"
+        if kind == "partial" then
+            local refused = {
+                ["that loadout slot is empty or unavailable"] = where .. " is empty or not loaded",
+                ["invalid loadout"] = where .. " is outside the Saved Builds the server declares",
+                ["store unavailable"] = "the assignment could not be stored right now",
+                ["unavailable"] = "the assignment could not be stored right now",
+                ["invalid wishlist"] = "the saved plan could not be recorded as an assignment",
+                ["invalid slot"] = "the server Wishlist slot could not be identified",
+            }
+            if reason == "draftChanged" then return "the editor changed during the upload" end
+            if reason == "localTargets" then return "its locked targets could not be saved on this character" end
+            local plain = refused[tostring(detail or "unavailable")]
+            if plain then return plain end
+            return "the assignment was refused", detail
+        end
+        local words = {
+            stale_confirmation = "the editor changed after you confirmed; review and save again",
+            retry_draft_changed = "the draft changed while the save waited; review and save again",
+            assignment_changed = where .. " was assigned, unassigned or restored while the editor was "
+                .. "open, and that choice is kept; close and reopen the editor",
+            destination_empty = where .. " is empty or not loaded; add Echoes to it and save again",
+            stale_slot = "the server Wishlist slot no longer holds the Wishlist this editor opened; "
+                .. "open it again from the Echo Journal",
+            design_limit = "the plan designs more than six locked target copies; untag one first",
+            mirror_unresolved = "this saved plan has no distinct current server Wishlist to save to",
+            stale_candidate = "the copied record changed; reopen the current record",
+            stale_payload = "the plan changed while the save waited; review and save again",
+            empty = "the plan is empty; add an Echo first",
+            name = "enter a Wishlist name first",
+            adapter = "the editor is not ready yet",
+            expired = "the server stayed busy with another build operation; try again in a moment",
+            refused = "the server refused the change",
+            ["no echoes"] = "the plan has no Echoes",
+            ["no valid echoes"] = "none of the plan's Echoes look valid",
+            invalid_locked_design = "the locked-target design is invalid or no longer matches the Echo catalog",
+        }
+        local plain = words[tostring(reason or "")]
+        if plain then return plain end
+        return "the save could not be completed", reason
+    end
+
+    -- The row's one line and its hover lines for a SaveResult copy.
+    function M.SaveResultLines(result)
+        local plan = "'" .. (DisplayUntrusted(result.name, 1024, false) or "Wishlist") .. "'"
+        local destination = type(result.destination) == "table" and result.destination or {}
+        local label = M.DestinationLabel(destination)
+        local copies = tonumber(result.copies)
+        local planned = copies and string.format("%d of 79 rolled copies planned (a plan, not owned Echoes); "
+            .. "planned locked targets are separate.", copies) or nil
+        local journal = "Assign now... opens the Echo Journal's Wishlist selector; nothing is assigned until "
+            .. "you choose a Wishlist there, and nothing is uploaded again."
+        local kind, reason = result.kind, result.reason
+        if kind == "assigned" then
+            return "|cff4dff80Saved|r " .. plan .. " \226\128\162 Assigned to " .. (label or "its Saved Build"),
+                {"Saved, and " .. (label or "its Saved Build") .. " now uses this plan. Nothing was "
+                    .. "activated or rolled, and no Saved Build's Echoes changed.", planned}
+        elseif kind == "firstRun" then
+            local who = DisplayUntrusted(destination.character, 1024, false) or "this character"
+            return "|cff4dff80Saved|r " .. plan .. " \226\128\162 First-run target for " .. who,
+                {"Used until a Saved Build with Echoes is active. No Saved Build was changed.", planned}
+        elseif kind == "unassigned" then
+            local why = reason == "notLoaded" and "Saved Build data was not loaded"
+                or reason == "unboundPlan" and "this Wishlist has no Saved Build here"
+                or "no Saved Build was open when this draft began"
+            return "|cffffd200Saved \226\128\162 Not assigned|r " .. plan .. ": " .. why,
+                {"The plan is saved but no Saved Build or first-run target uses it yet.", journal, planned}
+        elseif kind == "kept" then
+            return "|cffffd200Saved \226\128\162 Not assigned|r " .. plan .. ": "
+                .. (label or "its destination") .. " changed meanwhile; that choice is kept",
+                {"The plan is saved. Its destination was assigned, unassigned or restored while the editor "
+                    .. "was open, and that newer choice is kept.", journal, planned}
+        elseif kind == "partial" then
+            local plain, code = M.PlainSaveReason(kind, reason, result.detail, label)
+            local lines = {}
+            if reason == "association" then
+                lines[1] = "Your plan is saved on the server, but the assignment was refused. Nothing will be "
+                    .. "uploaded again."
+                lines[2] = journal
+            elseif reason == "draftChanged" then
+                lines[1] = "The upload completed, but the editor changed during it, so nothing was assigned "
+                    .. "and local targets were not updated. Review the draft and save again."
+            else
+                lines[1] = "The upload completed, but the plan's locked targets could not be saved on this "
+                    .. "character, so nothing was assigned. Your draft is kept."
+            end
+            if code then lines[#lines + 1] = "Details: " .. tostring(DisplayUntrusted(code, 140, false) or "") end
+            return "|cffff6060Uploaded \226\128\162 Not assigned|r " .. plan .. ": " .. plain, lines
+        end
+        local plain, code = M.PlainSaveReason("notSaved", reason, nil, label)
+        local lines = {"Nothing was saved or assigned; your edits are kept."}
+        if code then lines[2] = "Details: " .. tostring(DisplayUntrusted(code, 140, false) or "") end
+        return "|cffff6060Not saved|r: " .. plain, lines
+    end
+
+    function M.EnsureSaveResultRow()
+        if not frame or frame._saveResultText then return end
+        -- Between the name field (create mode) and Import/Export, above the
+        -- locked strip; clear of the fixed list, footer and Save geometry.
+        local text = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        text:SetPoint("TOPLEFT", 400, -92)
+        text:SetSize(456, 18)
+        text:SetJustifyH("LEFT")
+        if type(text.SetWordWrap) == "function" then pcall(text.SetWordWrap, text, false) end
+        text:SetText("")
+        text:Hide()
+        frame._saveResultText = text
+        local hover = CreateFrame("Frame", nil, frame)
+        hover:SetPoint("TOPLEFT", text, "TOPLEFT", 0, 0)
+        hover:SetPoint("BOTTOMRIGHT", text, "BOTTOMRIGHT", 0, 0)
+        hover:EnableMouse(true)
+        hover:SetScript("OnEnter", function(self)
+            local lines = frame and frame._saveResultDetail
+            if not (GameTooltip and lines) then return end
+            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            GameTooltip:AddLine(tostring(frame._saveResultText:GetText() or ""), 1, 1, 1, true)
+            for _, line in ipairs(lines) do GameTooltip:AddLine(line, 0.82, 0.82, 0.82, true) end
+            GameTooltip:Show()
+        end)
+        hover:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+        hover:Hide()
+        frame._saveResultHover = hover
+        local button = CreateFrame("Button", "NexusWishlistAssignNowButton", frame, "UIPanelButtonTemplate")
+        button:SetSize(120, 20)
+        button:SetPoint("TOPLEFT", 736, -91)
+        button:SetText("Assign now...")
+        button:SetScript("OnClick", function() M.AssignNow() end)
+        button:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Assign now", 1, 0.8, 0.3)
+            GameTooltip:AddLine("Closes the editor and opens the Echo Journal's Wishlist selector, the same "
+                .. "route as Assign Wishlist. The Journal names the Saved Build it assigns to; nothing is "
+                .. "assigned until you choose a Wishlist there.", 0.8, 0.8, 0.8, true)
+            GameTooltip:AddLine("Nothing is uploaded again, no Saved Build is activated, and Auto is not changed.",
+                0.8, 0.8, 0.8, true)
+            GameTooltip:Show()
+        end)
+        button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        button:Hide()
+        frame._assignNowBtn = button
+    end
+
+    -- Draw the current result (or none). Reading it changes nothing; a
+    -- result the controller no longer considers current is not shown.
+    function M.RenderSaveResult()
+        if not frame or not frame._saveResultText then return end
+        local result = Controller.SaveResult and Controller.SaveResult(M.NameText()) or nil
+        local text, hover, button = frame._saveResultText, frame._saveResultHover, frame._assignNowBtn
+        if not result then
+            frame._saveResultDetail = nil
+            text:SetText("")
+            text:Hide(); hover:Hide(); button:Hide()
+            return
+        end
+        local line, detail = M.SaveResultLines(result)
+        frame._saveResultDetail = detail
+        text:SetWidth(result.assignNow and 330 or 456)
+        text:SetText(line)
+        text:Show(); hover:Show()
+        if result.assignNow then button:Show() else button:Hide() end
+    end
+
+    -- Assign now: the established Journal assignment route for a saved plan
+    -- that no destination uses. The controller refuses when the result is
+    -- no longer current, slot data is not loaded, or the Journal would
+    -- assign somewhere other than the captured destination; the editor is
+    -- then left as it is.
+    function M.AssignNowRefusal(why, destination)
+        local label = M.DestinationLabel(destination)
+        if why == "not_loaded" then
+            return "Saved Build data is not loaded yet, so the Wishlist selector was not opened and nothing "
+                .. "was assigned. Try again when it has loaded."
+        elseif why == "elsewhere" then
+            if type(destination) == "table" and destination.kind == "firstRun" then
+                return "The Echo Journal now assigns to a Saved Build, not to the first-run target this plan "
+                    .. "was saved for, so the selector was not opened and nothing was assigned. Close and "
+                    .. "reopen the editor to continue."
+            end
+            return "The Echo Journal now assigns to a different Saved Build than " .. (label or "the one")
+                .. " this plan was saved for, so the selector was not opened and nothing was assigned. "
+                .. "Select that Saved Build in the game first, or close and reopen the editor."
+        end
+        return "Assign now no longer applies to this plan, so nothing was opened or assigned."
+    end
+
+    function M.AssignNow()
+        local ok, why, destination = Controller.AssignNowCheck(M.NameText())
+        if not ok then
+            print("|cffff6060Nexus:|r " .. M.AssignNowRefusal(why, destination))
+            M.RenderSaveResult()
+            return false
+        end
+        local journal = Nexus.JournalTab
+        if not (journal and type(journal.OpenBuilds) == "function") then
+            print("|cffff6060Nexus:|r The Echo Journal's Wishlist selector is unavailable. Nothing was assigned.")
+            return false
+        end
+        -- As the main panel's Assign Wishlist: the editor closes first, since
+        -- the Echo Journal is kept hidden while the editor is shown.
+        M.Hide()
+        journal.OpenBuilds()
+        return true
     end
 
     function M.SetNameText(value)

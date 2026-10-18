@@ -204,6 +204,8 @@ function M._PumpApplyRetry()
     local ok = wishlistController.PumpApplyRetry()
     SyncFulfilledDraftTargets()
     if ok and wishlistRenderer then wishlistRenderer.SetApplySaved() end
+    -- A finished retry (not an idle pump) shows its result at once.
+    if ok ~= nil and wishlistRenderer then wishlistRenderer.RenderSaveResult() end
 end
 
 function M.IsApplyPending()
@@ -214,11 +216,15 @@ local function AcceptApply(data)
     local ok, err = wishlistController.AcceptApply(data)
     SyncFulfilledDraftTargets()
     if ok and wishlistRenderer then wishlistRenderer.SetApplySaved() end
+    if wishlistRenderer then wishlistRenderer.RenderSaveResult() end
     return ok, err
 end
 
+-- The second argument of both confirmations is composed by the renderer
+-- (ConfirmationText): the planned count, the destination this editor
+-- captured and, only when it applies, the Auto line.
 StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
-    text = "Save %d/79 rolled copies to '%s'?\nUpdates this server Wishlist. Planned locked targets are saved separately.",
+    text = "Save changes to '%s'?\n%s",
     button1 = "Save Changes",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
@@ -229,7 +235,7 @@ StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
 }
 
 StaticPopupDialogs["WISHLISTREALIZER_CREATE_WISHLIST"] = {
-    text = "Create '%s' with %d/79 rolled copies?\nSaves a new server Wishlist and assigns it to the loadout shown in the editor after successful saving. Existing Wishlists are not overwritten.",
+    text = "Create '%s'?\n%s",
     button1 = "Create Wishlist",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
