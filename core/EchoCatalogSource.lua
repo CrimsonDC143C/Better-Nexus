@@ -147,45 +147,6 @@ function Source.Materialize(database, resolveSpell)
     return candidate, canonical, hash
 end
 
--- Number equality as the canonical text sees it: Encode writes tostring, so
--- 0 and -0 differ there although they compare equal.
-local function SameNumber(left, right)
-    if left ~= right then return false end
-    return left ~= 0 or 1 / left == 1 / right
-end
-
--- "skip" for a source entry that Materialize does not take, true when the row
--- normalizes to the published row (name and lever tome name resolved again),
--- false when it differs. Reads one row, at most two names. Never publishes.
-local function VerifyRowUnsafe(catalog, spellId, row, resolveSpell)
-    if not (type(spellId) == "number" and Number(spellId) ~= nil
-        and type(row) == "table" and row.maxStack) then return "skip" end
-    local published = catalog.rows[spellId]
-    if type(published) ~= "table" then return false end
-    if EchoName(row, spellId, resolveSpell) ~= published.name then return false end
-    local requiredSpell = Number(row.requiredSpell, 0)
-    if not (SameNumber(Number(row.maxStack, 1), published.maxStack)
-        and SameNumber(Number(row.classMask, 0), published.classMask)
-        and SameNumber(Number(row.minLevel, 1), published.minLevel)
-        and SameNumber(Number(row.quality, 0), published.quality)
-        and SameNumber(Number(row.groupId, 0), published.groupId)
-        and SameNumber(requiredSpell, published.requiredSpell)) then
-        return false
-    end
-    if requiredSpell ~= 0 then
-        local lever = catalog.levers[requiredSpell]
-        if type(lever) ~= "table" then return false end
-        if ResolveName(resolveSpell, requiredSpell) ~= lever.tomeName then return false end
-    end
-    return true
-end
-
-function Source.VerifyRow(catalog, spellId, row, resolveSpell)
-    local ok, result = pcall(VerifyRowUnsafe, catalog, spellId, row, resolveSpell)
-    if not ok then return nil, SafeText(result) end
-    return result
-end
-
 function Source.FamilyDrift(previous, candidate)
     local oldFamilies = type(previous) == "table" and previous.familyOf or nil
     local newFamilies = type(candidate) == "table" and candidate.familyOf or nil

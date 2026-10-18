@@ -27,7 +27,7 @@ local HELD_CHOICE_DELAY=5
 local SESSION_INTERRUPTED="Session interrupted. Orb spending will not restart automatically."
 -- Continue is a bounded class, not an exit for every unresolved receipt.
 local KEPT=" The record and its spending exposure are kept."
-local NO_EXIT=" Continue is available only after a reload for a client-observed spend with no usable recorded choice and no open offer, after a read-only check. Open /nexus orbs for this record's eligibility and explanation. Nexus never continues by itself."
+local NO_EXIT=" Besides a matching result, the only exit is the player's explicit Continue in /nexus orbs. It is offered only for an action whose spend the client observed (one Orb fewer with its offer) and no recorded outcome, once its offer is gone, after a read-only check; Nexus never continues by itself."
 local UNOBSERVED=" This record contains no retained observation of one Orb fewer with this action's offer. That does not prove that the server spent nothing. Continue does not apply to this record. Start, Resume and reload cannot reconstruct the missing history; Recheck can collect current facts but cannot promise to settle it. Preserve the record; do not repeat the spend or clear its exposure."
 -- The game's lifecycle as this owner's frame saw it (local facts only; they say
 -- nothing about the server). epoch counts every loading transition (leave or
@@ -325,7 +325,7 @@ local function journalBegin(p)
         if not ae or #archive>=8 or ab+b+4096>28672 then run.boundary.reason="archive_budget";return end
     end
     if p.boundaryJournal~=nil then run.boundary.reason="foreign_journal";return end
-    p.boundaryJournal={};run.boundary.owner=p;run.boundary.journal=p.boundaryJournal;run.boundary.mode="durable";run.boundary.reason=nil
+    run.boundary.owner=p;run.boundary.journal=run.boundary.session;run.boundary.mode="session_only";run.boundary.reason=nil
 end
 local function journalRelation(charges,before)
     if not integer(charges,0) or not integer(before,0) then return "unknown" end
@@ -2565,6 +2565,7 @@ end) end
 do
     local status=M.Status
     function M.Status(...)
+        local _=config,run
         local perf=Nexus.Performance
         if perf and type(perf.MeasureDiagnostic)=="function" then return perf.MeasureDiagnostic("orb.status",status,...) end
         return status(...)

@@ -2292,49 +2292,43 @@ local function EnsureFrame()
             and not importPending and not coldStart
         local needPump = (not backingOff) and (refreshDirty
             or viewDiagnostic.projectionPending or coldStart or importPending)
-        if not needPump then
-            pumpTicker = 0
-        else
-            pumpTicker = pumpTicker + elapsed
-            if pumpTicker >= PUMP_INTERVAL then
-                pumpTicker = 0
-                local function NoteRefreshOutcome()
-                    if viewDiagnostic.projectionError then
-                        local failures = math.max(1,
-                            tonumber(virtualStats.dataFailures) or 1)
-                        local delay = FAIL_BACKOFF_BASE
-                            * (2 ^ math.min(failures - 1, 4))
-                        if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
-                        failBackoffUntil = now + delay
-                    else
-                        failBackoffUntil = 0
-                    end
+        if needPump then
+            local function NoteRefreshOutcome()
+                if viewDiagnostic.projectionError then
+                    local failures = math.max(1,
+                        tonumber(virtualStats.dataFailures) or 1)
+                    local delay = FAIL_BACKOFF_BASE
+                        * (2 ^ math.min(failures - 1, 4))
+                    if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
+                    failBackoffUntil = now + delay
+                else
+                    failBackoffUntil = 0
                 end
-                if importPending then
-                    local _, pending = PrepareData(false)
-                    if not pending then M.Refresh(); NoteRefreshOutcome() end
-                elseif refreshDirty and not viewDiagnostic.projectionPending
-                    and not receivingNow then
-                    -- MarkDataDirty clears projectionPending; request a job
-                    -- before PumpBuilds can advance one.
+            end
+            if importPending then
+                local _, pending = PrepareData(false)
+                if not pending then M.Refresh(); NoteRefreshOutcome() end
+            elseif refreshDirty and not viewDiagnostic.projectionPending
+                and not receivingNow then
+                -- MarkDataDirty clears projectionPending; request a job
+                -- before PumpBuilds can advance one.
+                M.Refresh()
+                NoteRefreshOutcome()
+            end
+            local projections = Nexus and Nexus.ViewProjections
+            if projections and (not receivingNow or coldStart)
+                and type(projections.PumpBuilds) == "function" then
+                -- A receive window may already be active when the browser
+                -- first opens. Keep that cold persisted projection moving,
+                -- but retain an existing last-good publication until the
+                -- burst becomes quiet.
+                if receivingNow and coldStart then
                     M.Refresh()
                     NoteRefreshOutcome()
                 end
-                local projections = Nexus and Nexus.ViewProjections
-                if projections and (not receivingNow or coldStart)
-                    and type(projections.PumpBuilds) == "function" then
-                    -- A receive window may already be active when the browser
-                    -- first opens. Keep that cold persisted projection moving,
-                    -- but retain an existing last-good publication until the
-                    -- burst becomes quiet.
-                    if receivingNow and coldStart then
-                        M.Refresh()
-                        NoteRefreshOutcome()
-                    end
-                    local ok, published, pumpError = pcall(projections.PumpBuilds)
-                    if ok and published then M.Refresh(); NoteRefreshOutcome() end
-                    if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
-                end
+                local ok, published, pumpError = pcall(projections.PumpBuilds)
+                if ok and published then M.Refresh(); NoteRefreshOutcome() end
+                if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
             end
         end
 

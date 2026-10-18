@@ -1162,17 +1162,7 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
     if wishlistPicker.clearRow then wishlistPicker.clearRow:Hide() end
     wishlistPicker:ClearAllPoints()
     wishlistPicker:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
-    -- The selector already names the selected Wishlist, so the list offers
-    -- only the others. Only that one identity (IsAssignedPickerRow) is left
-    -- out: a row with the same name or contents is another Wishlist and stays.
-    -- With no name on the selector the selection stays listed and marked.
     local shown = wishes
-    if linked and tostring(linked.name or "") ~= "" then
-        shown = {}
-        for i=1,#wishes do
-            if not IsAssignedPickerRow(linked, wishes[i]) then shown[#shown+1] = wishes[i] end
-        end
-    end
     local width, rowH = 245, 24
     wishlistPicker:SetWidth(width)
     local count = math.max(1, #shown)

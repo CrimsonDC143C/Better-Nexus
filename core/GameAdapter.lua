@@ -4185,7 +4185,7 @@ end
 -- authoritative (first SS-530 arrived) and clamps timestamps from a previous
 -- boot (GetTime() restarts at reboot -- a persisted future timestamp would
 -- otherwise never expire).
-local TOME_PENDING_EXPIRE = 2.5
+local TOME_PENDING_EXPIRE = 3.5
 local function ReconcileTomePending()
     local st = Store and Store.State()
     -- Every shaped row has this map, usually empty. With nothing pending the

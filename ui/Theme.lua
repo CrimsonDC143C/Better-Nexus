@@ -614,13 +614,11 @@ function T.MenuItems(close)
         func=pick(T.SetPalette, nil),
     }
     for _, palette in ipairs(T.Palettes()) do
-        if not SameColours(palette, own) then
-            items[#items + 1] = {
-                text=palette.label .. " (" .. palette.hue .. ")",
-                checked=a.explicitPalette and a.palette == palette,
-                func=pick(T.SetPalette, palette.id),
-            }
-        end
+        items[#items + 1] = {
+            text=palette.label .. " (" .. palette.hue .. ")",
+            checked=a.explicitPalette and a.palette == palette,
+            func=pick(T.SetPalette, palette.id),
+        }
     end
     if a.unknownPalette then
         items[#items + 1] = {notCheckable=true, disabled=true,
