@@ -1818,7 +1818,32 @@ local function StaticContext(probe, forceCompile)
         wishlistKey=wishlistKey,targets=targets,plan=plan,
     }
     staticInvalidated = false
-    CaptureFallbackSignature()
+    -- This capture reconciles the Echo mirrors, so it can move a generation
+    -- after ConsumeDirty keyed this poll's projections, and it makes that
+    -- generation the fallback baseline: no later fallback would repair it.
+    -- A projection whose generation moved here is read again in this step,
+    -- not served under the earlier key (its value predates the change), so
+    -- what the step renders and caches matches the revisions now current.
+    -- The keys stay as ConsumeDirty set them: a disagreeing stub can cause an
+    -- extra read, never a stale one. Inline and allocation-free: New is at
+    -- the 200-local limit.
+    if CaptureFallbackSignature() and projectionRevisions.valid then
+        local s, k = fallbackSignature, projectionRevisions
+        if (type(s.slots) == "number" and s.slots ~= k.slots)
+            or (type(s.activeSlot) == "number"
+                and s.activeSlot ~= k.activeSlot) then
+            projectionCache.slots.set, projectionCache.slots.value = false, nil
+        end
+        if type(s.granted) == "number" and s.granted ~= k.granted then
+            projectionCache.owned.set, projectionCache.owned.value = false, nil
+        end
+        if type(s.locked) == "number" and s.locked ~= k.locked then
+            projectionCache.locked.set, projectionCache.locked.value = false, nil
+        end
+        if type(s.discovery) == "number" and s.discovery ~= k.discovery then
+            projectionCache.levers.set, projectionCache.levers.value = false, nil
+        end
+    end
     return staticCache
 end
 
