@@ -112,11 +112,52 @@ local function World(kind)
  setup(W.runtime.AutoEnabled()==true and #F.calls==0,'explicit Auto ON before first action tick')
  return W
 end
+-- Since M3 (UX-05) a pick for a numbered Saved Build with Echoes while Auto is
+-- selected asks first with the real confirmation; this synthetic player checks
+-- it and answers Assign (the dialog's own OnAccept, as the client runs it).
+-- The expectation comes from the scenario (Auto state, Saved Build 1 with
+-- Echoes), never from the dialog: a missing or different confirmation, or a
+-- dialog where none is expected, fails the fixture. Only the raw Store
+-- association is read between the click and the answer (no assignment,
+-- slot, Progress or display observer).
+local CONSENT='NEXUS_ASSIGN_WISHLIST_AUTO_ON'
+local function Association()
+ local links=Nexus.Store.State().loadoutWishlists
+ local record=type(links)=='table' and links[1] or nil
+ if type(record)~='table' then return tostring(record) end
+ return tostring(record.slot)..'/'..tostring(record.name)..'/'..tostring(record.assignmentId)
+end
 local function Pick(W,key)
  local picker=assert(S.OpenPicker(),'SETUP: real Journal selector opens')
  local row=assert(S.PickerRow('Late Discovery '..key),'SETUP: real Journal offers '..key)
+ local H=W.H
+ local target=type(H.perks.serverBuildSlots)=='table' and H.perks.serverBuildSlots[1] or nil
+ local auto=W.runtime.AutoEnabled()==true
+ local asks=auto and tonumber(H.perks.serverActiveSlot)==1 and type(target)=='table' and #(target.echoes or {})>0
+ local prior=Association()
+ H.popup=nil
  row.nameButton:Click()
+ local p=H.popup
+ if asks then
+  setup(p~=nil and p.which==CONSENT,'Auto-ON pick asks with the real assignment confirmation: '..tostring(p and p.which))
+  local d=StaticPopupDialogs[CONSENT]
+  setup(type(d)=='table','the confirmation dialog is defined')
+  local wishlist,where='Late Discovery '..key,"Saved Build '"..tostring(target.name).."'"
+  local ok,asked=pcall(string.format,tostring(d.text),p.arg1,p.arg2)
+  setup(d.button1=='Assign' and d.button2=='Cancel','confirmation buttons are Assign and Cancel')
+  setup(p.arg1==wishlist and p.arg2==where,'confirmation names the picked Wishlist and the captured Saved Build: '
+   ..tostring(p.arg1)..' / '..tostring(p.arg2))
+  setup(ok and asked:find("Assign '"..wishlist.."' to "..where.."?",1,true)==1
+   and asked:find('Auto is ON',1,true)~=nil and asked:find('Cancel changes nothing',1,true)~=nil,
+   'confirmation title and Auto consequence: '..tostring(asked))
+  setup(picker:IsShown() and Association()==prior,'nothing is assigned before the answer')
+  H.popup=nil
+  d.OnAccept(p.frame,p.data)
+ else
+  setup(p==nil,'no dialog for this pick: '..tostring(p and p.which))
+ end
  setup(not picker:IsShown(),'real name callback closes its picker')
+ setup((W.runtime.AutoEnabled()==true)==auto,'picking changes no Auto state')
  ProjectEbonholdEchoJournal:Hide()
 end
 local function Pending()

@@ -34,8 +34,17 @@ local footer,save,area
 for _,f in ipairs(frame.regions)do
  if f:GetText():find('Rolled copies:',1,true)then footer=f end
 end
+-- M3: the Save control is labelled by its effect (Create & assign, else Create
+-- unassigned; legacy Create Wishlist). It is created before the Create
+-- unassigned alternative beside it, so the first match of the first label
+-- present is the apply button.
+for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+ for _,f in ipairs(frame.children)do
+  if f.kind=='Button' and f:GetText()==label then save=f;break end
+ end
+ if save then break end
+end
 for _,f in ipairs(frame.children)do
- if f.kind=='Button' and f:GetText()=='Create Wishlist' then save=f end
  if f.scripts.OnMouseWheel and f.width==332 then area=f end
 end
 assert(footer and save and area,'actual Selected Echoes footer/list/Save control')

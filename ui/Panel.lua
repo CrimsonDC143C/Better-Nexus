@@ -162,6 +162,8 @@ local function ModelSignatures(model)
                 or SafeText(model.recommendation) ~= "") or nil,
             -- The compact charges line follows the charge facts the model carries.
             charges=model.charges,
+            -- The inline Auto line (M.AutoNoteFor) is roll content too.
+            autoNote=model.autoNote,
         }),
         performance = Signature({
             performance=type(model.progress) == "table" and model.progress.performance or nil,
@@ -819,6 +821,23 @@ local function EnsureFrame()
     frame._chargesText:SetSize(72, 14)
     frame._chargesText:SetJustifyH("RIGHT")
     frame._chargesText:Hide()
+    -- Its legend on hover (Readout.ChargesLegend): what B/R/F, "?" and "~"
+    -- mean. Shown and hidden with the line; reading it changes nothing.
+    -- A frame field, not a local (EnsureFrame is near the Lua limits).
+    frame._chargesHover = CreateFrame("Frame", nil, rollArea)
+    frame._chargesHover:SetPoint("TOPLEFT", frame._chargesText, "TOPLEFT", 0, 0)
+    frame._chargesHover:SetPoint("BOTTOMRIGHT", frame._chargesText, "BOTTOMRIGHT", 0, 0)
+    frame._chargesHover:EnableMouse(true)
+    frame._chargesHover:SetScript("OnEnter", function(self)
+        local readout = Nexus.Readout
+        if not (GameTooltip and readout and type(readout.ChargesLegend) == "function") then return end
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Charges", 1, 1, 1)
+        for _, line in ipairs(readout.ChargesLegend()) do GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true) end
+        GameTooltip:Show()
+    end)
+    frame._chargesHover:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    frame._chargesHover:Hide()
 
     for i = 1, 3 do
         local fs = rollArea:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -1121,9 +1140,12 @@ local function EnsureFrame()
     autoBtn:SetText(AutoLabel(nil))
     autoBtn:SetScript("OnClick", function()
         if callbacks and type(callbacks.ToggleAuto) == "function" then
+            local before = M.AutoSelectedNow()
             local ok, state = pcall(callbacks.ToggleAuto)
             -- The label, and at Auto OFF the release of a reserved roll block.
             if ok and state ~= nil then M.SetAuto(state and true or false) end
+            -- A click that left Auto OFF says why in the roll block (UX-09).
+            M.NoteAutoClick(before, ok, state)
         end
     end)
     autoBtn:SetScript("OnEnter", function(self)
@@ -1136,6 +1158,32 @@ local function EnsureFrame()
         GameTooltip:AddLine("OFF keeps recommendations visible; it does not turn off Sync.", 0.75, 0.75, 0.75, true)
         GameTooltip:AddLine("An off-Wishlist pick may occur when no eligible target or", 0.75, 0.75, 0.75, true)
         GameTooltip:AddLine("search action is available. Later improvement is not guaranteed.", 0.75, 0.75, 0.75, true)
+        -- What Auto may do (Readout.AutomationScopeLines): the session
+        -- selection, why it is not acting, and each permission the runtime
+        -- gates on with the existing control that changes it. Read from the
+        -- last committed model and Store.Settings only: hovering calls no gate,
+        -- requests, sends or writes nothing. Through the Nexus global (no new
+        -- upvalue: EnsureFrame is at the ceiling).
+        local readout = Nexus.Readout
+        if readout and type(readout.AutomationScopeLines) == "function" then
+            local model = type(M._lastModel) == "table" and M._lastModel or {}
+            local store = Nexus.Store
+            local okSettings, settings = false, nil
+            if store and type(store.Settings) == "function" then okSettings, settings = pcall(store.Settings) end
+            local internals = Nexus.MainInternals
+            local okRead, readOnly = false, nil
+            if internals and type(internals.SavedRootReadOnlyV1) == "function" then
+                okRead, readOnly = pcall(internals.SavedRootReadOnlyV1)
+            end
+            local held = model.auto and (type(model.paused) == "string" and model.paused
+                or (type(model.effective) == "table" and model.effective.hold and model.effective.reason)) or nil
+            GameTooltip:AddLine(" ")
+            for _, line in ipairs(readout.AutomationScopeLines({selected = model.auto == true,
+                held = held, settings = okSettings and settings or nil,
+                readOnly = okRead and readOnly ~= nil and readOnly ~= false})) do
+                GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true)
+            end
+        end
         -- The button is the selection; this is what it is doing now, from
         -- the last committed model (memory only: waiting, rechecking,
         -- paused or ready, with the reason). The reason is in the player's
@@ -1226,6 +1274,10 @@ local function EnsureFrame()
               end) },
             { text = "Orbs / Lost Memories", notCheckable = true,
               func = MenuAction(function() if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end) },
+            -- What Auto may do, with each permission's current value; only
+            -- the existing setters change one (M.AutomationMenuItems).
+            { text = "Automation settings", notCheckable = true, hasArrow = true,
+              menuList = M.AutomationMenuItems(MenuAction) },
             {
                 -- Opens the style and colour choices as their own menu.
                 text = "Appearance: " .. ((Nexus.Theme and Nexus.Theme.Summary)
@@ -1598,6 +1650,8 @@ function M.Init(cb)
 end
 
 function M.SetAuto(auto)
+    -- Auto ON ends the line of an earlier refused click.
+    if auto then M._autoRefusal = nil end
     if autoBtn then autoBtn:SetText(AutoLabel(auto and true or false)) end
     ReleaseRollOnAutoOff(auto and true or false)
 end
@@ -1882,7 +1936,7 @@ local function ApplyModel(model, signatures, roll)
             local cards = type(model.cards) == "table" and model.cards or {}
             local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
             local activeRoll = #cards > 0 or SafeText(model.recommendation) ~= ""
-                or (guide and SafeText(guide.text) ~= "") or false
+                or (guide and SafeText(guide.text) ~= "") or SafeText(model.autoNote) ~= "" or false
             local noBuild = total <= 0 or not pr.wishlistName
             local ss = type(model.serverStatus) == "table" and model.serverStatus or nil
             local statusVisible = ss and (ss.tier or ss.mode or ss.ash
@@ -1923,7 +1977,10 @@ local function ApplyModel(model, signatures, roll)
     local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
     -- With no build, the setup view already names the missing Wishlist.
     local guideText = (guide and total > 0 and name) and SafeText(guide.text) or ""
-    local activeRoll = #cards > 0 or recommendation ~= "" or guideText ~= ""
+    -- The inline Auto line (M.AutoNoteFor): why a selected Auto is not acting,
+    -- or why the last Auto click left it OFF. It shows the roll block too.
+    local autoNote = SafeText(model.autoNote)
+    local activeRoll = #cards > 0 or recommendation ~= "" or guideText ~= "" or autoNote ~= ""
     -- The roll block's space: current content, or a reservation through an
     -- ordinary gap between choices (RollPresentation). Content and actions
     -- still come only from the current model.
@@ -1959,8 +2016,13 @@ local function ApplyModel(model, signatures, roll)
                 orbButton=(activeRoll and guide and guide.openOrbs
                     and total > 0 and name) and true or false,
                 -- Rows for the body while it shows the Orb guidance or,
-                -- with the Open Orbs button, the Orb pause reason.
-                guidanceRows=(guideText ~= "" and (bodyText == guideText
+                -- with the Open Orbs button, the Orb pause reason; or, below
+                -- the cards, the recommendation with the inline Auto line
+                -- (without cards the body already has the card rows' space).
+                guidanceRows=(autoNote ~= "" and #cards > 0)
+                    and Nexus.LayoutMetrics.TextRows((bodyText ~= "" and (bodyText .. "\n") or "")
+                        .. autoNote, 248, fontScale)
+                    or (guideText ~= "" and (bodyText == guideText
                     or guide.openOrbs))
                     and Nexus.LayoutMetrics.TextRows(bodyText, 248, fontScale)
                     or 0,
@@ -2028,6 +2090,8 @@ local function ApplyModel(model, signatures, roll)
             and not (guide and guide.openOrbs) and type(cards[marked]) == "table" then
             body = Nexus.Readout.RecommendationWithTarget(recommendation, SafeText(cards[marked].text))
         end
+        -- The inline Auto line follows whatever the body shows, on its own line.
+        if autoNote ~= "" then body = (body ~= "" and (body .. "\n") or "") .. autoNote end
         recText:SetText(body)
         -- Compact charges, only from charge facts the model itself carries
         -- (Readout.ChargesLine; unknown is "?", never 0).
@@ -2037,9 +2101,13 @@ local function ApplyModel(model, signatures, roll)
                 and Nexus.Readout.ChargesLine and Nexus.Readout.ChargesLine(model.charges) or ""
             chargesText:SetText(line)
             if line ~= "" then chargesText:Show() else chargesText:Hide() end
+            if frame._chargesHover then
+                if line ~= "" then frame._chargesHover:Show() else frame._chargesHover:Hide() end
+            end
         end
     elseif frame._chargesText then
         frame._chargesText:Hide()
+        if frame._chargesHover then frame._chargesHover:Hide() end
     end
     if frame._orbsBtn then
         frame._orbsBtn.blockers = guide and guide.blockers or nil
@@ -2313,6 +2381,9 @@ function M.Render(model)
         candidate.recommendation=Nexus.UserText.Message(candidate.recommendation)
         candidate.status=Nexus.UserText.Message(candidate.status)
     end
+    -- The inline Auto line, from this model and the last refused Auto click
+    -- (memory only); recomputed on every render, so an old one never stays.
+    candidate.autoNote = M.AutoNoteFor(candidate)
     local signatures = ModelSignatures(candidate)
     -- The reservation changes the layout, so it is part of its signature.
     local roll = RollPresentation(candidate)
@@ -2372,6 +2443,141 @@ function M.Refresh()
     if M._lastModel then return M.Render(M._lastModel) end
     return false
 end
+-- The inline Auto line of the roll block (UX-09), from the model and the last
+-- refused Auto click only: why a selected Auto is not acting, in plain words
+-- with what helps (not for a wait for a sent action, whose heading and line
+-- already say it, and not when the Orb guidance is itself the pause reason:
+-- an Orb run or the Orb-state gate, shown with Open Orbs); or why the last
+-- Auto click left Auto OFF. Other guidance (for example "An Echo choice is
+-- open", which every board carries and the body does not show beside a
+-- recommendation) does not explain a pause and does not hide it. Passive:
+-- memory only, no gate, request or action; nil when there is nothing to say.
+function M.AutoNoteFor(model)
+    if type(model) ~= "table" or not Nexus.Readout then return nil end
+    local pr = type(model.progress) == "table" and model.progress or {}
+    local total, owned = tonumber(pr.total) or 0, tonumber(pr.owned) or 0
+    -- Without a build the setup view stands in this space (M.NoteAutoClick prints).
+    if total <= 0 or not pr.wishlistName then return nil end
+    local refusal = M._autoRefusal
+    if model.auto == false and type(refusal) == "table" and type(refusal.text) == "string"
+        and (tonumber(GetTime()) or 0) - (tonumber(refusal.at) or 0) <= 60 then
+        return refusal.text
+    end
+    if not (model.auto and type(model.paused) == "string" and model.paused ~= "") then return nil end
+    local complete = owned >= total and #(type(pr.toLock) == "table" and pr.toLock or {}) == 0
+    local effective = type(model.effective) == "table" and model.effective.state or nil
+    local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
+    local orbPause = guide and (guide.state == "orb-run" or guide.state == "orb-state")
+        and SafeText(guide.text) ~= ""
+    if complete or effective == "waiting" or effective == "rechecking" or orbPause then
+        return nil
+    end
+    return Nexus.Readout.AutoHoldNote and Nexus.Readout.AutoHoldNote(model.paused) or nil
+end
+
+-- The "Automation settings" submenu of the ... menu (UX-10): every permission
+-- Auto gates on, with its current value (Readout.AutomationSettingsRows), read
+-- from Store.Settings and the runtime's counters when the menu opens. Opening,
+-- hovering or closing it changes nothing. Only the Reroll and Freeze rows act,
+-- through their existing setter (/nexus reroll|freeze on|off: MainCommands to
+-- Main's rollingOption); Lock Wishlist Echoes opens the Wishlist Editor, whose
+-- own control is its setter; the last row opens Help. `action` wraps a click
+-- (the menu's MenuAction: it closes the menu first).
+function M.AutomationMenuItems(action)
+    local readout = Nexus.Readout
+    if not (readout and type(readout.AutomationSettingsRows) == "function") then
+        return {{text = "Automation settings are not available yet", notCheckable = true, disabled = true}}
+    end
+    local store = Nexus.Store
+    local okSettings, settings = false, nil
+    if store and type(store.Settings) == "function" then okSettings, settings = pcall(store.Settings) end
+    local internals = Nexus.MainInternals
+    local okRead, readOnly = false, nil
+    if internals and type(internals.SavedRootReadOnlyV1) == "function" then
+        okRead, readOnly = pcall(internals.SavedRootReadOnlyV1)
+    end
+    local rows = readout.AutomationSettingsRows({selected = M.AutoSelectedNow() == true,
+        settings = okSettings and settings or nil,
+        readOnly = okRead and readOnly ~= nil and readOnly ~= false})
+    local items = {}
+    for _, row in ipairs(rows) do
+        local item = {text = row.text}
+        if row.kind == "title" then
+            item.isTitle, item.notCheckable = true, true
+        elseif row.kind == "toggle" then
+            local command = row.command
+            item.checked = row.checked == true
+            item.func = action(function()
+                local slash = SlashCmdList and SlashCmdList.NEXUS
+                if type(slash) == "function" then slash(command) end
+            end)
+        elseif row.kind == "editor" then
+            item.notCheckable = true
+            item.func = action(function()
+                local help = Nexus.Help
+                if help and type(help.OpenEditor) == "function" then help.OpenEditor() end
+            end)
+        elseif row.kind == "help" then
+            item.notCheckable = true
+            item.func = action(function() if Nexus.Help then Nexus.Help.Show("rolling") end end)
+        else
+            item.notCheckable, item.disabled = true, true
+        end
+        items[#items + 1] = item
+    end
+    return items
+end
+
+-- Whether Auto is selected now, from the runtime's counters (memory only).
+function M.AutoSelectedNow()
+    if type(Nexus.RecomputeStats) ~= "function" then return nil end
+    local ok, stats = pcall(Nexus.RecomputeStats)
+    if not ok or type(stats) ~= "table" then return nil end
+    return stats.autoEnabled == true
+end
+
+-- After an Auto button click: when Auto was OFF, stayed OFF and no warning
+-- opened (the warning is its own next step), remember why for the roll block
+-- and render the last model again. Any other outcome forgets an earlier one.
+-- Reads only; it never toggles, retries or requests.
+function M.NoteAutoClick(before, ok, state)
+    local warning = Nexus.OverwriteWarning
+    local open = warning and type(warning.IsOpen) == "function" and warning.IsOpen()
+    if before ~= false or not ok or state ~= false or open then
+        M._autoRefusal = nil
+        return false
+    end
+    local orb = Nexus.OrbRuntime
+    local blocked = false
+    if orb and type(orb.BlocksOrdinary) == "function" then
+        local okOrb, value = pcall(orb.BlocksOrdinary)
+        blocked = okOrb and value == true
+    end
+    local model = type(M._lastModel) == "table" and M._lastModel or nil
+    local status = model and SafeText(model.status) or ""
+    local kind = blocked and "orb"
+        or ((not warning or type(warning.RequestAuto) ~= "function") and "warning") or nil
+    local text = Nexus.Readout and Nexus.Readout.AutoRefusalText
+        and Nexus.Readout.AutoRefusalText(kind, status) or ("Auto stayed OFF. " .. status)
+    M._autoRefusal = {text = text, at = tonumber(GetTime()) or 0}
+    local pr = model and type(model.progress) == "table" and model.progress or {}
+    if not model or (tonumber(pr.total) or 0) <= 0 or not pr.wishlistName then
+        -- No roll block to show it in: said once in chat instead.
+        print("|cffffd200Nexus:|r " .. text)
+        return true
+    end
+    -- The ordinary render transaction of the last committed model with its
+    -- own raw text (as ReleaseRollOnAutoOff); nothing else changes.
+    local copy = DefensiveCopy(model)
+    local rawText = renderState.rawText or {}
+    copy.status, copy.recommendation = rawText.status, rawText.recommendation
+    local rendered, why = pcall(M.Render, copy)
+    if not rendered and Nexus.Errors and type(Nexus.Errors.Record) == "function" then
+        pcall(Nexus.Errors.Record, "Panel.NoteAutoClick", why)
+    end
+    return true
+end
+
 function M.SetStatus(status)
     if not M._lastModel then return false end
     local nextStatus = SafeText(Nexus.UserText and Nexus.UserText.Message(status) or status)

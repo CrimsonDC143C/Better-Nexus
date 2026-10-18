@@ -106,15 +106,13 @@ Boot()
 local injected={}
 local legacy5=Player('Legacy5')
 local passRevision
--- While catalog admission runs the repair cannot progress (its pump waits);
--- advance in coarse steps until the pass can work, then frame by frame.
-for _=1,20000 do
- local root=Nexus.BuildCatalog.RootState and Nexus.BuildCatalog.RootState() or nil
- if not (type(root)=='table' and root.candidate==true) then break end
- H.Advance(1,.05)
-end
 -- Read-only observation of the real cursor: which rows each pass scanned.
+-- Installed before the admission wait below, whose last coarse step can
+-- already run repair pumps, so no scanned row goes unobserved. It also keeps
+-- the start-up pass's own handle on Legacy5's dummy row (the cursor, the
+-- captured key and the exact row read there) for the section 12 setup.
 local scannedByPass={}
+local captured5
 do
  local dps=Nexus.DpsCapture
  local realNext=dps.LegacyQualificationCursorNext
@@ -124,20 +122,51 @@ do
    local pass=(Stats().passesCompleted or 0)+1
    scannedByPass[pass]=scannedByPass[pass] or {}
    scannedByPass[pass][tostring(item.row.player)]=true
+   scannedByPass[pass].n=(scannedByPass[pass].n or 0)+1
+   if pass==1 and not captured5 and item.category=='dummy' and item.row.player=='Legacy5' then
+    captured5={cursor=cursor,key=item.key,row=item.row,at=scannedByPass[pass].n}
+   end
   end
   return item,done,err
  end
 end
+-- While catalog admission runs the repair cannot progress (its pump waits);
+-- advance in coarse steps until the pass can work, then frame by frame.
+for _=1,20000 do
+ local root=Nexus.BuildCatalog.RootState and Nexus.BuildCatalog.RootState() or nil
+ if not (type(root)=='table' and root.candidate==true) then break end
+ H.Advance(1,.05)
+end
+-- Section 12 replaces a legacy candidate's row AFTER the pass captured it and
+-- BEFORE it is classified. The cursor reads each captured key's row only when
+-- it reaches that key, and the phase reads 'scan' from the request on, before
+-- any row is read; how far the scan got before this loop depends on how many
+-- updates of the last admission step followed admission (its slices have a
+-- real-time budget). So the updates arrive in the first scan frame in which
+-- the start-up pass has read Legacy5's dummy row; its lk rows come later, so
+-- the scan is still running.
 for _=1,math.floor(60*FPS*S) do
  local phase=Meta().phase
- if Stats().pending and phase=='scan' and not injected.scan then
+ if Stats().pending and phase=='scan' and captured5 and not injected.scan then
   injected.scan=true
   passRevision=Meta().requestedDpsRevision
+  local before5=legacy5.dps.dummy
   AlphaImproves('during scan')
   injected.newcomer=Nexus.DpsCapture.ReceiveRecord({v=7,c='dummy',d=33333,u=180,t=time()-5,p='Newcomer',l=80,k='MAGE',
    o='newcomer@ebonhold',r='Ebonhold',e=L.Copy(fx.players[2].dpsOrdinary),f=fx.players[2].fingerprint,
    lk=L.Copy(fx.players[2].dpsLocked)},'Newcomer-Ebonhold')
   injected.replaced=fx:Receive('Legacy5','dummy',{dps=legacy5.dps.dummy+1000,ts=time()-4})
+  -- Setup evidence at this boundary, through the re-read the repair itself
+  -- uses before a write: the pass captured the old legacy row, the row now
+  -- stored under that captured key is not it, and Legacy5's newer record is
+  -- stored under its owner key (the same key, unless the receive re-keyed it).
+  local now5=Nexus.DpsCapture.LegacyQualificationCurrentRow(captured5.cursor,'dummy',captured5.key)
+  local new5=Nexus.DpsCapture.LegacyQualificationCurrentRow(captured5.cursor,'dummy',legacy5.owner)
+  injected.stale=Meta().phase=='scan' and Stats().pending==true and tonumber(captured5.row.dps)==before5
+   and now5~=captured5.row and type(new5)=='table' and tonumber(new5.dps)==before5+1000
+  print('LRP setup','scannedBeforeReplace',scannedByPass[1] and scannedByPass[1].n or 0,'legacy5At',captured5.at,
+   'capturedKey',tostring(captured5.key),'capturedDps',tostring(captured5.row.dps),
+   'storedUnderKeyDps',tostring(now5 and now5.dps),'newerDps',tostring(new5 and new5.dps),'stale',tostring(injected.stale))
  elseif Stats().pending and phase=='classify' and injected.scan and not injected.classify then
   injected.classify=true
   AlphaImproves('during classification')
@@ -150,6 +179,7 @@ print('LRP startup-pass','scan',tostring(injected.scan),'classify',tostring(inje
  'replaced',tostring(injected.replaced),'skippedChanged',s.changedSkipped,'stalePasses',s.stalePasses,
  'completed',tostring(s.completedDpsRevision),'passRevision',tostring(passRevision),'current',CurrentRevision())
 check(injected.scan and injected.classify and injected.newcomer and injected.replaced,'4: updates arrived during scan and classification')
+check(captured5 and injected.stale,'12: setup: the pass read Legacy5\'s legacy dummy row, then that row was replaced under its captured key while the pass was still scanning')
 check(s.restarts==0 and s.passesCompleted==1,'4: the pass completes without a restart: restarts='..s.restarts)
 check(scannedByPass[1] and scannedByPass[1].Alpha and not scannedByPass[1].Newcomer,
  '5: a row stored after the pass began is outside its scope')

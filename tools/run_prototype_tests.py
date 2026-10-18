@@ -297,6 +297,10 @@ NAMES += ['ux_setup_replay','ux_manual_recommendation','ux_help_navigation']
 NAMES += ['wishlist_create_once','wishlist_unique_names']
 NAMES += ['manual_external_orb_refresh']
 NAMES += ['manual_refresh_projection_consistency']
+# UX M3: Save changes vs Save & assign intents, bound destinations, truthful partial/unconfirmed results, Auto consent and scope (EXPECT fails on accepted ea3268a8 by design).
+NAMES += ['ux_save_intents','ux_auto_assignment_consent','ux_automation_scope']
+# UX M3 review repair: a spaced Save changes keeps its bound confirmation; every Auto-ON assignment route asks before any role or assignment write (EXPECT fails on combined-03 2594d591 by design).
+NAMES += ['ux_save_retry_intent','ux_assignment_consent_routes']
 
 # Wall-clock limit for one test process. It is a runner limit only: no test, timer or budget reads it.
 DEFAULT_TIMEOUT_SECONDS=45

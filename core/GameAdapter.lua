@@ -4938,8 +4938,20 @@ function A.UploadWishlist(slot, name, echoes, expected)
         local current = A.ServerWishlistSlotToken(slot)
         if current == nil or not expected[current] then return false, "stale_slot" end
     end
-    local ok = svc and SafeCall(svc.UploadServerBuildSlot,
-        tonumber(slot) or 0, tostring(name or "Nexus"), clean)
+    -- The one native call of an upload. A falsy return is the host's own
+    -- refusal: nothing was sent, and the caller may try again. A raise inside
+    -- the host function is not a refusal: the host may have sent the change
+    -- before it failed, so the outcome is unknown ("host_error"); the caller
+    -- must not repeat it blindly. Either way the spacing clock and the slot
+    -- list are treated as after a send. (Only this call; SafeCall is unchanged.)
+    local upload = svc and svc.UploadServerBuildSlot
+    if type(upload) ~= "function" then return false, "refused" end
+    local called, ok = pcall(upload, tonumber(slot) or 0, tostring(name or "Nexus"), clean)
+    if not called then
+        lastBuildOpAt = GetTime()
+        A.RequestSlots()
+        return false, "host_error"
+    end
     if ok then
         lastBuildOpAt = GetTime()
         -- the slot cache is now stale; re-request like Save/seed does

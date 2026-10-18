@@ -26,6 +26,19 @@
 -- from this file's directory. Synthetic data only; nothing native or saved.
 local here=(arg and arg[0] or ''):match('^(.*[/\\])') or 'tests/prototype/'
 local S=dofile(here..'saved_build_wishlist_transition_support.lua')
+-- M3: the editor's actions are named by their effect; a legacy label also
+-- finds the action with that default intent (new label first, then legacy).
+-- As S.Button otherwise.
+local ACTION={['Create Wishlist']={'Create & assign','Create unassigned','Create Wishlist'},
+ ['Save Wishlist']={'Save & assign','Save changes','Save Wishlist'}}
+local function ActionButton(W,text)
+ for _,label in ipairs(ACTION[text] or {text}) do
+  for _,f in ipairs(W.H.frames) do
+   if f.kind=='Button' and f:IsVisible() and f:GetText()==label then return f end
+  end
+ end
+ error('SETUP: visible button absent: '..text)
+end
 local realPrint=print
 local results={}
 local function record(group,id,ok,message)
@@ -193,7 +206,7 @@ local function NewPlanFromJournal(W,between)
   local row=assert(CatalogRow(W,S.ECHO_3),'SETUP: the editor lists catalog Echo '..S.ECHO_3)
   row:Click()
   NexusWishlistNameInput:SetText(NEW_PLAN)
-  S.Button(W,'Create Wishlist'):Click()
+  ActionButton(W,'Create Wishlist'):Click()
   assert(W.H.popup and W.H.popup.which=='WISHLISTREALIZER_CREATE_WISHLIST',
    'SETUP: Create asks for confirmation: '..tostring(W.H.popup and W.H.popup.which))
   W.H.AcceptPopup()

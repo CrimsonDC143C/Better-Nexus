@@ -99,6 +99,81 @@ local AUTO_SAVE_WARNING = "With Auto ON, Nexus may replace the active Saved Buil
 local AUTO_SAVE_ORBS = "The replaced build may hold an Echo you value, even one obtained with Orbs: "
     .. "Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged."
 
+-- UX-05: an assignment to a numbered Saved Build while Auto is selected (ON,
+-- also while held) asks first, naming the Wishlist, the target captured when
+-- the player chose it and the conditional replacement (no timing promise).
+-- Cancel changes nothing; nothing here changes Auto. With Auto OFF the choice
+-- assigns at once. Used by the Journal picker and the editor's candidates.
+StaticPopupDialogs = StaticPopupDialogs or {}
+StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"] = {
+    text = "Assign '%s' to %s?\n" .. "Auto is ON. Assigning by itself does not change the Saved Build. But "
+        .. "when it is active and a finished run at level 80 passes Auto's checks, Nexus may replace it with "
+        .. "the run. Cancel changes nothing. To avoid that, choose Cancel, turn Auto OFF, then assign.",
+    button1 = "Assign",
+    button2 = "Cancel",
+    OnAccept = function(_, data)
+        if type(data) == "table" and type(data.assign) == "function" then data.assign() end
+    end,
+    timeout = 0, whileDead = true, hideOnEscape = true,
+}
+
+-- Whether Auto is selected (ON, also while held), from the runtime's
+-- counters (memory only).
+function M.AutoSelected()
+    if type(Nexus.RecomputeStats) ~= "function" then return false end
+    local ok, stats = pcall(Nexus.RecomputeStats)
+    return ok and type(stats) == "table" and stats.autoEnabled == true
+end
+
+-- A Wishlist or Saved Build name as it may be shown in chat or a dialog.
+function M.SafeName(text, fallback)
+    local display = Nexus.Identity and Nexus.Identity.DisplaySafeText
+    local shown = display and display(tostring(text or ""), 1024, false) or nil
+    if type(shown) ~= "string" or shown == "" then shown = tostring(fallback or "") end
+    return shown
+end
+
+local function OwnerKeyNow()
+    local store = Nexus.Store
+    if not (store and type(store.CurrentOwnerKey) == "function") then return nil end
+    local ok, owner = pcall(store.CurrentOwnerKey)
+    return ok and owner or nil
+end
+
+-- One assignment the player chose. `assign` performs it (and every role
+-- choice it starts) for the target captured when the player chose it. A
+-- numbered, non-empty target with Auto selected asks first; the first-run
+-- target has no Saved Build to replace, and an empty one is refused by the
+-- assignment itself. When the confirmation cannot be shown, nothing is
+-- assigned (never assigned unasked while Auto is selected). One accept
+-- performs it once; an accept after the character's saved data changed
+-- assigns nothing. Returns true when it asked, false when it assigned at
+-- once, nil and a reason when it refused.
+function M.AssignWithConsent(wishlistName, targetLabel, numbered, assign)
+    if not numbered or not M.AutoSelected() then
+        assign()
+        return false
+    end
+    if type(StaticPopup_Show) ~= "function" or type(StaticPopupDialogs) ~= "table"
+        or type(StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"]) ~= "table" then
+        print("|cffff6060Nexus:|r Nothing was assigned: Auto is ON and the confirmation that names its "
+            .. "consequence could not be shown. Turn Auto OFF to assign, or try again later.")
+        return nil, "consent_unavailable"
+    end
+    local owner, answered = OwnerKeyNow(), false
+    StaticPopup_Show("NEXUS_ASSIGN_WISHLIST_AUTO_ON", wishlistName, targetLabel, {assign = function()
+        if answered then return end
+        answered = true
+        if OwnerKeyNow() ~= owner then
+            print("|cffff6060Nexus:|r Nothing was assigned: this character's saved data changed after you "
+                .. "were asked. Open the Wishlist chooser again.")
+            return
+        end
+        assign()
+    end})
+    return true
+end
+
 ------------------------------------------------------------------------
 -- Text lines
 ------------------------------------------------------------------------
@@ -1256,27 +1331,44 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
                 }
             end
             local function AssociateWishlistOnly()
+                local numbered = tonumber(active) and tonumber(active) > 0
+                local shownName = M.SafeName(cName, "Unnamed Wishlist")
+                local target = numbered and ("Saved Build '" .. M.SafeName(loadoutName, tostring(active)) .. "'")
+                    or "the first-run target"
                 if cSnapshot.lockEvidenceStatus=="unavailable" and Nexus.WishlistEditor
                     and Nexus.WishlistEditor.ResolveAndAssignWishlist then
+                    -- A Wishlist without lock evidence: its role choice (the
+                    -- current-lock default or the role picker) and the
+                    -- assignment it ends in wait for the same Auto-ON
+                    -- confirmation; Cancel writes neither.
+                    M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                        HideWishlistPicker()
+                        Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
+                    end)
+                    return
+                end
+                -- The captured target, candidate and empty-slot refusal as
+                -- before; Auto selected asks first (M.AssignWithConsent).
+                M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                    local ok, err
+                    if numbered then
+                        ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
+                    elseif type(A.SetFirstRunWishlist) == "function" then
+                        ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
+                    else
+                        ok, err = false, "first-run association unavailable"
+                    end
+                    if not ok then
+                        print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
+                        return
+                    end
                     HideWishlistPicker()
-                    Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
-                    return
-                end
-                local ok, err
-                if tonumber(active) and tonumber(active) > 0 then
-                    ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
-                elseif type(A.SetFirstRunWishlist) == "function" then
-                    ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
-                else
-                    ok, err = false, "first-run association unavailable"
-                end
-                if not ok then
-                    print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
-                    return
-                end
-                HideWishlistPicker()
-                M.RefreshAssociations()
-                if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    M.RefreshAssociations()
+                    if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    -- A visible confirmation of what changed, and only that.
+                    print("|cff4dff80Nexus:|r '" .. shownName .. "' is now the Wishlist for " .. target
+                        .. ". No Saved Build was changed or activated.")
+                end)
             end
             local function OpenWishlistEditorOnly()
                 HideWishlistPicker()
@@ -1815,7 +1907,17 @@ function M.OpenBuilds(openChooser, beforeOpen)
                     chooserPending = false
                 elseif last then
                     chooserPending = false
-                    print("|cffffd200Nexus:|r " .. CHOOSER_COACH)
+                    -- Truthful about the page: "open" only when Nexus sees its
+                    -- strip there. The game's button toggles the page, so one
+                    -- that was already open can close again (native behaviour,
+                    -- not observed offline); then no claim is made.
+                    local strip = associationPanel
+                    local shown = strip and strip.IsVisible and strip:IsVisible()
+                    print("|cffffd200Nexus:|r " .. (shown and CHOOSER_COACH
+                        or ("Nexus could not confirm that the Echoes page is open (if it was already open, "
+                            .. "the game's button may have closed it). Open Character Progression -> Echoes "
+                            .. "and click the Nexus Wishlist selector at its top; nothing is assigned until "
+                            .. "you choose one.")))
                 end
             end
         end)

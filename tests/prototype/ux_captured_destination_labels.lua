@@ -84,14 +84,26 @@ local function VisibleButton(text)
  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==text then return f end end
  return nil
 end
-local function button(text) return VisibleButton(text) or error('visible button absent: '..text) end
+-- M3: the editor's actions are named by their effect; a legacy label also
+-- finds the action with that default intent (new label first, then legacy).
+local LABELS={['Create Wishlist']={'Create & assign','Create unassigned','Create Wishlist'},
+ ['Save Wishlist']={'Save & assign','Save changes','Save Wishlist'}}
+local function button(text)
+ for _,label in ipairs(LABELS[text] or {text})do
+  local found=VisibleButton(label)
+  if found then return found end
+ end
+ error('visible button absent: '..text)
+end
 -- The editor's own control with this label. The HUD's no-build setup row has
 -- a "Create Wishlist" button too (it only opens the editor); it stays shown
 -- beside an editor opened through OpenForCandidate while no Wishlist is
 -- assigned, so a lookup by label alone can press that one instead.
 local function EditorButton(text)
- for _,f in ipairs(H.frames)do
-  if f.kind=='Button' and f:IsVisible() and f:GetParent()==NexusEditorFrame and f:GetText()==text then return f end
+ for _,label in ipairs(LABELS[text] or {text})do
+  for _,f in ipairs(H.frames)do
+   if f.kind=='Button' and f:IsVisible() and f:GetParent()==NexusEditorFrame and f:GetText()==label then return f end
+  end
  end
  return nil
 end

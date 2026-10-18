@@ -26,9 +26,9 @@ guide=guide:gsub('%s+',' ')
 
 -- 1. The active Saved Build warning stands before the step that turns Auto ON.
 before(start,'With Auto ON, Nexus may replace that active Saved Build','Click Auto OFF','Help start: warning before the Auto step')
-before(start,'With Auto ON, Nexus may replace that active Saved Build','Click Create Wishlist','Help start: warning before Create Wishlist')
-check(has(start,'Click Create Wishlist for a new or imported plan. It saves the plan and makes it the target of the loadout shown in the editor.'),'Create Wishlist saves and targets (it is not a blank-plan button)')
-check(has(start,'For an existing Wishlist, click Save Wishlist.'),'Save Wishlist is for an existing Wishlist')
+before(start,'With Auto ON, Nexus may replace that active Saved Build','Click Create & assign','Help start: warning before Create & assign')
+check(has(start,'Click Create & assign for a new or imported plan. It saves the plan and makes it the target of the loadout shown in the editor.'),'Create & assign saves and targets (it is not a blank-plan button)')
+check(has(start,'For an existing Wishlist, click Save changes.'),'Save changes is for an existing Wishlist')
 before(rolling,'Automatic save is separate from Take, Banish, Reroll and Freeze.','1. Click Auto OFF','Help rolling: warning before the Auto step')
 before(guide,'### Automatic save and your Saved Build','Click **Auto OFF**','guide: automatic-save section before the Auto step')
 check(has(rolling,'Auto OFF does not turn Nexus off'),'Auto is not addon enablement')
@@ -88,12 +88,12 @@ for _,path in ipairs({'ui/Panel.lua','ui/OrbPanel.lua','ui/SupportReport.lua','u
  local f=assert(io.open(path,'rb'));sources[#sources+1]=f:read('*a');f:close()
 end
 local all=table.concat(sources,'\n')
-for _,label in ipairs({'Wishlist Editor','Create Wishlist','Import','Save Wishlist','Assign Wishlist','Unassign Wishlist',
+for _,label in ipairs({'Wishlist Editor','Create & assign','Create unassigned','Import','Save changes','Save & assign','Assign Wishlist','Unassign Wishlist',
  'Confirm locked targets & edit','Build Library','All Shared','Require both DPS records','Updating results...','Copy into Editor',
  'Share Build','Stop Sharing','Sync Now','Training Dummy','Lich King','Both records','Open Orbs...','Orbs / Lost Memories',
  'Max','Start','Pause','Resume','Stop','Start new run','Confirm new run','Advanced','Recheck','Hide Nexus Panel',
  'Copy summary','Prepare report file','Prepare full diagnostic report','Select this page','EXTRA COPIES','Different quality from target',
- 'Needed','Target already met','Not on Wishlist','Auto ON','Auto OFF'}) do
+ 'Needed','Target already met','Not on Wishlist','Auto ON','Auto OFF','Automation settings'}) do
  -- A string literal or a colour-coded span in the source, not any substring.
  local esc=label:gsub('%p','%%%0')
  check(all:find('"'..esc) or all:find(esc..'"') or all:find('|c%x%x%x%x%x%x%x%x'..esc) or all:find(esc..'|r'),'real label: '..label)

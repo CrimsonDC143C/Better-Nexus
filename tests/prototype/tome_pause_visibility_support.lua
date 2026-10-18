@@ -63,10 +63,48 @@ function F.Boot(mode,permission,auto,route)
  if auto~=false then SlashCmdList.NEXUS('auto')end
  return W
 end
+-- The synthetic player picks a Wishlist in the real Journal chooser. Since M3
+-- (UX-05) a pick for a numbered Saved Build with Echoes while Auto is selected
+-- asks first with the real confirmation, which this player answers with
+-- Assign (the dialog's own OnAccept, as the client runs it). Whether it must
+-- ask is predicted from production-visible state, not from the dialog: an
+-- expected confirmation that is missing or different, or any dialog where
+-- none is expected, fails the fixture. Every other pick assigns at once.
+local CONSENT='NEXUS_ASSIGN_WISHLIST_AUTO_ON'
 function F.Pick(W,key)
  local picker=assert(S.OpenPicker(),'real Journal selector opens')
  local row=assert(S.PickerRow('Observation '..key),'real Journal row exists')
- row.nameButton:Click();assert(not picker:IsShown(),'name callback closes picker')
+ local H=W.H
+ local active=tonumber(H.perks.serverActiveSlot) or 0
+ local target=type(H.perks.serverBuildSlots)=='table' and H.perks.serverBuildSlots[active] or nil
+ local auto=Nexus.RecomputeStats().autoEnabled==true
+ local asks=auto and active>=1 and type(target)=='table' and #(target.echoes or {})>0
+ local before=F.Facts(W)
+ local sequence=before and before.assignment and before.assignment.sequence
+ H.popup=nil
+ row.nameButton:Click()
+ local p=H.popup
+ if asks then
+  assert(p~=nil and p.which==CONSENT,'Auto-ON pick asks with the real assignment confirmation: '..tostring(p and p.which))
+  local d=assert(StaticPopupDialogs[CONSENT],'confirmation dialog is defined')
+  local wishlist,where='Observation '..key,"Saved Build '"..tostring(target.name).."'"
+  local ok,asked=pcall(string.format,tostring(d.text),p.arg1,p.arg2)
+  assert(d.button1=='Assign' and d.button2=='Cancel','confirmation buttons are Assign and Cancel')
+  assert(p.arg1==wishlist and p.arg2==where,'confirmation names the picked Wishlist and the captured Saved Build: '
+   ..tostring(p.arg1)..' / '..tostring(p.arg2))
+  assert(ok and asked:find("Assign '"..wishlist.."' to "..where.."?",1,true)==1
+   and asked:find('Auto is ON',1,true)~=nil and asked:find('Cancel changes nothing',1,true)~=nil,
+   'confirmation title and Auto consequence: '..tostring(asked))
+  local asking=F.Facts(W)
+  assert(picker:IsShown() and (sequence==nil or (asking and asking.assignment
+   and asking.assignment.sequence==sequence)),'nothing is assigned before the answer')
+  H.popup=nil
+  d.OnAccept(p.frame,p.data)
+ else
+  assert(p==nil,'no dialog for this pick: '..tostring(p and p.which))
+ end
+ assert(not picker:IsShown(),'name callback closes picker')
+ assert((Nexus.RecomputeStats().autoEnabled==true)==auto,'picking changes no Auto state')
  ProjectEbonholdEchoJournal:Hide()
 end
 function F.Vector(W)return {W.H.disabled[F.ECHO[1]]==true,W.H.disabled[F.ECHO[2]]==true}end

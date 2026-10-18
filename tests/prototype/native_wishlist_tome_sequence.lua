@@ -254,7 +254,54 @@ local function Stored(W)
     return state.firstRunWishlist
 end
 
--- One real selection: the selector opens the picker, the named row is clicked.
+-- Since M3 (UX-05) a Journal pick for a numbered Saved Build with Echoes while
+-- Auto is selected asks first with the real confirmation. The synthetic player
+-- checks it and answers Assign (the dialog's own OnAccept, as the client runs
+-- it). Whether it must ask comes from the scenario only: Auto selected and the
+-- populated Saved Build One as the Journal's target (also while a Wishlist is
+-- natively active: the Journal keeps that Saved Build). A missing or different
+-- confirmation, or any dialog where none is expected, fails PICK.
+local CONSENT = 'NEXUS_ASSIGN_WISHLIST_AUTO_ON'
+local function StoredText(W)
+    local stored = Stored(W)
+    if type(stored) ~= 'table' then return tostring(stored) end
+    return tostring(stored.slot) .. '/' .. tostring(stored.name) .. '/' .. tostring(stored.assignmentId)
+end
+local function Consent(W, w, picker, prior, asks)
+    local p = W.H.popup
+    if not asks then
+        if p ~= nil then return false, 'unexpected dialog ' .. tostring(p.which) end
+        return true, 'no confirmation expected or shown'
+    end
+    if not (p and p.which == CONSENT) then
+        return false, 'expected the Auto-ON assignment confirmation, got ' .. tostring(p and p.which)
+    end
+    local d = StaticPopupDialogs[CONSENT]
+    local where = "Saved Build '" .. SAVED_BUILD .. "'"
+    local formatted, asked = pcall(string.format, tostring(d and d.text), p.arg1, p.arg2)
+    asked = formatted and Plain(asked) or ''
+    local problems = {}
+    if not (type(d) == 'table' and d.button1 == 'Assign' and d.button2 == 'Cancel') then
+        problems[#problems + 1] = 'buttons are not Assign/Cancel'
+    end
+    if p.arg1 ~= w.name or p.arg2 ~= where then
+        problems[#problems + 1] = 'names ' .. tostring(p.arg1) .. ' / ' .. tostring(p.arg2)
+    end
+    if asked:find("Assign '" .. w.name .. "' to " .. where .. "?", 1, true) ~= 1
+        or not asked:find('Auto is ON', 1, true) or not asked:find('Cancel changes nothing', 1, true) then
+        problems[#problems + 1] = 'title or Auto consequence: ' .. asked
+    end
+    if not picker:IsShown() or StoredText(W) ~= prior then
+        problems[#problems + 1] = 'assigned before the answer'
+    end
+    if #problems > 0 then return false, 'confirmation mismatch: ' .. table.concat(problems, '; ') end
+    W.H.popup = nil
+    d.OnAccept(p.frame, p.data)
+    return true, 'confirmed ' .. w.name .. ' for ' .. where .. ' with Assign'
+end
+
+-- One real selection: the selector opens the picker, the named row is clicked
+-- (and, where the scenario requires it, the real confirmation is answered).
 local function Pick(W, key)
     local w = WISHLISTS[key]
     local picker = OpenPicker()
@@ -273,6 +320,10 @@ local function Pick(W, key)
             .. Plain(NexusActiveWishlistSelector.text:GetText()) .. '" rows ['
             .. table.concat(names, ' | ') .. ']'
     end
+    local auto = Nexus.RecomputeStats().autoEnabled == true
+    local asks = auto and W.o.destination == 'saved_build'
+    local prior = StoredText(W)
+    W.H.popup = nil
     local heard = {}
     print = function(...)
         local parts = {}
@@ -280,18 +331,26 @@ local function Pick(W, key)
         heard[#heard + 1] = Plain(table.concat(parts, ' '))
     end
     local ok, err = pcall(row.nameButton.Click, row.nameButton)
+    local consented, consent = false, 'not reached'
+    if ok then
+        local answered, verdict, detail = pcall(Consent, W, w, picker, prior, asks)
+        if answered then consented, consent = verdict, detail
+        else consented, consent = false, 'the confirmation answer raised: ' .. tostring(verdict) end
+    end
     print = realPrint
     if not ok then return false, 'the row click raised: ' .. tostring(err) end
     local closed = not NexusWishlistOnlyPicker:IsShown()
     ClosePicker()
+    W.H.popup = nil
     local a, stored = W.A.AssignedWishlist() or {}, Stored(W)
     local storedSlot = type(stored) == 'table' and tonumber(stored.slot) or nil
     local storedName = type(stored) == 'table' and stored.name or nil
-    return closed and a.state == 'ready' and a.name == w.name
+    local autoKept = (Nexus.RecomputeStats().autoEnabled == true) == auto
+    return consented == true and autoKept and closed and a.state == 'ready' and a.name == w.name
             and storedSlot == w.slot and storedName == w.name,
-        string.format('clicked %s (server slot %d): picker closed=%s assigned=%s/%s stored=%s/%s%s',
-            w.name, w.slot, tostring(closed), tostring(a.state), tostring(a.name),
-            tostring(storedSlot), tostring(storedName),
+        string.format('clicked %s (server slot %d): %s; picker closed=%s assigned=%s/%s stored=%s/%s auto kept=%s%s',
+            w.name, w.slot, tostring(consent), tostring(closed), tostring(a.state), tostring(a.name),
+            tostring(storedSlot), tostring(storedName), tostring(autoKept),
             #heard > 0 and (' heard: ' .. table.concat(heard, ' / ')) or '')
 end
 

@@ -105,11 +105,17 @@ local function selected(id)
  for _,f in ipairs(H.frames)do if f:IsVisible() and f.plus and f.data and f.data.spellId==id then return f end end
  error('visible selected row absent: '..id)
 end
+-- M3: the editor's apply button names its effect (Create & assign, Create
+-- unassigned, Save & assign, Save changes; legacy Create Wishlist / Save
+-- Wishlist). It is created before the Save changes alternative beside it,
+-- so it is the first match.
+local APPLY_LABELS={['Create Wishlist']=true,['Save Wishlist']=true,['Saved']=true,['Saving...']=true,
+ ['Create & assign']=true,['Create unassigned']=true,['Save & assign']=true,['Save changes']=true}
 local function ApplyButton()
  for _,f in ipairs(H.frames) do
   if f.kind=='Button' and f:IsVisible() and f:GetParent()==NexusEditorFrame then
    local t=V.Plain(f:GetText() or '')
-   if t=='Create Wishlist' or t=='Save Wishlist' or t=='Saved' or t=='Saving...' then return f end
+   if APPLY_LABELS[t] then return f end
   end
  end
  error('the editor Create/Save button is absent')

@@ -70,6 +70,30 @@ function M.Settled()
     return recordAttempts >= MAX_RECORD_ATTEMPTS
 end
 
+-- The informational replay's routes wait for local start-up as Help's own
+-- routes do (ui/Help.lua H.OpenAssignment/H.OpenEditor): the same rule and
+-- the same words, said before any window is closed. Returns false after
+-- saying why; the replay then stays open.
+local function ReplayRouteReady(kind)
+    local ready = false
+    if type(Nexus.StartupStatus) == "function" then
+        local ok, s = pcall(Nexus.StartupStatus)
+        ready = ok and type(s) == "table" and s.coreReady == true
+    end
+    if not ready then
+        print("|cffffd200Nexus:|r " .. (kind == "assign"
+            and "Assign Wishlist opens after start-up finishes (see the loading panel). Nothing was opened or assigned."
+            or "The Wishlist Editor opens after start-up finishes (see the loading panel). Nothing was opened."))
+        return false
+    end
+    local journal = Nexus.JournalTab
+    if kind == "assign" and journal and type(journal.CanOpenBuilds) == "function" and not journal.CanOpenBuilds() then
+        print("|cffffd200Nexus:|r The game's Character Progression button was not found. Nothing was opened or assigned.")
+        return false
+    end
+    return true
+end
+
 local function CloseOtherSetupWindows()
     local names = { "NexusCommunityBuildsFrame", "NexusLeaderboardFrame", "NexusEditorFrame", "NexusLogViewer", "NexusChangelogPopup" }
     for i = 1, #names do
@@ -182,6 +206,7 @@ local function EnsureFrame()
     current:SetPoint("TOPLEFT", 24, -176)
     current:SetText("Set up current build")
     current:SetScript("OnClick", function()
+        if frame and frame._informational and not ReplayRouteReady("assign") then return end
         Finish()
         CloseOtherSetupWindows()
         -- The Echo Journal with its Wishlist chooser opened for the Saved
@@ -194,6 +219,7 @@ local function EnsureFrame()
     import:SetPoint("TOPRIGHT", -24, -176)
     import:SetText("Import / Create Wishlist")
     import:SetScript("OnClick", function()
+        if frame and frame._informational and not ReplayRouteReady("editor") then return end
         Finish()
         CloseOtherSetupWindows()
         if Nexus.WishlistEditor then Nexus.WishlistEditor.Show() end
@@ -269,6 +295,12 @@ function M.ShowSetup()
     local warning = Nexus.OverwriteWarning
     if warning and type(warning.IsOpen) == "function" and warning.IsOpen() then
         return false, "warning-open"
+    end
+    -- The first-time Welcome is open already: it stays the first-time window
+    -- (closing it is still the first-time dismissal); the replay never turns
+    -- it into information only.
+    if frame and frame:IsShown() and not frame._informational then
+        return true, "first-time-open"
     end
     local f = EnsureFrame()
     f._informational = true

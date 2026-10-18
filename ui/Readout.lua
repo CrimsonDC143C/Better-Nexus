@@ -136,6 +136,191 @@ function M.ChargesLine(charges)
     return line
 end
 
+-- The legend of that line (its hover). Text only, from GameAdapter.Charges'
+-- own rules: counts the runtime last read for its decision; "?" before the
+-- game reports them; "~" when they look like the game's placeholder format.
+function M.ChargesLegend()
+    return {
+        "B, R and F: the Banish, Reroll and Freeze charges left this run, as the game reported them when "
+            .. "Nexus made its last decision.",
+        "?: the game has not reported that count yet. It is unknown, not zero.",
+        "~: estimated. The counts look like the placeholder the game sends without real counts, so they may "
+            .. "be wrong.",
+        "Shown with Auto OFF, where you choose; with Auto ON Nexus uses these charges itself.",
+    }
+end
+
+-- Plain words for why a selected Auto is not acting (the runtime's
+-- AutoAllowed and effective-state reasons). Anything else keeps the
+-- player wording of UserText. Text only; it changes no gate.
+local HOLD_TEXT = {
+    ["manual mode"] = "Auto is OFF: Nexus only recommends.",
+    ["loading screen (waiting for world entry)"] = "A loading screen is in progress; Nexus waits until you "
+        .. "are in the world.",
+    ["settling after world entry"] = "Nexus waits a few seconds after a loading screen before it acts.",
+    ["user acting"] = "You made an Echo choice in the game's window; Nexus waits about 3 seconds before it "
+        .. "acts again.",
+    ["Another Echo automation addon is loaded -- disable it"] = "Another Echo automation addon is loaded; "
+        .. "Nexus does not act while it is enabled. Disable that addon to let Nexus act.",
+    ["client auto-accept re-enabled"] = "The game's own option to accept loadout Echoes automatically is on; "
+        .. "Nexus does not act while it is on. Turn it off in the game's options.",
+}
+function M.AutoHoldText(reason)
+    local s = tostring(reason or "")
+    if HOLD_TEXT[s] then return HOLD_TEXT[s] end
+    local text = Nexus.UserText and Nexus.UserText.Message
+    return type(text) == "function" and text(s) or s
+end
+
+-- What the player can do about a hold, for the same reasons. A reason whose
+-- own text already says what to do (an unresolved action across a loading
+-- screen) gets none. Text only.
+local HELP_HINT = {
+    ["loading screen (waiting for world entry)"] = "What helps: nothing; it continues by itself.",
+    ["settling after world entry"] = "What helps: nothing; it continues by itself.",
+    ["user acting"] = "What helps: wait without choosing; it continues by itself.",
+    ["Another Echo automation addon is loaded -- disable it"] = "What helps: disable the other addon in the "
+        .. "AddOns list at character selection.",
+    ["client auto-accept re-enabled"] = "What helps: turn off the game's option to accept loadout Echoes "
+        .. "automatically.",
+}
+function M.AutoHelpHint(reason)
+    local s = tostring(reason or "")
+    if HELP_HINT[s] then return HELP_HINT[s] end
+    if s == "" or s == "manual mode" or s:find("no confirmed result for", 1, true) then return nil end
+    if s:find("Orb", 1, true) or s:find("orb", 1, true) then
+        return "What helps: finish, pause or stop the Orb run in Orbs (... menu), or wait until Nexus can "
+            .. "read the Orb state."
+    end
+    return "What helps: point at the Auto button for details."
+end
+
+-- The inline line for a selected Auto that is not acting: the plain reason
+-- and, when there is one, what helps.
+function M.AutoHoldNote(reason)
+    local hint = M.AutoHelpHint(reason)
+    return "Paused: " .. M.AutoHoldText(reason) .. (hint and (" " .. hint) or "")
+end
+
+-- The inline line for an Auto click that left Auto OFF without opening the
+-- warning. `kind`: "orb" (an Orb operation blocks ordinary Automation),
+-- "warning" (the warning is unavailable), else the runtime's status line.
+function M.AutoRefusalText(kind, status)
+    if kind == "orb" then
+        return "Auto stayed OFF: an Orb run is active or unresolved. What helps: finish or stop it in "
+            .. "Orbs (... menu, Orbs / Lost Memories)."
+    elseif kind == "warning" then
+        return "Auto stayed OFF: its overwrite warning is unavailable, and Auto never turns ON without it. "
+            .. "What helps: type /nexus report and report it."
+    end
+    local s = tostring(status or "")
+    if s == "" then
+        return "Auto stayed OFF. What helps: point at the Auto button for details."
+    end
+    return "Auto stayed OFF: " .. s
+end
+
+-- The Automation scope in plain lines, from facts the caller read without
+-- acting: `selected` (the session's Auto selection), `held` (why it is not
+-- acting, if it is not), `settings` (Store.Settings) and `readOnly` (saved
+-- data is read-only). Each line names a permission the runtime actually
+-- gates on, its current value and the existing control that changes it.
+-- Reading it changes nothing.
+-- How each gate reads a permission that was never saved: Reroll and Freeze
+-- are blocked only by a saved false; every other gate needs a saved true.
+local UNSET_ACTS_ON = {autoReroll = true, autoFreeze = true}
+local function OnOff(settings, key, raw)
+    -- Not `settings[key] or nil`: that turns a saved false into "not set".
+    local value
+    if type(settings) == "table" then value = settings[key] end
+    if value == true then return "on" elseif value == false then return "off" end
+    if raw then return "not set" end
+    return UNSET_ACTS_ON[key] and "not set (acts as on)" or "not set (acts as off)"
+end
+function M.AutomationScopeLines(facts)
+    facts = type(facts) == "table" and facts or {}
+    local s = facts.settings
+    local lines = {}
+    lines[#lines + 1] = facts.selected
+        and "Auto: ON for this session. The selection is OFF again after every login or reload."
+        or "Auto: OFF. Nexus only recommends; it takes, banishes, rerolls, freezes, saves and locks nothing."
+    if facts.selected and facts.held then
+        lines[#lines + 1] = "Paused because: " .. M.AutoHoldText(facts.held)
+    end
+    lines[#lines + 1] = "With Auto ON, Nexus may only do what these permissions allow:"
+    lines[#lines + 1] = "- Take needed Echoes (autoPick): " .. OnOff(s, "autoPick")
+    lines[#lines + 1] = "- Banish (autoBanish): " .. OnOff(s, "autoBanish")
+    lines[#lines + 1] = "- Reroll (autoReroll): " .. OnOff(s, "autoReroll") .. "; change with /nexus reroll on|off"
+    lines[#lines + 1] = "- Freeze (autoFreeze): " .. OnOff(s, "autoFreeze") .. "; change with /nexus freeze on|off"
+    lines[#lines + 1] = "- Echo availability controls (tomes) (autoDisable): " .. OnOff(s, "autoDisable")
+        .. "; disables off-Wishlist and re-enables Wishlist controls"
+    lines[#lines + 1] = "- Save a better finished level-80 run over the active Saved Build (autoSave): "
+        .. OnOff(s, "autoSave") .. "; no in-game control, and Auto OFF stops it"
+    lines[#lines + 1] = "- Lock Wishlist Echoes into locked slots (autoLockEchoes): " .. OnOff(s, "autoLockEchoes")
+        .. "; its own option in the Wishlist editor"
+    lines[#lines + 1] = "- Activate a Saved Build: never. Nexus does not activate or load Saved Builds; the "
+        .. "saved autoActivate value (" .. OnOff(s, "autoActivate", true) .. ") is not used by any action."
+    lines[#lines + 1] = "- Orb runs: never by Auto; each one needs its own approval in the Orb window."
+    if facts.readOnly then
+        lines[#lines + 1] = "Saved data is read-only: a permission counts as on only when it was saved as on, "
+            .. "and a change lasts this session only."
+    end
+    return lines
+end
+
+-- What the tome permission (autoDisable) does, from AutomationRuntime StepArm:
+-- with Auto acting it turns off tomes the Wishlist does not use and turns
+-- needed ones back on; nothing turns them back on when Auto stops. Shared by
+-- the Auto warning; Help carries the same paragraph.
+M.TOME_PARAGRAPH = "Tomes: with Auto ON and the tome permission (autoDisable) on, once the game's tome data is "
+    .. "ready Nexus turns off Echo tomes your Wishlist does not use and turns back on tomes it needs, one change "
+    .. "about every half second. It never turns off a tome you opted out of. Nexus does not turn tomes back on "
+    .. "when you turn Auto OFF, log out or change the Wishlist: it turns back on only tomes a Wishlist needs (or "
+    .. "that you opted out of), and only while Auto is ON. The tome list in the Echo Journal shows their state."
+
+-- The rows of the Automation settings menu, from facts the caller read
+-- without acting (as AutomationScopeLines). Each row: `text`; `kind` "title",
+-- "info" (shown, not changeable here), "toggle" (an existing setter:
+-- `command` is the /nexus argument to run, `checked` the current value),
+-- "editor" (the option lives in the Wishlist editor) or "help". Pure.
+function M.AutomationSettingsRows(facts)
+    facts = type(facts) == "table" and facts or {}
+    local s = facts.settings
+    local rows = {}
+    local function Add(kind, text, extra)
+        local row = extra or {}
+        row.kind, row.text = kind, text
+        rows[#rows + 1] = row
+    end
+    local function Value(key)
+        if type(s) == "table" then return s[key] end
+        return nil
+    end
+    Add("title", "Automation settings")
+    Add("info", facts.selected and "Auto: ON for this session (the Auto button turns it OFF)"
+        or "Auto: OFF (the Auto button turns it ON after its warning)")
+    -- The two permissions that have an in-game setter (/nexus reroll|freeze).
+    for _, item in ipairs({{"autoReroll", "Allow Reroll", "reroll"}, {"autoFreeze", "Allow Freeze", "freeze"}}) do
+        local on = Value(item[1]) ~= false
+        Add("toggle", item[2] .. " (" .. item[1] .. "): " .. OnOff(s, item[1]),
+            {key = item[1], checked = on, command = item[3] .. (on and " off" or " on")})
+    end
+    Add("info", "Take needed Echoes (autoPick): " .. OnOff(s, "autoPick") .. "; no in-game switch")
+    Add("info", "Banish (autoBanish): " .. OnOff(s, "autoBanish") .. "; no in-game switch")
+    Add("info", "Turn tomes off and on (autoDisable): " .. OnOff(s, "autoDisable") .. "; no in-game switch")
+    Add("info", "Save a better finished run over the active Saved Build (autoSave): " .. OnOff(s, "autoSave")
+        .. "; no in-game switch; Auto OFF stops it")
+    Add("editor", "Lock Wishlist Echoes (autoLockEchoes): " .. OnOff(s, "autoLockEchoes")
+        .. "; set in the Wishlist Editor...", {key = "autoLockEchoes"})
+    Add("info", "Activate a Saved Build: never (the saved autoActivate value is not used)")
+    Add("info", "Orb runs: never by Auto; each needs its own approval in Orbs")
+    if facts.readOnly then
+        Add("info", "Saved data is read-only: a change lasts this session only")
+    end
+    Add("help", "What Auto may do (Help)...")
+    return rows
+end
+
 -- Next n predicted guaranteed arrivals, "(predicted)" suffixed --
 -- injection order is measured but not version-stable, never state it
 -- as fact. queue = Ratchet.PredictQueue output (entries pre-bridged).

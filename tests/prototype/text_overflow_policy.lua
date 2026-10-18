@@ -258,7 +258,11 @@ do
  for i=80,85 do plan[i]={spellId=200000+i,quality=i%4,stacks=1,locked=true} end
  W.ImportEBH1String(assert(Nexus.Codec.EncodeEBH1(plan,'MAGE','Full plan')),'Full plan')
  local create
- for _,f in ipairs(H.frames) do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist' then create=f end end
+ -- M3: the Create action is labelled by its effect (new label first, then legacy).
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'}) do
+  for _,f in ipairs(H.frames) do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then create=f end end
+  if create then break end
+ end
  assert(create,'Create button');create:Click();H.AcceptPopup();H.now=H.now+3.1
  check(A.AssignedWishlist().state=='ready' and #A.AssignedWishlist().entries==85,
   'fixture: the assigned plan holds 79 ordinary copies and 6 locked targets')

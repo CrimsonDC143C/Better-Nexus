@@ -120,11 +120,16 @@ local function selected(id)
 end
 -- The editor's Create/Save button, whatever it reads now: right after a save it
 -- reads Saved and is still enabled, and a refresh turns it back into Create.
+-- M3: its label names its effect (Create & assign, Create unassigned, Save &
+-- assign, Save changes; legacy Create Wishlist / Save Wishlist). It is created
+-- before the Save changes alternative beside it, so it is the first match.
+local APPLY_LABELS={['Create Wishlist']=true,['Save Wishlist']=true,['Saved']=true,['Saving...']=true,
+ ['Create & assign']=true,['Create unassigned']=true,['Save & assign']=true,['Save changes']=true}
 local function ApplyButton()
  for _,f in ipairs(H.frames) do
   if f.kind=='Button' and f:IsVisible() and f:GetParent()==NexusEditorFrame then
    local t=V.Plain(f:GetText() or '')
-   if t=='Create Wishlist' or t=='Save Wishlist' or t=='Saved' or t=='Saving...' then return f end
+   if APPLY_LABELS[t] then return f end
   end
  end
  error('the editor Create/Save button is absent')
@@ -183,7 +188,7 @@ C.scenario('R1 a fresh confirmation for the unchanged created draft (the reporte
   'R1: fixture: the Create is assigned to Saved Build 2 once',Facts())
  local facts=Facts()
  -- Later, outside the spacing window and after refreshes: the button reads
- -- Create Wishlist again and the editor still shows the same draft and name.
+ -- Create & assign again and the editor still shows the same draft and name.
  for _=1,3 do Nexus.WishlistEditor.Refresh() end
  H.Advance(4)
  local again

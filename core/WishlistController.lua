@@ -65,6 +65,23 @@ local function UpdateStoreSetting(key, value)
     return {mode="injected"}
 end
 
+-- An error inside a save attempt is raised again with where it happened: the
+-- original message first, then the stack (debugstack in the client,
+-- debug.traceback offline). A non-string error object is passed on unchanged.
+local function WithTraceback(err)
+    if type(err) ~= "string" then return err end
+    local stack
+    if type(debugstack) == "function" then
+        local ok, text = pcall(debugstack, 2)
+        if ok then stack = text end
+    elseif type(debug) == "table" and type(debug.traceback) == "function" then
+        local ok, text = pcall(debug.traceback, "", 2)
+        if ok then stack = text end
+    end
+    if type(stack) == "string" and stack ~= "" then return err .. "\n" .. stack end
+    return err
+end
+
 function Controller.New(options)
     options = type(options) == "table" and options or {}
     local DraftModel = assert(options.model, "Wishlist controller requires WishlistModel")
@@ -84,6 +101,13 @@ function Controller.New(options)
         ["no echoes"] = "there are no echoes in your pending list",
         ["no valid echoes"] = "none of the pending echoes look valid",
     }
+    -- Save intents (UX-03). Save changes uploads the plan: an opened plan
+    -- keeps the assignment it already has in step, and a new plan is saved
+    -- with no assignment written. Save & assign is a new plan's save to the
+    -- destination this editor captured (a Saved Build when the draft began,
+    -- or the first-run target), named in its confirmation. Callers that name
+    -- no intent get M.DefaultIntent(): the behaviour before intents existed.
+    local INTENT = {SAVE_CHANGES = "saveChanges", SAVE_AND_ASSIGN = "saveAndAssign"}
 
     local state = {
         pending = {},
@@ -971,9 +995,17 @@ function Controller.New(options)
     end
 
     function M.ReconcileLocked(lockedBySpell)
+        -- A passive reconciliation (an Echo became locked) is not an edit: a
+        -- draft a Create already sent stays that draft, so the reconciled
+        -- token joins the tokens it was sent under (never a fresh copy).
+        local created = state.createdDraft
+        local before = created and CurrentDraftToken() or nil
         state.pending, state.pendingLock, state.fulfilledDraftTargets =
             DraftModel.ReconcileLocked(state.pending, state.pendingLock,
                 state.fulfilledDraftTargets, lockedBySpell)
+        if before ~= nil and created == state.createdDraft and created.draftTokens[before] then
+            created.draftTokens[CurrentDraftToken()] = true
+        end
         TouchPresentation()
     end
 
@@ -1077,11 +1109,9 @@ function Controller.New(options)
 
     function M.BeginWishlist(wishlist, loadoutSlot, selectedToken)
         M.CancelApply()
-        state.saveResult = nil
-        state.candidateContext = nil
-        state.candidateApplyToken = nil
-        state.applyRetry = nil
-        state.createTargetContext = nil
+        -- Validated before anything of the current draft is cleared: a refused
+        -- open keeps that draft, its result and the destination it captured,
+        -- so it is never re-admitted as a different (copy-named) Create.
         if type(wishlist) ~= "table" or type(wishlist.echoes)~="table" then
             notify("|cffff6060Nexus:|r Associated wishlist data is unavailable.")
             return false
@@ -1112,6 +1142,11 @@ function Controller.New(options)
             notify("|cffff9040Nexus:|r Wishlist identity found; awaiting authoritative lock evidence before editing.")
             return false
         end
+        state.saveResult = nil
+        state.candidateContext = nil
+        state.candidateApplyToken = nil
+        state.applyRetry = nil
+        state.createTargetContext = nil
         state.awaitingWishlist = nil
         state.pendingSeeded = true
         state.editingContext = {
@@ -1576,6 +1611,102 @@ function Controller.New(options)
 
     function M.SaveDestinationDescriptor() return DestinationDescriptor() end
 
+    -- Whether an opened Wishlist is the plan its bound Saved Build holds (a
+    -- read of the saved assignment): the same assignment identity; else, for a
+    -- record that names its server Wishlist, that same server slot; else (a
+    -- record kept without one) the same contents under the same name. Its save
+    -- then only refreshes that same assignment. A Wishlist opened for a Saved
+    -- Build that holds another plan or none is not: saving it with Save &
+    -- assign makes it that Saved Build's Wishlist. (An assignment changed
+    -- after the editor bound it refuses the save anyway: TryApply.)
+    local function SameBoundPlan(context)
+        local loadoutSlot = type(context) == "table" and tonumber(context.loadoutSlot) or nil
+        if not loadoutSlot then return false end
+        local root = Store.State and Store.State()
+        local links = type(root) == "table" and root.loadoutWishlists or nil
+        local record = type(links) == "table" and links[loadoutSlot] or nil
+        if type(record) ~= "table" then
+            -- The oldest shape: a bare server slot number.
+            return tonumber(record) ~= nil and tonumber(record) == tonumber(context.slot)
+        end
+        if context.assignmentId ~= nil and record.assignmentId == context.assignmentId then return true end
+        if tonumber(record.slot) then return tonumber(record.slot) == tonumber(context.slot) end
+        return type(record.key) == "string" and record.key ~= "" and record.key == context.key
+            and tostring(record.name or "") == tostring(context.name or "")
+    end
+
+    -- An opened Wishlist whose save would assign it to the Saved Build the
+    -- editor opened it for (Save & assign); false for one already assigned
+    -- there, the first-run plan and an unbound Wishlist (Save changes).
+    function M.SaveAssignsOpened()
+        local context = state.editingContext
+        return context ~= nil and tonumber(context.loadoutSlot) ~= nil and not SameBoundPlan(context)
+    end
+
+    -- The destination a Save & assign of this draft writes: a new plan's
+    -- captured Saved Build or first-run target (DestinationDescriptor), else
+    -- nil. An opened plan has no assignment to choose: its save keeps the one
+    -- it already has (or none).
+    local function AssignTarget()
+        if state.editingContext then return nil end
+        local destination = DestinationDescriptor()
+        if destination.kind == "savedBuild" or destination.kind == "firstRun" then
+            return destination
+        end
+        return nil
+    end
+
+    -- A descriptor's identity for the confirmation binding: what it names, not
+    -- how it is worded (a Saved Build's slot, the first-run target, none or not
+    -- loaded).
+    local function DestinationKey(destination)
+        if type(destination) ~= "table" then return "none" end
+        if destination.kind == "savedBuild" then
+            return "savedBuild:" .. tostring(tonumber(destination.slot) or "?")
+        end
+        return tostring(destination.kind or "none")
+    end
+
+    -- The intent of one attempt: the one its confirmation bound (a spaced
+    -- retry keeps it), else the default of this draft (legacy callers).
+    local function IntentOf(guard)
+        local confirmation = type(guard) == "table" and guard.confirmation or nil
+        local intent = type(confirmation) == "table" and confirmation.intent or nil
+        if intent == nil and type(guard) == "table" then intent = guard.intent end
+        if intent == INTENT.SAVE_CHANGES or intent == INTENT.SAVE_AND_ASSIGN then return intent end
+        return AssignTarget() and INTENT.SAVE_AND_ASSIGN or INTENT.SAVE_CHANGES
+    end
+
+    -- The destination a confirmation showed (kept by its spaced retry); nil
+    -- for the direct payload API, which showed none.
+    local function BoundDestinationKey(guard)
+        local confirmation = type(guard) == "table" and guard.confirmation or nil
+        if type(confirmation) == "table" and confirmation.destinationKey ~= nil then
+            return confirmation.destinationKey
+        end
+        return type(guard) == "table" and guard.destinationKey or nil
+    end
+
+    M.INTENT = {SAVE_CHANGES = INTENT.SAVE_CHANGES, SAVE_AND_ASSIGN = INTENT.SAVE_AND_ASSIGN}
+    function M.DefaultIntent() return AssignTarget() and INTENT.SAVE_AND_ASSIGN or INTENT.SAVE_CHANGES end
+    function M.SaveAndAssignTarget()
+        local target = AssignTarget()
+        return target and CopyRecord(target) or nil
+    end
+
+    -- Whether a write the Store accepted was kept only for this session: the
+    -- owner writes a transient, never-saved row while saved data cannot be
+    -- written (Store.StateWriteStatus is not "durable"). Returns that mode and
+    -- its reason, or nil. A store that cannot tell is not described either way.
+    local function SessionOnlyWrite()
+        if type(Store.StateWriteStatus) ~= "function" then return nil end
+        local ok, status = pcall(Store.StateWriteStatus)
+        if not ok or type(status) ~= "table" or status.mode == nil or status.mode == "durable" then
+            return nil
+        end
+        return tostring(status.mode), status.reason ~= nil and tostring(status.reason) or nil
+    end
+
     local function NotSavedChanged(destination)
         local context = state.editingContext or state.createTargetContext
         local label = context and context.loadoutName ~= nil and tostring(context.loadoutName) ~= ""
@@ -1691,7 +1822,9 @@ function Controller.New(options)
     -- The upload call of a Create began and did not report that nothing was
     -- sent. `settled`: the draft did not change during the call, so the draft
     -- the commit leaves (its fulfilled targets may be rewritten) is that draft.
-    local function NoteCreated(trace, name, requested, settled)
+    -- `uncertain`: the call ended in an error, so whether the server received
+    -- it is unknown; it still counts as sent (never repeated blindly).
+    local function NoteCreated(trace, name, requested, settled, uncertain)
         local nameKey = DraftModel.NameKey(name)
         if nameKey ~= "" then state.createdNames[nameKey] = true end
         local tokens = {[trace.draftToken] = true}
@@ -1702,18 +1835,27 @@ function Controller.New(options)
             name = tostring(name or ""),
             keys = {[nameKey] = true,
                 [DraftModel.NameKey(requested or name)] = true},
+            uncertain = uncertain and true or nil,
         }
     end
 
-    local function NotAdmitted(reason, name)
+    -- Admission refusals, said as what this editor knows: an upload it sent
+    -- (and the game accepted), or one whose outcome an error left unknown.
+    local function NotAdmitted(reason, name, uncertain)
         if reason == "save_in_progress" then
-            notify("|cffffd200Nexus:|r A save is already in progress; nothing is sent twice.")
+            notify("|cffffd200Nexus:|r A save is already in progress; this click sends nothing.")
         elseif reason == "save_pending" then
-            notify("|cffffd200Nexus:|r This Wishlist is already waiting for the server; it is sent once, on its own.")
+            notify("|cffffd200Nexus:|r This save is already waiting for the server's spacing; the editor sends "
+                .. "it when the server is ready and does not start another one.")
+        elseif uncertain then
+            notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' may already have been sent from this draft "
+                .. "(the game reported an error during that upload), so nothing was uploaded again. Check the "
+                .. "Wishlist list in the Echo Journal. To create another Wishlist anyway, change the plan or its "
+                .. "name, or use New Wishlist.")
         else
-            notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' was already created from this draft, so "
-                .. "nothing was uploaded again. To create another Wishlist, change the plan or its name, or "
-                .. "use New Wishlist.")
+            notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' was sent from this draft and the game accepted "
+                .. "the upload, so it counts as already created and nothing was uploaded again. To create "
+                .. "another Wishlist, change the plan or its name, or use New Wishlist.")
         end
         return reason
     end
@@ -1770,19 +1912,65 @@ function Controller.New(options)
             return false, "stale_confirmation"
         end
         trace.draftToken = draftToken
+        local intent = IntentOf(guard)
+        trace.intent = intent
+        -- A Save changes the control named (the editor's Save changes and
+        -- Create unassigned) writes no destination the plan did not already
+        -- have: a new plan is assigned nowhere, and an opened first-run plan
+        -- creates no new slot-1 handoff (see the writers below). Callers that
+        -- name no intent keep the writers' earlier rules.
+        local confirmed = type(guard) == "table" and guard.confirmation or nil
+        local explicitSave = intent == INTENT.SAVE_CHANGES and type(confirmed) == "table"
+            and confirmed.explicit == true
+        trace.explicit = explicitSave or nil
+        -- The destination the confirmation named is the one this save may
+        -- write (F6): when the editor would now resolve another one (a Saved
+        -- Build became active or empty, the first-run target came or went),
+        -- nothing is uploaded and the player reviews again. A confirmed save is
+        -- never redirected. The direct payload API showed no destination.
+        local boundKey = BoundDestinationKey(guard)
+        if boundKey ~= nil and boundKey ~= DestinationKey(DestinationDescriptor()) then
+            state.applyRetry = nil
+            notify("|cffff6060Nexus:|r Not saved: the destination named in the confirmation is not the one "
+                .. "this editor would use now (the active or selected Saved Build changed). Nothing was uploaded "
+                .. "or assigned; your edits are kept. Review and save again.")
+            return false, "destination_changed"
+        end
+        if intent == INTENT.SAVE_AND_ASSIGN and ((not state.editingContext and not AssignTarget())
+            or (state.editingContext and state.editingContext.destination == nil)) then
+            state.applyRetry = nil
+            notify("|cffff6060Nexus:|r Not saved: Save & assign needs a destination this editor captured, and "
+                .. "this draft has none. Nothing was uploaded or assigned; your edits are kept.")
+            return false, "no_destination"
+        end
+        -- An explicit Save changes of a Wishlist opened for a Saved Build that
+        -- does not hold it assigns nothing (the branch below), so neither an
+        -- assignment made meanwhile nor an emptied Saved Build stops it. That
+        -- is what its confirmation said (`keepsAssignment`, bound when it was
+        -- made), and only while the Saved Build still does not hold it. A
+        -- Save changes confirmed as the bound plan's own save ("Saving also
+        -- updates its assignment") never becomes one without a writer when
+        -- that assignment changes before the accept or a spaced retry: the
+        -- check below refuses it before anything is uploaded.
+        local keepsAssignment = explicitSave and state.editingContext ~= nil
+            and confirmed.keepsAssignment == true and M.SaveAssignsOpened()
         -- An Assign, Unassign or Restore of the destination this save would
         -- assign (in the Echo Journal, My Builds or the editor's own assign
         -- buttons), made after the editor bound it, is authoritative: nothing
         -- is uploaded, and the editor must be reopened. Checked again inside
         -- each writer.
+        -- Save changes of a new plan writes no destination, so neither a
+        -- destination changed meanwhile nor an emptied one stops it.
+        local writesDestination = (state.editingContext ~= nil and not keepsAssignment)
+            or intent == INTENT.SAVE_AND_ASSIGN
         local destination, bound = SaveDestination()
-        if destination ~= nil and bound ~= nil and Adapter.AssignmentActionUnchanged
+        if writesDestination and destination ~= nil and bound ~= nil and Adapter.AssignmentActionUnchanged
             and not Adapter.AssignmentActionUnchanged(bound, destination) then
             state.applyRetry = nil
             NotSavedChanged(destination)
             return false, "assignment_changed"
         end
-        local emptySlot = EmptyDestination()
+        local emptySlot = writesDestination and EmptyDestination() or nil
         if emptySlot then
             state.applyRetry = nil
             NotSavedEmptyDestination(emptySlot)
@@ -1808,7 +1996,7 @@ function Controller.New(options)
         if IsCreate(slot) and TakenWishlistNames()[DraftModel.NameKey(name)] then
             state.applyRetry = nil
             notify("|cffff6060Nexus:|r Not saved: a Wishlist named '" .. tostring(name) .. "' now exists. "
-                .. "Nothing was uploaded; your edits are kept. Press Create Wishlist again to see the name "
+                .. "Nothing was uploaded; your edits are kept. Press Create again to see the name "
                 .. "it will get.")
             return false, "name_taken"
         end
@@ -1818,6 +2006,8 @@ function Controller.New(options)
         local expected = submitting and submitting.mirrorTokens or nil
         trace.sending, trace.createTargetContext = true, state.createTargetContext
         local ok, err = Adapter.UploadWishlist(slot or 0, name, echoes, expected)
+        -- The call returned: an error raised from here on did not interrupt it.
+        trace.returned = true
         if ok then
             trace.uploaded = true
             -- This editor's own upload is part of the slot's lineage from now on, even
@@ -1837,12 +2027,19 @@ function Controller.New(options)
                 notify("|cffff6060Nexus:|r Wishlist uploaded, but the editor changed; local targets were not reassigned. Review and save again.")
                 return false, "uploaded_draft_changed"
             end
+            -- The draft is the one uploaded: whatever the commit below rewrites
+            -- (its fulfilled targets) is still that draft, also if a later
+            -- step ends in an error.
+            trace.settled = true
             local committed, commitReason, designTargets = CommitLockDesignTargets(echoes, preparedDesign)
             if not committed then
                 state.applyRetry = nil
                 notify("|cffff6060Nexus:|r Wishlist uploaded, but local designed targets could not be saved. Your draft is preserved.")
                 return false, commitReason or "local_save_incomplete"
             end
+            -- Accepted by the Store, but kept only for this session when saved
+            -- data cannot be written now: said, never shown as saved for good.
+            trace.writeMode, trace.writeReason = SessionOnlyWrite()
             -- The uploaded rows are exactly the plan's ORDINARY rows (locked
             -- targets are the committed design). Record them with that role:
             -- stored without it, an explicit ordinary row became untyped, and
@@ -1861,7 +2058,22 @@ function Controller.New(options)
                 notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' was uploaded, but its assignment "
                     .. "was changed while the editor was open; that choice is kept.")
             end
-            if state.editingContext and state.editingContext.loadoutSlot
+            if not state.editingContext and intent == INTENT.SAVE_CHANGES and AssignTarget() then
+                -- Save changes of a new plan that could have been assigned:
+                -- the player chose to save it unassigned. No writer runs.
+                trace.outcome = "saveOnly"
+                notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' saved without an assignment, as you chose. "
+                    .. "No Saved Build or first-run target changed. To assign it, use Assign now... or the "
+                    .. "Wishlist selector in the Echo Journal.")
+            elseif keepsAssignment then
+                -- Save changes of a Wishlist opened for a Saved Build that
+                -- does not hold it: its edits are saved, and that Saved Build
+                -- keeps its current Wishlist. No writer runs.
+                trace.outcome = "saveOnly"
+                notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' saved without an assignment, as you chose. "
+                    .. "The Saved Build this editor opened it for keeps its current Wishlist, and no first-run "
+                    .. "target changed. To assign it, use Save & assign or the Wishlist selector in the Echo Journal.")
+            elseif state.editingContext and state.editingContext.loadoutSlot
                 and Adapter.UpdateWishlistAssociationAfterSave then
                 -- The open editor's binding goes with the save (see the writer).
                 local context, assignmentId, key, installed = state.editingContext
@@ -1878,7 +2090,7 @@ function Controller.New(options)
                 elseif associationReason == "assignment_changed" then
                     KeptNotice()
                 end
-            elseif state.createTargetContext and Adapter.SetLoadoutWishlistIdentity then
+            elseif state.createTargetContext and not explicitSave and Adapter.SetLoadoutWishlistIdentity then
                 local createdId, createdKey, installed
                 trace.destination = tonumber(state.createTargetContext.loadoutSlot)
                 associated, associationReason, createdId, createdKey, installed = Adapter.SetLoadoutWishlistIdentity(
@@ -1901,12 +2113,36 @@ function Controller.New(options)
                 local firstRun, unloaded = FirstRunOwnsSave()
                 local context = state.editingContext
                 -- An opened Wishlist saves to the first-run plan only when it
-                -- was that plan when the editor bound it.
+                -- was that plan when the editor bound it; an explicit Save
+                -- changes of a new plan never becomes the first-run target.
                 if context and context.destination ~= "first" then firstRun = false end
+                if not context and explicitSave then firstRun = false end
                 if firstRun and Adapter.SetFirstLoadoutWishlistIdentity then
                     local assignmentId, key, installed
                     local bound = state.draftActions
                     if context then bound = context.boundActions end
+                    -- Explicit Save changes of the opened first-run plan: its
+                    -- proven slot-1 handoff is refreshed with it, but where
+                    -- slot 1 holds no assignment none is created (that would
+                    -- be a new destination). The writer's own slot-1 check
+                    -- sees a token that can never match; "first" is checked
+                    -- exactly as before.
+                    local root = context and explicitSave and Store.State and Store.State() or nil
+                    if type(root) == "table" and (type(root.loadoutWishlists) ~= "table"
+                        or root.loadoutWishlists[1] == nil) then
+                        local snapshot = bound
+                        if type(snapshot) ~= "table" and Adapter.AssignmentActionSnapshot then
+                            snapshot = Adapter.AssignmentActionSnapshot()
+                        end
+                        if type(snapshot) == "table" then
+                            local tokens = {}
+                            for destination, token in pairs(type(snapshot.tokens) == "table"
+                                and snapshot.tokens or {}) do tokens[destination] = token end
+                            tokens[1] = "saveChanges:no-new-handoff"
+                            bound = {epoch = snapshot.epoch, tokens = tokens}
+                            trace.handoffWithheld = true
+                        end
+                    end
                     trace.destination = "first"
                     associated, associationReason, assignmentId, key, installed =
                         Adapter.SetFirstLoadoutWishlistIdentity(name, recorded, designTargets, bound)
@@ -1923,9 +2159,12 @@ function Controller.New(options)
                     -- Saved, and intentionally assigned to nothing.
                     trace.outcome = unloaded and "notLoaded"
                         or (context and "unboundPlan" or "noDestination")
+                    -- What this editor captured, not what the game shows open
+                    -- (a copied draft can begin while a Saved Build is selected).
                     notify("|cffffd200Nexus:|r '" .. tostring(name) .. "' saved. "
                         .. (unloaded and "Saved Build data is not loaded yet, so it is not assigned."
-                            or "No Saved Build was open in the editor, so it is not assigned.")
+                            or context and "This editor has no Saved Build destination for it, so it is not assigned."
+                            or "The editor did not capture a Saved Build for this draft, so it is not assigned.")
                         .. " To assign it, use the Wishlist selector in My Builds.")
                 end
             end
@@ -1937,16 +2176,41 @@ function Controller.New(options)
                     loadoutSlot = state.createTargetContext
                         and state.createTargetContext.loadoutSlot or nil,
                 }) end
-                notify("|cffff6060Nexus:|r Wishlist uploaded and targets saved, but assignment failed ("
-                    .. tostring(associationReason or "unavailable") .. "). Select a valid loadout and assign it again.")
+                -- A writer that gave no reason is said without a guessed one.
+                notify("|cffff6060Nexus:|r Wishlist uploaded and targets saved, but assignment failed"
+                    .. (associationReason ~= nil and (" (" .. tostring(associationReason) .. ")") or "")
+                    .. ". Select a valid loadout and assign it again.")
                 return false, "association_incomplete"
             end
             state.applyRetry = nil
             state.candidateContext = nil
             state.candidateApplyToken = nil
+            -- Read again after the writer: what it wrote is kept for good only
+            -- while saved data can be written.
+            trace.writeMode, trace.writeReason = SessionOnlyWrite()
             notify("|cff4dff80Nexus:|r Wishlist saved ("
-                .. DraftModel.EchoListTotal(echoes) .. "/79 rolled copies; planned locked targets are separate).")
+                .. DraftModel.EchoListTotal(echoes) .. "/79 rolled copies; planned locked targets are separate)."
+                .. (trace.writeMode and " Saved data cannot be written right now, so its assignment and locked "
+                    .. "targets on this character last this session only." or ""))
             return true
+        end
+        if tostring(err) == "host_error" then
+            -- The host raised during its own upload call: it may have sent the
+            -- plan before failing. Never repeated from here; an opened
+            -- Wishlist's slot may now show this upload, so it joins the lineage.
+            state.applyRetry = nil
+            trace.uncertain = true
+            trace.settled = draftToken == CurrentDraftToken()
+            if submitting and type(submitting.mirrorTokens) == "table"
+                and tonumber(submitting.slot) == tonumber(slot)
+                and Adapter.ServerWishlistTokenFor then
+                local own = Adapter.ServerWishlistTokenFor(name, echoes)
+                if own then submitting.mirrorTokens[own] = true end
+            end
+            notify("|cffff6060Nexus:|r The game reported an error while sending '" .. tostring(name)
+                .. "'. It may or may not have reached the server, so it is not sent again from this draft and "
+                .. "nothing was assigned. Check the Wishlist list in the Echo Journal before saving again.")
+            return false, "host_error"
         end
         if tostring(err) == "stale_slot" then
             state.applyRetry = nil
@@ -1968,6 +2232,13 @@ function Controller.New(options)
                 requestedName=guard and guard.requestedName,
                 editingContext=state.editingContext,
                 createTargetContext=state.createTargetContext,
+                -- The confirmed intent and destination travel with the wait,
+                -- and so does the confirmation that bound them: its explicit
+                -- Save changes stays explicit on the retry (no assignment, no
+                -- new slot-1 handoff), and a legacy caller's stays legacy.
+                intent=intent,
+                destinationKey=boundKey,
+                confirmation=confirmed,
             }
             return false, "spacing"
         end
@@ -2003,21 +2274,47 @@ function Controller.New(options)
         local result = NewSaveResult(nil, nil, name, destination)
         -- The name the player typed, when a Create offered a copy name for it.
         result.requestedName = guard and guard.requestedName or nil
+        result.intent = IntentOf(guard)
+        result.create = IsCreate(slot) or nil
         state.saveResult = nil
         -- One attempt at a time, from its first check to its last write: a host
         -- callback that re-enters Save or Create meanwhile is refused. An error
-        -- still ends the attempt (and is raised again), and a Create whose
-        -- upload call had begun counts as sent, so it is not sent again.
+        -- still ends the attempt (and is raised again with its stack), and a
+        -- Create whose upload call had begun counts as sent, so it is not sent
+        -- again: certainly when the upload was accepted, as unknown when the
+        -- call ended in an error (the host's, or one raised out of the call).
         state.applying = true
-        local called, ok, reason = pcall(TryApply, slot, name, echoes, guard, trace)
+        local called, ok, reason = xpcall(function()
+            return TryApply(slot, name, echoes, guard, trace)
+        end, WithTraceback)
         state.applying = false
-        if IsCreate(slot) and (trace.uploaded or (not called and trace.sending)) then
+        local uncertain = not trace.uploaded and (trace.uncertain
+            or (not called and trace.sending and not trace.returned)) or false
+        if IsCreate(slot) and (trace.uploaded or uncertain) then
             NoteCreated(trace, name, guard and guard.requestedName,
-                called and reason ~= "uploaded_draft_changed")
+                trace.settled == true, uncertain)
         end
-        if not called then error(ok, 0) end
-        if not ok and reason == "spacing" then return ok, reason end
         result.copies = DraftModel.EchoListTotal(echoes or {})
+        if not called then
+            -- Recorded as far as it got before the error is raised again:
+            -- uploaded and then stopped, possibly sent, or nothing sent.
+            if trace.uploaded then
+                result.kind, result.reason = "partial", "error"
+            elseif uncertain then
+                result.kind = "uncertain"
+            else
+                result.kind, result.reason = "notSaved", "error"
+            end
+            state.saveResult = result
+            error(ok, 0)
+        end
+        if not ok and reason == "spacing" then return ok, reason end
+        result.sessionOnly, result.writeReason = trace.writeMode, trace.writeReason
+        if not ok and reason == "host_error" then
+            result.kind = "uncertain"
+            state.saveResult = result
+            return ok, reason
+        end
         if ok then
             local outcome = trace.outcome
             if outcome == "assigned" or outcome == "firstRun" then
@@ -2092,6 +2389,10 @@ function Controller.New(options)
             destination = CopyRecord(result.destination),
             assignNow = ASSIGN_NOW_KINDS[result.kind] == true
                 or (result.kind == "partial" and result.reason == "association"),
+            -- The intent of the save, and whether what it wrote on this
+            -- character lasts this session only (saved data not writable).
+            intent = result.intent, create = result.create,
+            sessionOnly = result.sessionOnly, writeReason = result.writeReason,
         }
     end
 
@@ -2174,7 +2475,7 @@ function Controller.New(options)
     end
     M._RecordSwitchRefusal = RecordSwitchRefusal
 
-    local function PrepareApplyChecked(nameText)
+    local function PrepareApplyChecked(nameText, intent)
         if not (Adapter and Adapter.UploadWishlist) then
             notify("|cffff6060Nexus:|r adapter not ready.")
             return nil, "adapter"
@@ -2185,7 +2486,24 @@ function Controller.New(options)
         if not state.editingContext then
             if state.applyRetry then return nil, NotAdmitted("save_pending") end
             local created = AlreadyCreated(DraftModel.NameKey(nameText))
-            if created then return nil, NotAdmitted("already_created", created.name) end
+            if created then return nil, NotAdmitted("already_created", created.name, created.uncertain) end
+        end
+        -- The intent this confirmation is for: named by the control, else the
+        -- draft's default (the behaviour before intents). Save & assign needs
+        -- a destination this editor captured; it is refused before anything
+        -- is offered when there is none. `explicit`: the control named it (the
+        -- editor's actions always do); see TryApply for what that changes.
+        local explicit = intent ~= nil
+        if intent == nil then intent = M.DefaultIntent() end
+        if intent ~= INTENT.SAVE_CHANGES and intent ~= INTENT.SAVE_AND_ASSIGN then
+            notify("|cffff6060Nexus:|r Not saved: this save action is not recognised. Nothing was uploaded or assigned.")
+            return nil, "invalid_intent"
+        end
+        if intent == INTENT.SAVE_AND_ASSIGN and ((not state.editingContext and not AssignTarget())
+            or (state.editingContext and state.editingContext.destination == nil)) then
+            notify("|cffff6060Nexus:|r Not saved: Save & assign needs a destination this editor captured, and "
+                .. "this draft has none. Nothing was uploaded or assigned; your edits are kept.")
+            return nil, "no_destination"
         end
         if state.editingContext and not tonumber(state.editingContext.slot) then
             notify("|cffff9040Nexus:|r This saved plan has no distinct current server mirror. It is kept exactly as it is; saving it would need a mirror to write to, and no other Wishlist will be overwritten.")
@@ -2207,7 +2525,12 @@ function Controller.New(options)
         if DesignLimitRefusal() then return nil, "design_limit" end
         local preparedDesign, designReason = PrepareLockDesignTargets()
         if not preparedDesign then return nil, designReason end
-        local emptySlot = EmptyDestination()
+        -- Save changes of a new plan writes no destination: an emptied one does
+        -- not stop it; nor does it stop an explicit Save changes of a Wishlist
+        -- opened for a Saved Build that does not hold it (assigned nowhere).
+        local keepsAssignment = explicit and intent == INTENT.SAVE_CHANGES and M.SaveAssignsOpened()
+        local emptySlot = ((state.editingContext and not keepsAssignment) or intent == INTENT.SAVE_AND_ASSIGN)
+            and EmptyDestination() or nil
         if emptySlot then
             NotSavedEmptyDestination(emptySlot)
             return nil, "destination_empty"
@@ -2250,21 +2573,35 @@ function Controller.New(options)
                 return nil, "name_unavailable"
             end
             if unique ~= name then
-                notify("|cffffd200Nexus:|r A Wishlist named \"" .. name .. "\" already exists, so this "
-                    .. "new one will be named \"" .. unique .. "\".")
+                -- Taken means listed where the player can see it (the server
+                -- list, a saved plan, or a Create of this session).
+                notify("|cffffd200Nexus:|r A Wishlist named \"" .. name .. "\" is already listed (on the server "
+                    .. "list, in your saved plans or created this session), so this new one will be named \""
+                    .. unique .. "\".")
             end
             requestedName, name, namesUnknown = name, unique, not known or nil
         end
         -- `destination`: what the confirmation names (DestinationDescriptor).
         -- `requestedName`/`namesUnknown`: a Create's typed name, when it was
         -- given a copy name, and whether existing names could not be read.
+        -- `intent` and the destination's key are bound into the confirmation:
+        -- its accept saves with that intent, to that destination, or not at all.
+        local destination = DestinationDescriptor()
+        -- `keepsAssignment`: an explicit Save changes of a Wishlist opened for
+        -- a Saved Build that does not hold it saves it there unassigned.
         local data = {slot = slot, name = name, echoes = echoes,
-            destination = DestinationDescriptor(),
+            destination = destination, intent = intent,
+            assigns = (state.editingContext == nil and intent == INTENT.SAVE_AND_ASSIGN) or nil,
+            keepsAssignment = keepsAssignment or nil,
             requestedName = requestedName, namesUnknown = namesUnknown}
+        -- `keepsAssignment` is bound too: the accept and its spaced retry save
+        -- the way this confirmation is worded (TryApply).
         local confirmation = {adapter=Adapter,editingContext=state.editingContext,
             createTargetContext=state.createTargetContext,
             draftToken=CurrentDraftToken(),
-            applyToken=ApplyPayloadToken(slot,name,echoes)}
+            applyToken=ApplyPayloadToken(slot,name,echoes),
+            intent=intent, explicit=explicit or nil, destinationKey=DestinationKey(destination),
+            keepsAssignment=keepsAssignment == true or nil}
         state.applyConfirmation = confirmation
         data.confirmation = confirmation
         if state.candidateContext then
@@ -2285,8 +2622,10 @@ function Controller.New(options)
     local NOT_ADMITTED = {save_in_progress = true, save_pending = true, already_created = true}
 
     -- A refusal before any confirmation is a visible not-saved result too.
-    function M.PrepareApply(nameText)
-        local data, mode = PrepareApplyChecked(nameText)
+    -- `intent` (optional): M.INTENT.SAVE_CHANGES or M.INTENT.SAVE_AND_ASSIGN;
+    -- without it the draft's default intent (M.DefaultIntent) applies.
+    function M.PrepareApply(nameText, intent)
+        local data, mode = PrepareApplyChecked(nameText, intent)
         if not data and not NOT_ADMITTED[mode] then
             RecordRefusal(mode, state.editingContext and state.editingContext.name
                 or DraftModel.TrimName(tostring(nameText or "")))
@@ -2303,12 +2642,21 @@ function Controller.New(options)
             local confirmation = data.confirmation
             -- PrepareApply always binds UI confirmations. Preserve the existing
             -- direct controller payload API for callers without a popup token.
-            if confirmation and (confirmation ~= state.applyConfirmation
+            if confirmation and (confirmation.used or confirmation ~= state.applyConfirmation
                 or confirmation.adapter ~= Adapter
                 or confirmation.editingContext ~= state.editingContext
                 or confirmation.createTargetContext ~= state.createTargetContext
                 or confirmation.draftToken ~= CurrentDraftToken()
                 or confirmation.applyToken ~= ApplyPayloadToken(slot,name,echoes)) then
+                -- An accept already used, or a superseded one for a draft that
+                -- was already sent, is a repeat: nothing is sent, and the result
+                -- of the save that did happen is not replaced by a refusal.
+                if confirmation.used or (IsCreate(slot) and AlreadyCreated(DraftModel.NameKey(name),
+                    data.requestedName and DraftModel.NameKey(data.requestedName))) then
+                    notify("|cffffd200Nexus:|r This confirmation was already used for a save of this draft, "
+                        .. "so nothing was sent again.")
+                    return false, "confirmation_used"
+                end
                 notify("|cffff6060Nexus:|r Save cancelled: the editor changed. Review and save again.")
                 RecordRefusal("stale_confirmation", name)
                 return false, "stale_confirmation"
@@ -2338,9 +2686,11 @@ function Controller.New(options)
             if state.applyRetry then return false, NotAdmitted("save_pending") end
             local created = AlreadyCreated(DraftModel.NameKey(name),
                 data and data.requestedName and DraftModel.NameKey(data.requestedName))
-            if created then return false, NotAdmitted("already_created", created.name) end
+            if created then return false, NotAdmitted("already_created", created.name, created.uncertain) end
         end
         state.applyConfirmation = nil
+        -- One accept per confirmation: a repeated callback is a repeat.
+        if data and type(data.confirmation) == "table" then data.confirmation.used = true end
         return ApplyAndRecord(slot, name, echoes, data)
     end
 
@@ -2391,6 +2741,19 @@ function Controller.New(options)
     end
 
     function M.IsApplyPending() return state.applyRetry ~= nil end
+
+    -- Read-only: the name the shown new draft was already sent under (and
+    -- whether an error left that send unconfirmed), or nil. The apply control
+    -- says so; pressing it for this draft sends nothing (Create admission).
+    function M.SentDraft()
+        local created = state.createdDraft
+        if state.editingContext or not created
+            or created.createTargetContext ~= state.createTargetContext
+            or not created.draftTokens[CurrentDraftToken()] then
+            return nil
+        end
+        return created.name, created.uncertain == true
+    end
 
     function M.PendingApply()
         local retry = state.applyRetry

@@ -185,9 +185,15 @@ local function Choose(tag,slot)
  return true
 end
 -- The visible editor control `text`, and the + control of the listed Echo `id`.
+-- M3: the editor's actions are named by their effect; a legacy label also
+-- finds the action with that default intent (new label first, then legacy).
+local LABELS={['Create Wishlist']={'Create & assign','Create unassigned','Create Wishlist'},
+ ['Save Wishlist']={'Save & assign','Save changes','Save Wishlist'}}
 local function Button(text)
- for _,f in ipairs(H.frames) do
-  if f.kind=='Button' and f:IsVisible() and f:GetText()==text then return f end
+ for _,label in ipairs(LABELS[text] or {text}) do
+  for _,f in ipairs(H.frames) do
+   if f.kind=='Button' and f:IsVisible() and f:GetText()==label then return f end
+  end
  end
 end
 local function PlusRow(id)

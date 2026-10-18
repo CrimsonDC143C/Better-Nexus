@@ -222,10 +222,11 @@ end
 
 -- The second argument of both confirmations is composed by the renderer
 -- (ConfirmationText): the planned count, the destination this editor
--- captured and, only when it applies, the Auto line.
+-- captured and, only when it applies, the Auto line. The renderer sets each
+-- accept button to the action that opened it (ConfirmLabel) before showing.
 StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
     text = "Save changes to '%s'?\n%s",
-    button1 = "Save Changes",
+    button1 = "Save changes",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
     OnAccept = function(self, data)
@@ -236,7 +237,7 @@ StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
 
 StaticPopupDialogs["WISHLISTREALIZER_CREATE_WISHLIST"] = {
     text = "Create '%s'?\n%s",
-    button1 = "Create Wishlist",
+    button1 = "Create & assign",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
     OnAccept = function(self, data)
@@ -315,7 +316,7 @@ local function LoadImportedWishlist(parsed, chosenName)
     M.Refresh()
     local displayName = DisplayUntrusted(name, 1024, false) or "Wishlist"
     print(string.format(
-        "|cff4dff80Nexus:|r imported %d Echo entr%s as new wishlist '%s'. Review this draft; Create Wishlist saves it. Assignment follows the loadout shown by the editor.",
+        "|cff4dff80Nexus:|r imported %d Echo entr%s as new wishlist '%s'. Review this draft; Create & assign saves it and assigns it to the loadout shown by the editor, Create unassigned saves it without an assignment.",
         count, count == 1 and "y" or "ies", displayName))
     return true
 end
@@ -666,6 +667,48 @@ function M.ResolveAndAssignWishlist(candidate, activeSlot)
     if status~="actionable" then return false,why end
     if tonumber(activeSlot)==0 then return Adapter.SetFirstRunWishlist(resolved.slot,resolved) end
     return Adapter.SetLoadoutWishlist(activeSlot,resolved.slot,resolved)
+end
+
+-- The editor's Wishlist candidates (when nothing is tracked) assign the clicked
+-- one to the active Saved Build. With Auto selected and a numbered Saved Build
+-- with Echoes as that target, the Journal's Auto-ON confirmation names it
+-- first (UX-05); `perform` (the click's own role choice and assignment) runs
+-- only after Assign, and only while the active Saved Build is still the one
+-- named. Cancel changes nothing; Auto is never changed here. Auto OFF, the
+-- first-run target and an empty or unknown Saved Build keep their behaviour.
+-- Returns what the consent call returned, or what `perform` returned.
+function M.ConfirmCandidateAssignment(candidate, perform)
+    local adapter = Adapter or Nexus.GameAdapter
+    local slots = adapter and adapter.Slots and adapter.Slots()
+    local active = type(slots) == "table" and tonumber(slots.activeSlot) or 0
+    local maxSlots = type(slots) == "table" and (tonumber(slots.maxSlots) or 5) or 5
+    local row = type(slots) == "table" and type(slots.bySlot) == "table" and slots.bySlot[active] or nil
+    local numbered = active >= 1 and active <= maxSlots and type(row) == "table"
+        and type(row.echoes) == "table" and #row.echoes > 0
+    if not numbered then return perform() end
+    local journal = Nexus.JournalTab
+    if not (journal and type(journal.AssignWithConsent) == "function") then
+        local stats = type(Nexus.RecomputeStats) == "function" and Nexus.RecomputeStats() or nil
+        if type(stats) == "table" and stats.autoEnabled == true then
+            print("|cffff6060Nexus:|r Nothing was assigned: Auto is ON and the confirmation that names its "
+                .. "consequence could not be shown. Turn Auto OFF to assign, or try again later.")
+            return nil, "consent_unavailable"
+        end
+        return perform()
+    end
+    local name = DisplayUntrusted(candidate and candidate.name, 1024, false)
+    if not name or name == "" then name = "Slot " .. tostring(candidate and candidate.slot or "?") end
+    local label = DisplayUntrusted(row.name, 1024, false)
+    if not label or label == "" then label = tostring(active) end
+    return journal.AssignWithConsent(name, "Saved Build '" .. label .. "'", true, function()
+        local now = adapter and adapter.Slots and adapter.Slots()
+        if type(now) ~= "table" or tonumber(now.activeSlot) ~= active then
+            print("|cffff6060Nexus:|r Nothing was assigned: the active Saved Build changed after you were "
+                .. "asked. Choose the Wishlist again.")
+            return
+        end
+        return perform()
+    end)
 end
 
 function M.ImportEBH1String(text, chosenName)
