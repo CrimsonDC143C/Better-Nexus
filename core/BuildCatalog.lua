@@ -187,11 +187,36 @@ local FIELD = {
     -- only; not a summary or wire field, and it grants nothing. Its writer
     -- (SavedDescriptionWitness) uses the same 2048 and writes at most 1181.
     generatedDescriptionWitness={kind="string", max=2048},
+    -- Local first-admission witness only; never content ownership or wire data.
+    syncAdmissionOriginV1={kind="string", max=177},
     buildId={kind="id"}, recordBuildId={kind="id"}, publishedBuildId={kind="id"},
     sourceSavedBuildId={kind="id"},
     sourceIdentity={kind="string", max=256}, provenanceIdentity={kind="string", max=256},
     echoes={kind="evidence", locked=false}, lockedEchoes={kind="evidence", locked=true},
 }
+
+-- Quota bookkeeping has two observed-transport namespaces. A bare actual
+-- sender has no realm/ownership proof: keep its validated player key separate
+-- instead of borrowing a realm or disabling its legacy unverified transport.
+-- Neither namespace participates in ownership, fingerprints or wire payloads.
+function FIELD.syncAdmissionOriginV1.ActualOrigin(sender)
+    local qualified = Identity.CanonicalOwnerFromTransport(sender)
+    if qualified then return qualified end
+    if type(sender) == "string" and not sender:find("-", 1, true)
+        and Identity.ValidPlayer(sender) then
+        local player = Identity.PlayerKey(sender)
+        return player and ("transport-bare:" .. player) or nil
+    end
+end
+function FIELD.syncAdmissionOriginV1.ReadOrigin(value)
+    if type(value) ~= "string" or #value > 177 then return nil end
+    local qualified = Identity.CanonicalOwnerKey(value)
+    if qualified then return qualified end
+    local player = value:match("^transport%-bare:(.+)$")
+    if player and not player:find("-", 1, true) and Identity.ValidPlayer(player) then
+        return "transport-bare:" .. Identity.PlayerKey(player)
+    end
+end
 
 -- Fixed compact/verbose alias table (source key -> canonical field).
 local ALIAS = {
@@ -815,8 +840,19 @@ local function WalkFrame(walker, frame, work)
             end
         else -- row
             local canonical = FIELD[key] and key or ALIAS[key]
+            if canonical == "syncAdmissionOriginV1"
+                and not FIELD.syncAdmissionOriginV1.ReadOrigin(value) then
+                -- This name was unknown before the optional local extension.
+                -- Old bounded values of another shape stay exact unknown
+                -- evidence; they neither invalidate the row nor name an origin.
+                canonical = nil
+            end
             local spec = canonical and FIELD[canonical]
-            if spec and spec.kind == "evidence" then
+            if key == "syncAdmissionOriginV1" and walker.ignoreAdmissionOrigin then
+                -- Mutation payloads cannot supply local transport history. The
+                -- admission owner restores the existing witness or records the
+                -- actual sender of a newly occupied remote identity below.
+            elseif spec and spec.kind == "evidence" then
                 if BeginEvidenceArray(walker, work, frame, key, value, spec.locked)
                     ~= "ok" then return "done" end
                 if walker.frames[#walker.frames] ~= frame then return "ok" end
@@ -3202,6 +3238,45 @@ function Candidate.AddsBuildIdentity(existing)
     return not (existing and (existing.overlayRaw ~= nil or existing.bundledRaw ~= nil))
 end
 
+-- Private conservative policy: each bound is one eighth of the existing
+-- 2048 hard cap. These are engineering guardrails, not native measurements.
+Candidate.REMOTE_ORIGIN_MAX = 256
+Candidate.REMOTE_RESERVED_SLOTS = 256
+
+function Candidate.CountAdmissionOrigin(counts, verdict, sign)
+    -- Q charges retained durable overlay identities, including rows hidden by
+    -- tombstones, barriers or invalid content. Read only the already-retained
+    -- scalar witness; never parse or grant authority from the raw row.
+    local overlay = verdict and verdict.overlayRaw
+    local value = type(overlay) == "table"
+        and rawget(overlay, "syncAdmissionOriginV1")
+    local origin = FIELD.syncAdmissionOriginV1.ReadOrigin(value)
+    if not origin then return end
+    counts.remoteOrigins = counts.remoteOrigins or {}
+    local n = (counts.remoteOrigins[origin] or 0) + sign
+    counts.remoteOrigins[origin] = n > 0 and n or nil
+end
+
+-- Called only after the record's own schema/ownership/reservation verdicts.
+-- Counts are derived during the existing bounded root finalization, never by
+-- rescanning all rows for each arrival. One candidate owns all reservations.
+function Candidate.RemoteAdmissionPolicy(put)
+    if not put.addsBuild or put.options.source ~= "remote" then return nil end
+    local origin = FIELD.syncAdmissionOriginV1.ActualOrigin(put.options.sender)
+    if not origin then return "REMOTE_ORIGIN_UNAVAILABLE" end
+    local counts = put.root.counts or {}
+    local used = counts.remoteOrigins and counts.remoteOrigins[origin] or 0
+    local held = put.reservedOrigins and put.reservedOrigins[origin] or 0
+    if used + held >= Candidate.REMOTE_ORIGIN_MAX then
+        return "REMOTE_ORIGIN_LIMIT"
+    end
+    if (counts.builds or 0) + put.reservedBuilds
+        >= BUDGET.rows - Candidate.REMOTE_RESERVED_SLOTS then
+        return "REMOTE_HEADROOM_LIMIT"
+    end
+    return nil, origin
+end
+
 -- The refusal reason, and its scalar facts, when one more entry of the
 -- category would take the published count plus the transaction's signed
 -- reservation above the limit; nil when it fits. Records nothing. A negative
@@ -3795,6 +3870,7 @@ local function ComputeCounts(handle)
         if verdict.tombstone then counts.tombstones = counts.tombstones + 1 end
         if verdict.overlayRaw ~= nil then counts.overlay = counts.overlay + 1 end
         if verdict.barrier then counts.barriers = counts.barriers + 1 end
+        Candidate.CountAdmissionOrigin(counts, verdict, 1)
     end
     return counts
 end
@@ -5399,6 +5475,7 @@ function Candidate.PumpAdmissionFinalization(handle, work)
             handle.tombstoneKeys[#handle.tombstoneKeys + 1] = slot.key
         end
         if verdict.overlayRaw ~= nil then counts.overlay = counts.overlay + 1 end
+        Candidate.CountAdmissionOrigin(counts, verdict, 1)
         if verdict.barrier then
             counts.barriers = counts.barriers + 1
             handle.barrierKeys[#handle.barrierKeys + 1] = slot.key
@@ -5755,6 +5832,7 @@ local function ApplyCounts(root, previous, verdict)
         if item.tombstone then counts.tombstones = counts.tombstones + sign end
         if item.overlayRaw ~= nil then counts.overlay = counts.overlay + sign end
         if item.barrier then counts.barriers = counts.barriers + sign end
+        Candidate.CountAdmissionOrigin(counts, item, sign)
     end
     Delta(previous, -1)
     Delta(verdict, 1)
@@ -5953,6 +6031,8 @@ end
 
 function Candidate.NewPutPreparation(root, record, options, claim, deferred, slot,
                                      existing, readmitTombstone, carriedUnknown)
+    local walker = NewWalker(record, options)
+    walker.ignoreAdmissionOrigin = true
     return {
         mode="mutation", phase="put-prepare", counters=NewCounters(), pumps=1,
         preparationIdentity={},
@@ -5963,7 +6043,7 @@ function Candidate.NewPutPreparation(root, record, options, claim, deferred, slo
             claim=claim, slot=slot, existing=existing,
             readmitTombstone=readmitTombstone,
             carriedUnknown=carriedUnknown,
-            walker=NewWalker(record, options), storedAs="overlay",
+            walker=walker, storedAs="overlay",
         },
     }
 end
@@ -6017,6 +6097,18 @@ function Candidate.PumpPutPreparation(handle, work)
                 return Candidate.FinishPreparedPutWithoutCommit(handle, false,
                     put.capacityFull)
             end
+            local originWhy, admissionOrigin = Candidate.RemoteAdmissionPolicy(put)
+            if originWhy then
+                return Candidate.FinishPreparedPutWithoutCommit(handle, false,
+                    originWhy)
+            end
+            -- Updating a row never rewrites who originally admitted it, and a
+            -- historical row without this witness stays unattributed. A local
+            -- write cannot manufacture a new remote origin either.
+            verdict.snapshot.syncAdmissionOriginV1 = existingRow
+                and existingRow.source == "overlay"
+                and existingRow.snapshot.syncAdmissionOriginV1 or admissionOrigin
+            put.admissionOrigin = admissionOrigin
             local destination, destinationWhy = BuildDestination(verdict,
                 put.walker, existingRow and existingRow.source == "overlay"
                     and existingRow or nil, put.carriedUnknown)
@@ -6139,7 +6231,8 @@ end
 -- a single put makes them. Every receiver batch member is prepared through
 -- this same function, so no record reaches the catalog through a shortcut
 -- that skips these checks.
-function Candidate.PreparePut(root, record, options, claim, deferred, reservedBuilds)
+function Candidate.PreparePut(root, record, options, claim, deferred, reservedBuilds,
+                              reservedOrigins)
     local carriedUnknown
     if type(record) ~= "table" or record.id == nil then
         return false, "build id required"
@@ -6202,6 +6295,8 @@ function Candidate.PreparePut(root, record, options, claim, deferred, reservedBu
         candidateSlot, existing, readmitTombstone, carriedUnknown)
     handle.put.addsBuild, handle.put.capacityFull, handle.put.capacityFact =
         addsBuild, full, fullFact
+    handle.put.reservedBuilds, handle.put.reservedOrigins = reservedBuilds or 0,
+        reservedOrigins
     return handle
 end
 
@@ -6259,7 +6354,8 @@ function Candidate.NewBatchPutPreparation(root, members, deferred)
         originalRoot=root, ticket=nil, reason="receiver batch",
         deferred=deferred, notifyScope="all", completion="put",
         storedAs="overlay", claims={},
-        batch={members=members, index=1, items={}, admitted=0, refused=0},
+        batch={members=members, index=1, items={}, admitted=0, refused=0,
+            reservedOrigins={}},
     }
 end
 
@@ -6275,7 +6371,7 @@ function Candidate.PumpBatchPutPreparation(handle, work)
             -- the number of new builds already admitted into this batch.
             local sub, prepareWhy = Candidate.PreparePut(handle.originalRoot,
                 member.record, member.options, nil, handle.deferred,
-                batch.addedBuilds or 0)
+                batch.addedBuilds or 0, batch.reservedOrigins)
             if sub then
                 sub.batchMember = true
                 member.sub = sub
@@ -6295,7 +6391,14 @@ function Candidate.PumpBatchPutPreparation(handle, work)
                     put.claim = nil
                 end
                 member.outcome, member.storedAs = "admitted", put.storedAs
-                if put.addsBuild then batch.addedBuilds = (batch.addedBuilds or 0) + 1 end
+                if put.addsBuild then
+                    batch.addedBuilds = (batch.addedBuilds or 0) + 1
+                    if put.admissionOrigin then
+                        local origin = put.admissionOrigin
+                        batch.reservedOrigins[origin] =
+                            (batch.reservedOrigins[origin] or 0) + 1
+                    end
+                end
                 batch.items[#batch.items + 1] = put.item
                 batch.admitted = batch.admitted + 1
             elseif prepared == "noop" then

@@ -32,7 +32,11 @@ local function save(slot,name,locks,extraOrdinary)
  local d=W.DebugDraftState()
  check(d.pending==79,'the imported draft holds 79 rolled copies ('..name..')')
  local create
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist'then create=f;break end end
+ -- M3: the Create action is labelled by its effect (new label first, then legacy).
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then create=f;break end end
+  if create then break end
+ end
  assert(create,'Create button');create:Click();H.AcceptPopup()
  check(not W.IsApplyPending(),'the synthetic save completes ('..name..')')
  H.now=H.now+3.1

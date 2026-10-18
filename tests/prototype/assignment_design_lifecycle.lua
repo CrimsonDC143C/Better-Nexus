@@ -70,8 +70,14 @@ H2.Notify();Nexus.GameAdapter.Poll()
 local localPlan=Nexus.GameAdapter.GetLoadoutWishlist(1)
 assert(localPlan.slot==nil and localPlan.designTargets[200080],'ambiguous mirrored slot retains exact local plan')
 assert(Nexus.WishlistEditor.OpenForWishlist(localPlan,1));export(200080,200081)
-for _,button in ipairs(H2.frames)do
- if button.kind=='Button' and button:IsVisible() and button:GetText()=='Save Wishlist'then button:Click()end
+-- M3: the editor's primary save is labelled by its effect (Save & assign,
+-- else Save changes; legacy Save Wishlist); the first label shown is pressed.
+for _,label in ipairs({'Save & assign','Save changes','Save Wishlist'})do
+ local pressed=false
+ for _,button in ipairs(H2.frames)do
+  if button.kind=='Button' and button:IsVisible() and button:GetText()==label then button:Click();pressed=true end
+ end
+ if pressed then break end
 end
 assert(#H2.actions==0,'inspection, export, restore and protection make no game mutation')
 print('PASS distinct full designs through assignment picker, main model, real editor export, fresh boot and actual spending guard')

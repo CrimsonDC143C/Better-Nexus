@@ -204,6 +204,8 @@ function M._PumpApplyRetry()
     local ok = wishlistController.PumpApplyRetry()
     SyncFulfilledDraftTargets()
     if ok and wishlistRenderer then wishlistRenderer.SetApplySaved() end
+    -- A finished retry (not an idle pump) shows its result at once.
+    if ok ~= nil and wishlistRenderer then wishlistRenderer.RenderSaveResult() end
 end
 
 function M.IsApplyPending()
@@ -214,12 +216,17 @@ local function AcceptApply(data)
     local ok, err = wishlistController.AcceptApply(data)
     SyncFulfilledDraftTargets()
     if ok and wishlistRenderer then wishlistRenderer.SetApplySaved() end
+    if wishlistRenderer then wishlistRenderer.RenderSaveResult() end
     return ok, err
 end
 
+-- The second argument of both confirmations is composed by the renderer
+-- (ConfirmationText): the planned count, the destination this editor
+-- captured and, only when it applies, the Auto line. The renderer sets each
+-- accept button to the action that opened it (ConfirmLabel) before showing.
 StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
-    text = "Save %d/79 rolled copies to '%s'?\nUpdates this server Wishlist. Planned locked targets are saved separately.",
-    button1 = "Save Changes",
+    text = "Save changes to '%s'?\n%s",
+    button1 = "Save changes",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
     OnAccept = function(self, data)
@@ -229,8 +236,8 @@ StaticPopupDialogs["WISHLISTREALIZER_UPDATE_WISHLIST"] = {
 }
 
 StaticPopupDialogs["WISHLISTREALIZER_CREATE_WISHLIST"] = {
-    text = "Create '%s' with %d/79 rolled copies?\nSaves a new server Wishlist and assigns it to the loadout shown in the editor after successful saving. Existing Wishlists are not overwritten.",
-    button1 = "Create Wishlist",
+    text = "Create '%s'?\n%s",
+    button1 = "Create & assign",
     button2 = "Cancel",
     OnCancel = function(_, data) wishlistController.CancelApply(data) end,
     OnAccept = function(self, data)
@@ -309,7 +316,7 @@ local function LoadImportedWishlist(parsed, chosenName)
     M.Refresh()
     local displayName = DisplayUntrusted(name, 1024, false) or "Wishlist"
     print(string.format(
-        "|cff4dff80Nexus:|r imported %d Echo entr%s as new wishlist '%s'. Review this draft; Create Wishlist saves it. Assignment follows the loadout shown by the editor.",
+        "|cff4dff80Nexus:|r imported %d Echo entr%s as new wishlist '%s'. Review this draft; Create & assign saves it and assigns it to the loadout shown by the editor, Create unassigned saves it without an assignment.",
         count, count == 1 and "y" or "ies", displayName))
     return true
 end
@@ -458,8 +465,20 @@ function RolePicker.Accept()
         return LoadImportedWishlist({entries=echoes,name=name,class=class},name)
     end
     if state.assign then
+        -- One slots read. An unknown or missing read proves no target, so it
+        -- refuses before roles are confirmed or anything is written; it is
+        -- never taken as "no Saved Build" (first run). A known read is
+        -- compared through the Saved Build Nexus selects, projected from this
+        -- same read (0 = none): the authority the Journal captured
+        -- state.activeSlot from. The raw native slot can be a Wishlist index
+        -- and is not compared. state.activeSlot stays the destination; a
+        -- different current selection refuses and never retargets it.
         local slots=Adapter and Adapter.Slots and Adapter.Slots()
-        if not slots or tonumber(slots.activeSlot or 0)~=state.activeSlot then
+        if type(slots)~="table" or slots.activeKnown==false then
+            RolePicker.Message("Loadout data is not available right now. Nothing was confirmed or assigned; wait for it to load, then confirm again.")
+            return false
+        end
+        if (wishlistController.SelectedSavedBuild(slots) or 0)~=state.activeSlot then
             RolePicker.Message("The active loadout changed. Cancel and select the intended loadout again.")
             return false
         end
@@ -648,6 +667,48 @@ function M.ResolveAndAssignWishlist(candidate, activeSlot)
     if status~="actionable" then return false,why end
     if tonumber(activeSlot)==0 then return Adapter.SetFirstRunWishlist(resolved.slot,resolved) end
     return Adapter.SetLoadoutWishlist(activeSlot,resolved.slot,resolved)
+end
+
+-- The editor's Wishlist candidates (when nothing is tracked) assign the clicked
+-- one to the active Saved Build. With Auto selected and a numbered Saved Build
+-- with Echoes as that target, the Journal's Auto-ON confirmation names it
+-- first (UX-05); `perform` (the click's own role choice and assignment) runs
+-- only after Assign, and only while the active Saved Build is still the one
+-- named. Cancel changes nothing; Auto is never changed here. Auto OFF, the
+-- first-run target and an empty or unknown Saved Build keep their behaviour.
+-- Returns what the consent call returned, or what `perform` returned.
+function M.ConfirmCandidateAssignment(candidate, perform)
+    local adapter = Adapter or Nexus.GameAdapter
+    local slots = adapter and adapter.Slots and adapter.Slots()
+    local active = type(slots) == "table" and tonumber(slots.activeSlot) or 0
+    local maxSlots = type(slots) == "table" and (tonumber(slots.maxSlots) or 5) or 5
+    local row = type(slots) == "table" and type(slots.bySlot) == "table" and slots.bySlot[active] or nil
+    local numbered = active >= 1 and active <= maxSlots and type(row) == "table"
+        and type(row.echoes) == "table" and #row.echoes > 0
+    if not numbered then return perform() end
+    local journal = Nexus.JournalTab
+    if not (journal and type(journal.AssignWithConsent) == "function") then
+        local stats = type(Nexus.RecomputeStats) == "function" and Nexus.RecomputeStats() or nil
+        if type(stats) == "table" and stats.autoEnabled == true then
+            print("|cffff6060Nexus:|r Nothing was assigned: Auto is ON and the confirmation that names its "
+                .. "consequence could not be shown. Turn Auto OFF to assign, or try again later.")
+            return nil, "consent_unavailable"
+        end
+        return perform()
+    end
+    local name = DisplayUntrusted(candidate and candidate.name, 1024, false)
+    if not name or name == "" then name = "Slot " .. tostring(candidate and candidate.slot or "?") end
+    local label = DisplayUntrusted(row.name, 1024, false)
+    if not label or label == "" then label = tostring(active) end
+    return journal.AssignWithConsent(name, "Saved Build '" .. label .. "'", true, function()
+        local now = adapter and adapter.Slots and adapter.Slots()
+        if type(now) ~= "table" or tonumber(now.activeSlot) ~= active then
+            print("|cffff6060Nexus:|r Nothing was assigned: the active Saved Build changed after you were "
+                .. "asked. Choose the Wishlist again.")
+            return
+        end
+        return perform()
+    end)
 end
 
 function M.ImportEBH1String(text, chosenName)
@@ -878,7 +939,9 @@ end
 
 function M.Show()
     local slots=Adapter and Adapter.Slots and Adapter.Slots()
-    local active=slots and tonumber(slots.activeSlot) or 0
+    -- The selected Saved Build, never a native Wishlist index: an association
+    -- stored under one stays stored but is not opened as a loadout here.
+    local active=wishlistController.SelectedSavedBuild(slots) or 0
     if active>0 and Adapter.GetLoadoutWishlistState then
         local candidate,status=Adapter.GetLoadoutWishlistState(active)
         if status=="evidence-pending" and candidate then return M.OpenForWishlist(candidate,active) end

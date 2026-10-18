@@ -41,8 +41,15 @@ local function saved(context)
 end
 local function pick(name,slot,context)
  local p=open()
- local r=assert(row(p,name),'actual picker has '..name)
- r.nameButton:Click()
+ local r=row(p,name)
+ if r then r.nameButton:Click()
+ else
+  -- Already the selection: the selector names it and the list leaves it
+  -- out, so there is nothing to pick again. The stored checks below hold.
+  assert(A.AssignedWishlist().name==name and NexusActiveWishlistSelector.text:GetText():find(name,1,true),
+   'actual picker has '..name..' or it is the selection the selector names')
+  NexusActiveWishlistSelector:Click()
+ end
  local a,record=A.AssignedWishlist(),saved(context)
  print('EQUAL_CONTENT_PICK','context',context,'clicked',name,'assigned',a.name,'savedSlot',record and record.slot,'savedName',record and record.name)
  assert(not p:IsShown(),'successful selection closes the picker')
@@ -136,6 +143,10 @@ for _,context in ipairs({2,0})do
  -- The same, with exactly one equal-content Wishlist elsewhere and under the
  -- clicked name: still refused, never redirected by contents or name.
  server({[101]={'Plan A',variant(2)},[102]={'Plan B',rolled},[103]={'Plan C',variant(3)}})
+ -- The stored Plan C contents now exist only in Plan B, so the resolver
+ -- follows to it and the selector names Plan B; pick Plan C, as the cases
+ -- below do, so the Plan B row is offered.
+ pick('Plan C',103,context)
  p,r=staleRow('Plan B',{[101]={'Plan A',variant(2)},[102]={'Plan B',variant(1)},[103]={'Plan C',variant(3)},[104]={'Plan B',rolled}})
  refused(p,r,context,'wishlist changed; refresh and try again','changed clicked slot, one same-name match elsewhere, context '..context)
  -- The clicked slot keeps its contents under a new name: it is still the

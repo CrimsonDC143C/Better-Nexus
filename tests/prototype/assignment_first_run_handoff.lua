@@ -34,7 +34,14 @@ local function select(name)
    r.nameButton:Click();return
   end
  end
- error('actual selection row missing: '..name)
+ -- Already the selection: the selector names it and the picker does not
+ -- offer it again. Repeat it through the adapter call a picker row makes.
+ assert(A.AssignedWishlist().name==name and NexusActiveWishlistSelector.text:GetText():find(name,1,true),
+  'actual selection row missing: '..name)
+ NexusActiveWishlistSelector:Click()
+ local candidate
+ for _,c in ipairs(A.GetWishlistCandidates())do if c.name==name and c.slot then candidate=c end end
+ assert(candidate and A.SetFirstRunWishlist(candidate.slot,candidate),'repeated selection of '..name)
 end
 local identity=original.assignmentId
 for _,name in ipairs({'Second plan','First plan','First plan','Second plan'})do
@@ -77,4 +84,4 @@ for _,method in ipairs({'selected-source','identity'})do
  end
 end
 assert(#H.actions==0,'all companion cases remain local with no gameplay or upload')
-print('PASS actual repeated/different picker changes; complete matching handoff; selected-source and identity setters; unrelated/legacy/nil/false/no-handoff guards')
+print('PASS actual different picker changes and a repeated selection; complete matching handoff; selected-source and identity setters; unrelated/legacy/nil/false/no-handoff guards')

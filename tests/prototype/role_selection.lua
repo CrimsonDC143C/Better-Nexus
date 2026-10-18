@@ -42,12 +42,17 @@ local function roles(es)
  elseif e.locked==false then ordinary=ordinary+e.stacks else return -1,-1 end end
  return ordinary,locked
 end
+-- M3: the editor's primary action is labelled by its effect (Save & assign
+-- or Save changes; Create & assign or Create unassigned); legacy labels are
+-- still found. Assigning labels come first: they are the primary when shown.
 local function clickSave()
+ for _,label in ipairs({'Save & assign','Save changes','Create & assign','Create unassigned','Save Wishlist','Create Wishlist'})do
  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible()
-  and (f:GetText()=='Save Wishlist' or f:GetText()=='Create Wishlist')then
+  and f:GetText()==label then
   local before=#H.actions;f:Click();H.AcceptPopup()
   return #H.actions==before+1 and H.actions[#H.actions][1]=='upload' and not Editor.IsApplyPending()
  end end
+ end
  error('actual editor Save button not found')
 end
 local p=assert(plan())

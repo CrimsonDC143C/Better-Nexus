@@ -20,7 +20,7 @@ unknown or future saved value.
 
 | Style | Status | Default palette |
 | --- | --- | --- |
-| Nexus Vista | Default for a player who never chose. A deep, quiet backdrop with a soft accent edge and glow. | Nexus Sapphire |
+| Nexus Vista | Default for a player who never chose. A deep, quiet backdrop with a soft accent edge and glow. | Nexus Amethyst |
 | Nexus Slate | The earlier shared dark style of the imported 1.19.3 source and test.9094. Its colours and shapes use exactly the test.9094 literals. An explicit Slate choice stays Slate. | Nexus Graphite |
 
 One difference from test.9094 applies to every style, Slate included: the Orb
@@ -42,6 +42,17 @@ Six separate named palettes, each with a hue label shown beside its name:
 | Nexus Ember | orange |
 | Nexus Auric | gold |
 | Nexus Graphite | gray (exactly the test.9094 accent set) |
+
+The colour menu shows the style's own palette once, as **Default (name,
+hue)**, for example "Default (Nexus Amethyst, purple)" under Nexus Vista.
+A palette that paints the same colours as the style's own (compared by its
+border, window border, hover, accent and disabled-border colours, not by
+name) is not listed again; every other palette keeps its row. Default is
+checked when no colour is saved and when the saved palette paints those same
+colours; a saved colour this build does not know checks nothing and is named
+as kept. Opening the menu writes nothing: a saved explicit palette, including
+one equal to the default, stays saved and keeps applying when the style
+changes. Choosing Default clears the saved colour.
 
 Styling keeps native-looking controls without the bright red stock 3.3.5
 `UIPanelButton` artwork.

@@ -3,7 +3,34 @@ Nexus = Nexus or {}
 local M = { VERSION = 1 }
 Nexus.OverwriteWarning = M
 local frame, active, onboardingOutcome
-local TEXT = "Auto can overwrite your active game Saved Build. It may replace Echoes you value, including Echoes obtained with Orbs. Nexus cannot undo that save or recover spent Orbs.\n\nAfter a finished run at level 80, changing the assignment or saving edits to its assigned Wishlist can cause replacement without a new run.\n\nChoose No to keep Auto OFF. Opening this warning does not enable Auto."
+local TEXT_HEAD = "Auto can overwrite your active game Saved Build. It may replace Echoes you value, including Echoes obtained with Orbs. Nexus cannot undo that save or recover spent Orbs.\n\nAfter a finished run at level 80, changing the assignment or saving edits to its assigned Wishlist can cause replacement without a new run.\n\n"
+local TEXT_TAIL = "Choose No to keep Auto OFF. Opening this warning does not enable Auto."
+local TEXT = TEXT_HEAD .. TEXT_TAIL
+
+-- The Auto warning (kind "auto") also lists what Auto may do, from the
+-- current permissions (Readout.AutomationScopeLines, read only), and what it
+-- does to tomes (Readout.TOME_PARAGRAPH), before the closing choice. The
+-- first-launch warning keeps TEXT. Reading changes nothing.
+local function BodyText(kind)
+    local readout = Nexus.Readout
+    if kind ~= "auto" or not (readout and type(readout.AutomationScopeLines) == "function") then return TEXT end
+    local store, internals = Nexus.Store, Nexus.MainInternals
+    local okSettings, settings = false, nil
+    if store and type(store.Settings) == "function" then okSettings, settings = pcall(store.Settings) end
+    local okRead, readOnly = false, nil
+    if internals and type(internals.SavedRootReadOnlyV1) == "function" then
+        okRead, readOnly = pcall(internals.SavedRootReadOnlyV1)
+    end
+    local lines = readout.AutomationScopeLines({selected = false, settings = okSettings and settings or nil,
+        readOnly = okRead and readOnly ~= nil and readOnly ~= false})
+    -- Without its first line ("Auto: OFF ..."): this warning is the step that turns it ON.
+    local scope = {}
+    for index = 2, #lines do scope[#scope + 1] = lines[index] end
+    scope[#scope + 1] = "Current values: ... menu on the Nexus panel, Automation settings."
+    return TEXT_HEAD .. table.concat(scope, "\n") .. "\n\n"
+        .. (type(readout.TOME_PARAGRAPH) == "string" and (readout.TOME_PARAGRAPH .. "\n\n") or "")
+        .. TEXT_TAIL
+end
 
 local function CurrentOwner()
     local store = Nexus.Store
@@ -125,14 +152,14 @@ local function EnsureFrame()
     local heading = frame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge")
     heading:SetPoint("TOPLEFT",24,-22); heading:SetWidth(472)
     heading:SetJustifyH("LEFT"); heading:SetText("Saved Build overwrite warning")
-    local scroll = CreateFrame("ScrollFrame",nil,frame,"UIPanelScrollFrameTemplate")
+    local scroll = CreateFrame("ScrollFrame","NexusOverwriteWarningScroll",frame,"UIPanelScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT",24,-58); scroll:SetSize(446,230)
     local content = CreateFrame("Frame",nil,scroll); content:SetWidth(446)
     scroll:SetScrollChild(content)
     local body = content:CreateFontString(nil,"OVERLAY","GameFontHighlight")
     body:SetPoint("TOPLEFT"); body:SetWidth(446); body:SetJustifyH("LEFT")
     body:SetText(TEXT); body:SetHeight(math.max(220,body:GetStringHeight()))
-    content:SetHeight(body:GetHeight()); frame.body = body; frame.scroll = scroll
+    content:SetHeight(body:GetHeight()); frame.body = body; frame.scroll = scroll; frame.content = content
     frame.suppress = CreateFrame("CheckButton",nil,frame,"UICheckButtonTemplate")
     frame.suppress:SetSize(24,24); frame.suppress:SetPoint("TOPLEFT",24,-298)
     local label = frame:CreateFontString(nil,"OVERLAY","GameFontHighlight")
@@ -172,6 +199,11 @@ local function Show(kind, owner, accept)
     if active then return false end
     EnsureFrame()
     active = {kind=kind,owner=owner,accept=accept,database=NexusDB,ownerKey=CurrentOwner()}
+    -- This kind's text, measured again for the scroll area (text only).
+    local body = frame.body
+    body:SetText(BodyText(kind)); body:SetHeight(0)
+    body:SetHeight(math.max(220, tonumber(body:GetStringHeight()) or 0))
+    frame.content:SetHeight(body:GetHeight())
     frame.suppress:SetChecked(false); frame.lastCountdown = nil
     frame.yes:Disable(); frame.no:Disable(); frame.suppress:Disable()
     frame.suppress:EnableMouse(false); frame.scroll:SetVerticalScroll(0)
@@ -200,5 +232,10 @@ function M.CancelAuto(owner)
     if active and active.kind == "auto" and active.owner == owner then Finish(false,true); return true end
     return false
 end
+
+-- Read-only: whether a warning is open and waiting for its answer now. The
+-- informational setup replay waits for that answer instead of opening over
+-- it; asking changes nothing.
+function M.IsOpen() return active ~= nil end
 
 return M

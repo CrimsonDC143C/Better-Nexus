@@ -1,7 +1,8 @@
 -- Nexus: ui/JournalTab.lua
 -- A "Nexus Progress" tab (formerly "Nexus Advisor") inside ProjectEbonhold's
--- Echo Journal: a read-only Build Progress summary first, then the plain text
--- sections supplied by an injected dataProvider callback behind Show details.
+-- Echo Journal: a read-only Build Progress summary first, then the sections
+-- supplied by an injected dataProvider callback behind Show details: plain
+-- text, or icon rows where a section supplies structured tomeRows.
 -- Structures relied on (captured live against this exact client):
 --   frame  ProjectEbonholdEchoJournal
 --   tabs   ProjectEbonholdEchoJournalTab1..N (CharacterFrameTabButton
@@ -63,13 +64,27 @@ local OFF_UNAVAILABLE = "Off Wishlist: unavailable. The list of these families c
 local NEUTRAL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 local ROW_H, TILE = 26, 24
 local detailsShown = false
+-- Set by M.Invalidate after a semantic change; cleared by every page refresh.
+local refreshPending = false
 local detailsButton, buildsButton, introHover, countsHover
 local rowPool, rowsUsed = {}, 0
+-- Tome state rows behind Show details have their own pool, so their theme
+-- colours and tooltip entries never carry over into the Missing rows.
+local tomePool, tomesUsed = {}, 0
+local TOME_STATUS_W = 120
+-- The provider's request section. Its title does not begin with "Pending",
+-- which Summarize reads as the Wishlist's missing-family list.
+local TOME_REQUESTS = "Tome requests awaiting confirmation"
+local PENDING_BADGE = { enable = "Enable pending", disable = "Disable pending" }
+local TOME_SCOPE = "Observed when this page was refreshed; server state and freshness are unverified."
+local TOME_STALE = "This reading may be stale; Tome state coverage gives the reason."
 local DeselectOurTab
 -- Assignment only records the target. The automatic save (Auto ON, autoSave,
 -- Ratchet.Dominates) is what may replace the active Saved Build. A changed
--- assignment marks the projection dirty, so at level 80 with a finished run
--- the save check runs again at once against the new Wishlist.
+-- assignment marks the adapter's data dirty (MarkWishlistProjectionDirty);
+-- Auto's next update step (AutomationRuntime RunUpdate -> StepSave) then
+-- checks a finished level-80 run not yet saved this visit against the newly
+-- assigned Wishlist. M4 (FN7): the copy states that trigger, not a latency.
 local ASSIGN_NOTE = "Assigning by itself does not change any Saved Build."
 -- An empty numbered Saved Build holds no Wishlist of its own and refuses an
 -- assignment. The name the Journal shows beside it is the retained first-run
@@ -81,10 +96,85 @@ local EMPTY_SLOT_SELECTOR = "This Saved Build is empty, so no Wishlist can be as
     .. "A name shown here is the first-run Wishlist, not an assignment to this Saved Build. " .. ASSIGN_NOTE
 local AUTO_SAVE_WARNING = "With Auto ON, Nexus may replace the active Saved Build with a finished run that "
     .. "has more overall Wishlist progress, or equal progress after cleanup or an even swap of requested "
-    .. "copies. At level 80 after a finished run, Auto checks again right away when you change the assignment. "
+    .. "copies. At level 80, a changed assignment makes Auto check a finished run it has not saved yet. "
     .. "Saving edits to the assigned Wishlist can also lead to a replacement without a new run."
 local AUTO_SAVE_ORBS = "The replaced build may hold an Echo you value, even one obtained with Orbs: "
     .. "Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged."
+
+-- UX-05: an assignment to a numbered Saved Build while Auto is selected (ON,
+-- also while held) asks first, naming the Wishlist, the target captured when
+-- the player chose it and the conditional replacement (no timing promise).
+-- Cancel changes nothing; nothing here changes Auto. With Auto OFF the choice
+-- assigns at once. Used by the Journal picker and the editor's candidates.
+StaticPopupDialogs = StaticPopupDialogs or {}
+StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"] = {
+    text = "Assign '%s' to %s?\n" .. "Auto is ON. Assigning by itself does not change the Saved Build. But "
+        .. "when it is active and a finished run at level 80 passes Auto's checks, Nexus may replace it with "
+        .. "the run. Cancel changes nothing. To avoid that, choose Cancel, turn Auto OFF, then assign.",
+    button1 = "Assign",
+    button2 = "Cancel",
+    OnAccept = function(_, data)
+        if type(data) == "table" and type(data.assign) == "function" then data.assign() end
+    end,
+    timeout = 0, whileDead = true, hideOnEscape = true,
+}
+
+-- Whether Auto is selected (ON, also while held), from the runtime's
+-- counters (memory only).
+function M.AutoSelected()
+    if type(Nexus.RecomputeStats) ~= "function" then return false end
+    local ok, stats = pcall(Nexus.RecomputeStats)
+    return ok and type(stats) == "table" and stats.autoEnabled == true
+end
+
+-- A Wishlist or Saved Build name as it may be shown in chat or a dialog.
+function M.SafeName(text, fallback)
+    local display = Nexus.Identity and Nexus.Identity.DisplaySafeText
+    local shown = display and display(tostring(text or ""), 1024, false) or nil
+    if type(shown) ~= "string" or shown == "" then shown = tostring(fallback or "") end
+    return shown
+end
+
+local function OwnerKeyNow()
+    local store = Nexus.Store
+    if not (store and type(store.CurrentOwnerKey) == "function") then return nil end
+    local ok, owner = pcall(store.CurrentOwnerKey)
+    return ok and owner or nil
+end
+
+-- One assignment the player chose. `assign` performs it (and every role
+-- choice it starts) for the target captured when the player chose it. A
+-- numbered, non-empty target with Auto selected asks first; the first-run
+-- target has no Saved Build to replace, and an empty one is refused by the
+-- assignment itself. When the confirmation cannot be shown, nothing is
+-- assigned (never assigned unasked while Auto is selected). One accept
+-- performs it once; an accept after the character's saved data changed
+-- assigns nothing. Returns true when it asked, false when it assigned at
+-- once, nil and a reason when it refused.
+function M.AssignWithConsent(wishlistName, targetLabel, numbered, assign)
+    if not numbered or not M.AutoSelected() then
+        assign()
+        return false
+    end
+    if type(StaticPopup_Show) ~= "function" or type(StaticPopupDialogs) ~= "table"
+        or type(StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"]) ~= "table" then
+        print("|cffff6060Nexus:|r Nothing was assigned: Auto is ON and the confirmation that names its "
+            .. "consequence could not be shown. Turn Auto OFF to assign, or try again later.")
+        return nil, "consent_unavailable"
+    end
+    local owner, answered = OwnerKeyNow(), false
+    StaticPopup_Show("NEXUS_ASSIGN_WISHLIST_AUTO_ON", wishlistName, targetLabel, {assign = function()
+        if answered then return end
+        answered = true
+        if OwnerKeyNow() ~= owner then
+            print("|cffff6060Nexus:|r Nothing was assigned: this character's saved data changed after you "
+                .. "were asked. Open the Wishlist chooser again.")
+            return
+        end
+        assign()
+    end})
+    return true
+end
 
 ------------------------------------------------------------------------
 -- Text lines
@@ -186,6 +276,9 @@ local function Summarize(sections)
     else
         s.known, s.title, s.pending, s.off = true, head, pending, off
         s.total, s.represented, s.missing, s.offCount = total, rep, miss, offN
+        -- The one section these Missing rows were validated from (Show
+        -- details draws it without repeating them).
+        s.pendingSection = pendingSec
     end
     return s
 end
@@ -314,49 +407,141 @@ local function RowLeave(self)
     if GameTooltip then GameTooltip:Hide() end
 end
 
+-- A provider string worth showing, or nil.
+local function Filled(value)
+    return type(value) == "string" and value ~= "" and value or nil
+end
+
+local function RequestText(pending)
+    local request = pending == "enable" and "Enable requested"
+        or pending == "disable" and "Disable requested" or "Request direction unknown"
+    return request .. "; awaiting confirmation. A request is not a confirmed change."
+end
+
+-- The complete tome entry: the observation and any request kept apart, the
+-- supplied reason and plan, its Echoes, the raw control ID and where the icon
+-- came from. Only the supplied entry is read.
+local function TomeRowEnter(self)
+    if self.hover then self.hover:Show() end
+    local t = self.tome
+    if not (GameTooltip and type(t) == "table") then return end
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine(t.name, 1, 1, 1, true)
+    local observed = Filled(t.status) or "Unknown"
+    if self.tomeRequest then
+        GameTooltip:AddLine(RequestText(t.pending), 1, 0.82, 0, true)
+        GameTooltip:AddLine("Last observed in the client mirror: " .. observed, 0.82, 0.82, 0.82, true)
+    else
+        GameTooltip:AddLine("Client mirror: " .. observed, 0.82, 0.82, 0.82, true)
+        if t.pending ~= nil then GameTooltip:AddLine(RequestText(t.pending), 1, 0.82, 0, true) end
+    end
+    if Filled(t.reason) then GameTooltip:AddLine(t.reason, 0.82, 0.82, 0.82, true) end
+    if Filled(t.plan) then GameTooltip:AddLine(t.plan, 0.82, 0.82, 0.82, true) end
+    local names = {}
+    if type(t.echoNames) == "table" then
+        for i = 1, #t.echoNames do names[#names + 1] = Filled(t.echoNames[i]) end
+    end
+    if #names > 0 then
+        GameTooltip:AddLine((#names == 1 and "Echo: " or "Echoes: ") .. table.concat(names, ", "),
+            0.82, 0.82, 0.82, true)
+    end
+    if t.leverId ~= nil then GameTooltip:AddLine("Control ID: " .. tostring(t.leverId), 0.6, 0.6, 0.6, true) end
+    local icon = not self.tomeIcon and "No icon was supplied, so a neutral icon is shown."
+        or t.iconSource == "tome spell" and "Icon: the tome's spell icon."
+        or t.iconSource == "representative Echo spell"
+            and "Icon: a member Echo's spell icon; the tome's own icon was unavailable."
+        or "Icon: as supplied; its source was not stated."
+    GameTooltip:AddLine(icon, 0.6, 0.6, 0.6, true)
+    if t.stale == true then GameTooltip:AddLine(TOME_STALE, 1, 0.63, 0.25, true) end
+    GameTooltip:AddLine(TOME_SCOPE, 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+end
+
+-- A section's structured tome rows, or nil so that its text lines are shown:
+-- a plain non-empty sequence whose every entry carries a readable name.
+local function TomeRows(list)
+    if type(list) ~= "table" or #list == 0 then return nil end
+    local count = 0
+    for _ in pairs(list) do count = count + 1 end
+    if count ~= #list then return nil end
+    for i = 1, #list do
+        if type(list[i]) ~= "table" or not Filled(list[i].name) then return nil end
+    end
+    return list
+end
+
+-- One row frame for either pool. A striped row (the tome rows) also gets a
+-- background whose faint shade alternates with its neighbours.
+local function NewRow(statusWidth, striped)
+    local row = CreateFrame("Frame", nil, child)
+    row:SetHeight(ROW_H)
+    row:EnableMouse(true)
+    if striped then
+        row.background = row:CreateTexture(nil, "BACKGROUND")
+        row.background:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.background:SetAllPoints(row)
+    end
+    row.hover = row:CreateTexture(nil, "BACKGROUND")
+    row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.hover:SetAllPoints(row)
+    row.hover:SetVertexColor(0.30, 0.40, 0.52, 0.18)
+    row.separator = row:CreateTexture(nil, "BORDER")
+    row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.separator:SetHeight(1)
+    row.separator:SetPoint("BOTTOMLEFT", 0, 0)
+    row.separator:SetPoint("BOTTOMRIGHT", 0, 0)
+    row.separator:SetVertexColor(0.22, 0.24, 0.28, 0.55)
+    row.tile = row:CreateTexture(nil, "ARTWORK")
+    row.tile:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.tile:SetSize(TILE, TILE)
+    row.tile:SetPoint("LEFT", 2, 0)
+    row.tile:SetVertexColor(0.08, 0.10, 0.13, 0.95)
+    row.icon = row:CreateTexture(nil, "OVERLAY")
+    row.icon:SetSize(TILE - 4, TILE - 4)
+    row.icon:SetPoint("CENTER", row.tile, "CENTER", 0, 0)
+    row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    row.status = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.status:SetPoint("RIGHT", -4, 0)
+    row.status:SetWidth(statusWidth)
+    row.status:SetJustifyH("RIGHT")
+    row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    row.label:SetPoint("LEFT", row.tile, "RIGHT", 6, 0)
+    row.label:SetPoint("RIGHT", row.status, "LEFT", -6, 0)
+    row.label:SetJustifyH("LEFT")
+    -- Both texts keep one line at the row's height, so neither can grow
+    -- into the next row; the row tooltip has the complete name.
+    if Nexus.LayoutMetrics then
+        pcall(Nexus.LayoutMetrics.OneLineLabel, row.label, nil, ROW_H - 6)
+        pcall(Nexus.LayoutMetrics.OneLineLabel, row.status, nil, ROW_H - 6)
+    end
+    return row
+end
+
 local function AcquireRow()
     rowsUsed = rowsUsed + 1
     local row = rowPool[rowsUsed]
     if not row then
-        row = CreateFrame("Frame", nil, child)
-        row:SetHeight(ROW_H)
-        row:EnableMouse(true)
-        row.hover = row:CreateTexture(nil, "BACKGROUND")
-        row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.hover:SetAllPoints(row)
-        row.hover:SetVertexColor(0.30, 0.40, 0.52, 0.18)
-        row.separator = row:CreateTexture(nil, "BORDER")
-        row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.separator:SetHeight(1)
-        row.separator:SetPoint("BOTTOMLEFT", 0, 0)
-        row.separator:SetPoint("BOTTOMRIGHT", 0, 0)
-        row.separator:SetVertexColor(0.22, 0.24, 0.28, 0.55)
-        row.tile = row:CreateTexture(nil, "ARTWORK")
-        row.tile:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.tile:SetSize(TILE, TILE)
-        row.tile:SetPoint("LEFT", 2, 0)
-        row.tile:SetVertexColor(0.08, 0.10, 0.13, 0.95)
-        row.icon = row:CreateTexture(nil, "OVERLAY")
-        row.icon:SetSize(TILE - 4, TILE - 4)
-        row.icon:SetPoint("CENTER", row.tile, "CENTER", 0, 0)
-        row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-        row.status = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        row.status:SetPoint("RIGHT", -4, 0)
-        row.status:SetWidth(78)
-        row.status:SetJustifyH("RIGHT")
-        row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.label:SetPoint("LEFT", row.tile, "RIGHT", 6, 0)
-        row.label:SetPoint("RIGHT", row.status, "LEFT", -6, 0)
-        row.label:SetJustifyH("LEFT")
-        -- Both texts keep one line at the row's height, so neither can grow
-        -- into the next row; the row tooltip has the complete name.
-        if Nexus.LayoutMetrics then
-            pcall(Nexus.LayoutMetrics.OneLineLabel, row.label, nil, ROW_H - 6)
-            pcall(Nexus.LayoutMetrics.OneLineLabel, row.status, nil, ROW_H - 6)
-        end
+        row = NewRow(78)
         row:SetScript("OnEnter", RowEnter)
         row:SetScript("OnLeave", RowLeave)
         rowPool[rowsUsed] = row
+    end
+    row.hover:Hide()
+    row:Show()
+    return row
+end
+
+local function AcquireTomeRow()
+    tomesUsed = tomesUsed + 1
+    local row = tomePool[tomesUsed]
+    if not row then
+        row = NewRow(TOME_STATUS_W, true)
+        -- Names take the style's readable text colour; each badge's role is
+        -- set per entry. The theme repaints both when either choice changes.
+        if Nexus.Theme then pcall(Nexus.Theme.StyleLabel, row.label, "text") end
+        row:SetScript("OnEnter", TomeRowEnter)
+        row:SetScript("OnLeave", RowLeave)
+        tomePool[tomesUsed] = row
     end
     row.hover:Hide()
     row:Show()
@@ -413,8 +598,9 @@ local function PageButton(kind)
         b:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
             GameTooltip:AddLine(detailsShown and "Hide details" or "Show details", 1, 1, 1)
-            GameTooltip:AddLine("The full page notes and every section as received, unchanged: target, pending, "
-                .. "extra copies, Echo availability controls, notes, estimate and version.", 0.82, 0.82, 0.82, true)
+            GameTooltip:AddLine("The full page notes and every section as received: target, pending, "
+                .. "extra copies, tome states and their coverage, notes, estimate and version. Tome states "
+                .. "are listed as rows; hover a row for its complete entry.", 0.82, 0.82, 0.82, true)
             GameTooltip:Show()
         end)
         b:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -444,7 +630,27 @@ local function DoRefresh()
         if okP and type(res) == "table" then data = res elseif not okP then failed = true end
     end
 
-    linesUsed, rowsUsed = 0, 0
+    -- Pooled family and tome rows may be rebound below to other entries, and
+    -- the counts hover's off-Wishlist note may change; a tooltip one of them
+    -- owns would keep describing the old entry. The static intro and any
+    -- other owner's tooltip stay.
+    if GameTooltip and type(GameTooltip.GetOwner) == "function" then
+        local okOwner, owner = pcall(GameTooltip.GetOwner, GameTooltip)
+        if okOwner and owner ~= nil then
+            local owned = countsHover ~= nil and owner == countsHover
+            for i = 1, #rowPool do
+                if owned then break end
+                owned = rowPool[i] == owner
+            end
+            for i = 1, #tomePool do
+                if owned then break end
+                owned = tomePool[i] == owner
+            end
+            if owned then GameTooltip:Hide() end
+        end
+    end
+
+    linesUsed, rowsUsed, tomesUsed = 0, 0, 0
     local width = math.floor((scroll and scroll:GetWidth()) or 0)
     if width < 100 then width = 292 end
     width = width - 12
@@ -489,6 +695,36 @@ local function DoRefresh()
         row.tipRaw = raw ~= name and raw or nil
         row.tipIcon = not icon and "No single Echo family has exactly this name, so a neutral icon is shown."
             or nil
+        cy = cy - ROW_H
+    end
+
+    -- One tome row from the supplied entry only: its icon, name and
+    -- observation, or in the request section the request direction. Nothing
+    -- here reads the catalog or the game; the tooltip has the full entry.
+    local function AddTomeRow(t, index, requests)
+        local row = AcquireTomeRow()
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", child, "TOPLEFT", 14, cy)
+        row:SetWidth(width - 8)
+        local icon = t.icon
+        if not ((type(icon) == "string" and icon ~= "") or type(icon) == "number") then icon = nil end
+        row.icon:SetTexture(icon or NEUTRAL_ICON)
+        row.icon:SetAlpha(icon and 1 or 0.5)
+        row.background:SetVertexColor(0.55, 0.60, 0.68, index % 2 == 1 and 0.08 or 0.03)
+        local request = requests and t.pending ~= nil
+        row.label:SetText(t.name)
+        row.status:SetText(request and (PENDING_BADGE[t.pending] or "Request pending")
+            or Filled(t.status) or "Unknown")
+        -- Requests and clean observations take the palette accent; mixed,
+        -- unknown, undiscovered and possibly stale readings are muted.
+        local clean = t.stale ~= true and (t.observed == "disabled"
+            or (t.observed == "enabled" and t.known == true))
+        local role = (request or clean) and "accent" or "muted"
+        if row.badgeRole ~= role and Nexus.Theme then
+            row.badgeRole = role
+            pcall(Nexus.Theme.StyleLabel, row.status, role)
+        end
+        row.tome, row.tomeRequest, row.tomeIcon = t, request, icon ~= nil
         cy = cy - ROW_H
     end
 
@@ -590,10 +826,25 @@ local function DoRefresh()
                 local sec = sections[i]
                 if type(sec) == "table" then
                     AddLine(tostring(sec.title or ""), "GameFontNormalSmall")
-                    local lines = sec.lines
-                    if type(lines) == "table" then
-                        for j = 1, #lines do
-                            AddLine(tostring(lines[j] or ""), nil, 8)
+                    -- Structured tome rows stand in for the same entries'
+                    -- text lines; every other section keeps its lines.
+                    local tomes = TomeRows(sec.tomeRows)
+                    if tomes then
+                        local requests = sec.title == TOME_REQUESTS
+                        for j = 1, #tomes do AddTomeRow(tomes[j], j, requests) end
+                    elseif s.known and sec == s.pendingSection and #s.pending > 0 then
+                        -- This exact section validated the summary, so its
+                        -- families are already the Missing rows above; they
+                        -- are not listed twice. Any other section, or a
+                        -- Pending list the summary did not validate, keeps
+                        -- its lines as received. The data is not changed.
+                        AddLine("|cff8a8a8aListed above under Missing (" .. #s.pending .. ").|r", nil, 8)
+                    else
+                        local lines = sec.lines
+                        if type(lines) == "table" then
+                            for j = 1, #lines do
+                                AddLine(tostring(lines[j] or ""), nil, 8)
+                            end
                         end
                     end
                     cy = cy - 4
@@ -609,13 +860,28 @@ local function DoRefresh()
 
     for i = linesUsed + 1, #linePool do linePool[i]:Hide() end
     for i = rowsUsed + 1, #rowPool do rowPool[i]:Hide() end
+    for i = tomesUsed + 1, #tomePool do
+        tomePool[i]:Hide()
+        tomePool[i].tome = nil
+    end
     child:SetWidth(width + 12)
     child:SetHeight(-cy + 8)
 end
 
 function M.Refresh()
     if not (installed and panel and panel:IsShown()) then return end
+    -- Consumed first: a change marked during this refresh is kept for the next.
+    refreshPending = false
     pcall(DoRefresh)
+end
+
+-- A semantic change (GameAdapter) marks the page. Only a bit: no provider,
+-- adapter or service read and no frame work here. The association scanner
+-- refreshes a visible page with its details open on its next beat; a hidden
+-- or collapsed page reads nothing until its normal refresh on opening. A
+-- newer client mirror shown this way is still no server acknowledgment.
+function M.Invalidate()
+    refreshPending = true
 end
 
 
@@ -968,26 +1234,43 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
         wishlistPicker.title:SetPoint("TOPLEFT", 10, -8)
         wishlistPicker.title:SetText("Wishlists")
     end
+    -- The title names the target this picker's clicks act on (the context
+    -- captured with it), not only that these are Wishlists.
+    wishlistPicker.title:SetText(emptySlot and "Empty Saved Build: assigning is refused"
+        or ((tonumber(active) or 0) < 1 and "Assign to: first-run target")
+        or ("Assign to: " .. ShortName(tostring(loadoutName or ""), 24)))
     for i=1,#wishlistPickerRows do wishlistPickerRows[i]:Hide() end
     if wishlistPicker.emptyRow then wishlistPicker.emptyRow:Hide() end
     if wishlistPicker.clearRow then wishlistPicker.clearRow:Hide() end
     wishlistPicker:ClearAllPoints()
     wishlistPicker:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
+    -- The selector already names the selected Wishlist, so the list offers
+    -- only the others. Only that one identity (IsAssignedPickerRow) is left
+    -- out: a row with the same name or contents is another Wishlist and stays.
+    -- With no name on the selector the selection stays listed and marked.
+    local shown = wishes
+    if linked and tostring(linked.name or "") ~= "" then
+        shown = {}
+        for i=1,#wishes do
+            if not IsAssignedPickerRow(linked, wishes[i]) then shown[#shown+1] = wishes[i] end
+        end
+    end
     local width, rowH = 245, 24
     wishlistPicker:SetWidth(width)
-    local count = math.max(1, #wishes)
+    local count = math.max(1, #shown)
     wishlistPicker:SetHeight(26 + count * rowH + (linked and 24 or 0) + 6)
 
-    if #wishes == 0 then
+    if #shown == 0 then
         local row = wishlistPicker.emptyRow
         if not row then
             row = wishlistPicker:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
             wishlistPicker.emptyRow = row
         end
-        row:ClearAllPoints(); row:SetPoint("TOPLEFT", 10, -28); row:SetText("No server wishlists found"); row:Show()
+        row:ClearAllPoints(); row:SetPoint("TOPLEFT", 10, -28)
+        row:SetText(#wishes == 0 and "No server wishlists found" or "No other wishlists found"); row:Show()
     else
-        for i=1,#wishes do
-            local c = wishes[i]
+        for i=1,#shown do
+            local c = shown[i]
             local cSlot = c.slot
             local cName = c.name
             local cKey = c.key
@@ -1050,27 +1333,44 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
                 }
             end
             local function AssociateWishlistOnly()
+                local numbered = tonumber(active) and tonumber(active) > 0
+                local shownName = M.SafeName(cName, "Unnamed Wishlist")
+                local target = numbered and ("Saved Build '" .. M.SafeName(loadoutName, tostring(active)) .. "'")
+                    or "the first-run target"
                 if cSnapshot.lockEvidenceStatus=="unavailable" and Nexus.WishlistEditor
                     and Nexus.WishlistEditor.ResolveAndAssignWishlist then
+                    -- A Wishlist without lock evidence: its role choice (the
+                    -- current-lock default or the role picker) and the
+                    -- assignment it ends in wait for the same Auto-ON
+                    -- confirmation; Cancel writes neither.
+                    M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                        HideWishlistPicker()
+                        Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
+                    end)
+                    return
+                end
+                -- The captured target, candidate and empty-slot refusal as
+                -- before; Auto selected asks first (M.AssignWithConsent).
+                M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                    local ok, err
+                    if numbered then
+                        ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
+                    elseif type(A.SetFirstRunWishlist) == "function" then
+                        ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
+                    else
+                        ok, err = false, "first-run association unavailable"
+                    end
+                    if not ok then
+                        print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
+                        return
+                    end
                     HideWishlistPicker()
-                    Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
-                    return
-                end
-                local ok, err
-                if tonumber(active) and tonumber(active) > 0 then
-                    ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
-                elseif type(A.SetFirstRunWishlist) == "function" then
-                    ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
-                else
-                    ok, err = false, "first-run association unavailable"
-                end
-                if not ok then
-                    print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
-                    return
-                end
-                HideWishlistPicker()
-                M.RefreshAssociations()
-                if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    M.RefreshAssociations()
+                    if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    -- A visible confirmation of what changed, and only that.
+                    print("|cff4dff80Nexus:|r '" .. shownName .. "' is now the Wishlist for " .. target
+                        .. ". No Saved Build was changed or activated.")
+                end)
             end
             local function OpenWishlistEditorOnly()
                 HideWishlistPicker()
@@ -1136,7 +1436,7 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
         end
         row:SetFrameLevel(wishlistPicker:GetFrameLevel() + 2)
         row.emptySlot = emptySlot
-        row:ClearAllPoints(); row:SetPoint("TOPLEFT",6,-24-#wishes*rowH); row:SetPoint("RIGHT",-6,0)
+        row:ClearAllPoints(); row:SetPoint("TOPLEFT",6,-24-count*rowH); row:SetPoint("RIGHT",-6,0)
         row:SetScript("OnClick", function()
             if tonumber(active) and tonumber(active) > 0 then A.ClearLoadoutWishlist(active)
             elseif A.ClearFirstRunWishlist then A.ClearFirstRunWishlist() end
@@ -1157,7 +1457,11 @@ local function RefreshAssociationRows()
     local slots = A and A.Slots and A.Slots()
     if not slots then HideRowButtons(); return end
 
-    local active = tonumber(slots.activeSlot) or 0
+    -- The Saved Build this panel targets (GameAdapter.SelectedSavedBuild): the
+    -- native active slot when it is a Saved Build, or the Saved Build Nexus kept
+    -- while a Wishlist is natively active. 0 when there is none, so a Wishlist
+    -- number above the Saved Build range never reaches a callback below.
+    local active = A.SelectedSavedBuild and A.SelectedSavedBuild(slots) or 0
     local maxSlots = tonumber(slots.maxSlots) or 5
     local activeRow = slots.bySlot and slots.bySlot[active]
     local populated = activeRow and type(activeRow.echoes) == "table" and #activeRow.echoes > 0
@@ -1248,6 +1552,12 @@ local function EnsureAssociationScanner()
                 HideRowButtons()
             end
         end)
+        -- At most one coalesced page refresh per beat, and only for a marked
+        -- page that is visible (ancestor-aware) with its details open.
+        if refreshPending and detailsShown and installed and panel then
+            local okVisible, visible = pcall(panel.IsVisible, panel)
+            if okVisible and visible then pcall(M.Refresh) end
+        end
     end)
 end
 
@@ -1472,6 +1782,39 @@ local function EnsureLifecycleHooks()
     hooked = any
 end
 
+-- The live menu-bar button that opens Character Progression -> Echoes, or nil.
+-- Read-only: it finds the button and clicks nothing.
+local function FindEchoesMicroButton()
+    local button = _G["EchoJournalMicroButton"]
+    if button and type(button.Click) == "function" then return button end
+    local function walk(frame, depth)
+        if not frame or depth > 6 then return nil end
+        local name = frame.GetName and frame:GetName() or nil
+        if type(name) == "string" then
+            local lower = string.lower(name)
+            if string.find(lower, "echojournalmicrobutton", 1, true)
+                and type(frame.Click) == "function" then
+                return frame
+            end
+        end
+        local children = { frame.GetChildren and frame:GetChildren() }
+        for i = 1, #children do
+            local found = walk(children[i], depth + 1)
+            if found then return found end
+        end
+        return nil
+    end
+    return walk(_G["UIParent"], 0)
+end
+
+-- Whether the Echoes page can be opened now (read-only). Callers check this
+-- before closing their own window for the route, so a missing button loses
+-- nothing.
+function M.CanOpenBuilds()
+    local ok, button = pcall(FindEchoesMicroButton)
+    return ok and button ~= nil
+end
+
 local function ClickCurrentEchoesMicroButton()
     -- The server update moved Echoes into Character Progression. Calling the
     -- legacy ProjectEbonhold.EchoJournal.Show() still opens the retired
@@ -1510,18 +1853,50 @@ local function ClickCurrentEchoesMicroButton()
     return false
 end
 
-function M.OpenBuilds()
+-- The Wishlist chooser of the attached strip, opened through the selector's
+-- own click handler (the same candidates, target and checks as a player's
+-- click). Opening it assigns nothing; only a row click does. True when the
+-- chooser is open.
+local function OpenChooserNow()
+    local host = associationPanel
+    if not (host and host:IsVisible() and host.selector and host.selector:IsVisible()) then
+        return false
+    end
+    if wishlistPicker and wishlistPicker:IsShown() then return true end
+    local click = host.selector:GetScript("OnClick")
+    if type(click) ~= "function" then return false end
+    click(host.selector)
+    return wishlistPicker ~= nil and wishlistPicker:IsShown()
+end
+
+local CHOOSER_COACH = "The Echoes page is open. Click the Nexus Wishlist selector at its top to choose a "
+    .. "Wishlist; nothing is assigned until you choose one."
+
+-- `openChooser`: also open the Wishlist chooser once the strip is attached
+-- (Assign Wishlist, Set up current build, Help and the editor's Assign now);
+-- when the strip cannot be shown, say what to click instead. Without it the
+-- existing behaviour is unchanged. Returns true when the Echoes page opened.
+-- `beforeOpen` (optional): the caller's own step before the page opens (the
+-- HUD's Assign Wishlist closes its other windows). It runs only when the
+-- game's Character Progression entry is there; otherwise nothing runs and
+-- false, "unavailable" is returned, so the caller says why and loses nothing.
+function M.OpenBuilds(openChooser, beforeOpen)
+    if type(beforeOpen) == "function" then
+        if not M.CanOpenBuilds() then return false, "unavailable" end
+        beforeOpen()
+    end
     EnsureAssociationScanner()
 
     local opened = ClickCurrentEchoesMicroButton()
     if not opened then
         print("|cffff6060Nexus:|r Could not find the server Character Progression button. Open Character Progression → Echoes manually.")
-        return
+        return false
     end
 
+    local chooserPending = openChooser == true
     -- Let the server finish constructing/selecting its new Echoes page before
     -- attaching Nexus beside the live loadout dropdown.
-    local function finish()
+    local function finish(last)
         pcall(function()
             if not installed and pcall(Install) then installed = true end
             if installed then
@@ -1529,13 +1904,33 @@ function M.OpenBuilds()
                 DeselectOurTab(false)
             end
             RefreshAssociationRows()
+            if chooserPending then
+                if OpenChooserNow() then
+                    chooserPending = false
+                elseif last then
+                    chooserPending = false
+                    -- Truthful about the page: "open" only when Nexus sees its
+                    -- strip there. The game's button toggles the page, so one
+                    -- that was already open can close again (native behaviour,
+                    -- not observed offline); then no claim is made.
+                    local strip = associationPanel
+                    local shown = strip and strip.IsVisible and strip:IsVisible()
+                    print("|cffffd200Nexus:|r " .. (shown and CHOOSER_COACH
+                        or ("Nexus could not confirm that the Echoes page is open (if it was already open, "
+                            .. "the game's button may have closed it). Open Character Progression -> Echoes "
+                            .. "and click the Nexus Wishlist selector at its top; nothing is assigned until "
+                            .. "you choose one.")))
+                end
+            end
         end)
     end
-    finish()
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0.10, finish)
-        C_Timer.After(0.35, finish)
+    local timers = C_Timer and C_Timer.After
+    finish(not timers)
+    if timers then
+        C_Timer.After(0.10, function() finish(false) end)
+        C_Timer.After(0.35, function() finish(true) end)
     end
+    return true
 end
 
 function M.DebugSnapshot()

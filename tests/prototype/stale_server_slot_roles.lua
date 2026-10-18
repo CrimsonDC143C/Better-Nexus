@@ -16,8 +16,14 @@ local n=0;local function check(v,m)assert(v,m);n=n+1 end
 local function candidate(slot)for _,c in ipairs(A.GetWishlistCandidates())do if c.slot==(slot or 101)then return c end end end
 local function chooseFirstSix() for i=1,6 do _G['NexusWishlistRolePlus'..i]:Click()end end
 local function uploads() local c=0 for _,a in ipairs(H.actions)do if a[1]=='upload' then c=c+1 end end return c end
+-- M3: the editor's actions are named by their effect; a legacy label also
+-- finds the action with that default intent (new label first, then legacy).
+local LABELS={['Create Wishlist']={'Create & assign','Create unassigned','Create Wishlist'},
+ ['Save Wishlist']={'Save & assign','Save changes','Save Wishlist'}}
 local function frameButton(text)
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==text then return f end end
+ for _,label in ipairs(LABELS[text] or {text})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then return f end end
+ end
  error('visible button absent: '..text)
 end
 local function choices() return #(Nexus.Store.State().wishlistRoleChoices or {}) end

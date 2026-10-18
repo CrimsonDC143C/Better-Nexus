@@ -330,8 +330,8 @@ local function refresh()
         local stage=cv.stage
         frame.cont:SetText(stage=="done" and "Review outcome..."
             or stage=="refused" and "Review check..."
-            or stage=="checking" and "Check progress..." or "Continue...")
-        if cv.eligible==true or stage=="checking" or stage=="ready" or stage=="refused" or stage=="done" then frame.cont:Show()else frame.cont:Hide()end
+            or stage=="checking" and "Check progress..." or (stage=="ready" or cv.eligible==true) and "Continue..." or "Why blocked...")
+        if cv.explanation==true or cv.eligible==true or stage=="checking" or stage=="ready" or stage=="refused" or stage=="done" then frame.cont:Show()else frame.cont:Hide()end
     end
     if advanced then frame.advanced:Show()else frame.advanced:Hide()end
     selected(frame.advancedToggle,advanced)
@@ -452,7 +452,7 @@ local function ensure()
         frame.targetsHit=Nexus.LayoutMetrics.FullTextTooltip(frame.targets,frame)
         frame.planHit=Nexus.LayoutMetrics.FullTextTooltip(frame.plan,frame)
     end
-    -- 035: only while an unresolved action can be continued, or a check is in progress, or its result is shown.
+    -- The same read-only explanation also serves ineligible restored receipts.
     frame.cont=button(frame,470,-364,130,"Continue...",function()UI.ShowContinue()end)
     frame.cont:Hide()
     frame.closeNotice=text(frame,20,-393,580,20,CLOSE_NOTICE)
@@ -888,6 +888,8 @@ local contFrame
 local function contRefresh()
     if not contFrame or not contFrame:IsShown()then return end
     local v=Nexus.OrbRuntime.ContinueView()
+    contFrame.title:SetText((v.eligible==true or v.stage=="checking" or v.stage=="ready")
+        and "Continue with an unconfirmed Orb outcome" or "Unresolved Orb action")
     contFrame.token=v.token
     contFrame.body:SetText(v.text or "")
     local idle=v.stage=="idle" or v.stage=="refused"
@@ -911,7 +913,7 @@ local function ensureContinue()
     f:SetScript("OnDragStop",function(self)self:StopMovingOrSizing()end)
     f:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",edgeSize=14,insets={left=4,right=4,top=4,bottom=4}})
     f:SetBackdropColor(.035,.04,.05,1)
-    text(f,20,-14,540,22,"Continue with an unconfirmed Orb outcome")
+    f.title=text(f,20,-14,540,22,"Unresolved Orb action")
     f.state=text(f,20,-40,540,20)
     f.body=text(f,20,-66,540,170)
     f.notice=text(f,20,-240,540,22)
@@ -948,6 +950,14 @@ local function ensureContinue()
 end
 function UI.ShowContinue()
     ensureContinue();contFrame:Show();contRefresh();return contFrame
+end
+do
+    local refreshPanel=UI.Refresh
+    function UI.Refresh(...)
+        local perf=Nexus.Performance
+        if perf and type(perf.MeasureDiagnostic)=="function" then return perf.MeasureDiagnostic("orb.panel",refreshPanel,...) end
+        return refreshPanel(...)
+    end
 end
 -- Opens the window on its run page.
 function UI.Show()ensure();showPage("run");frame:Show();UI.Refresh();return frame end

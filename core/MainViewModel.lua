@@ -340,6 +340,9 @@ function ViewModel.New(options)
             wishlistName=wishlist and ((wishlist.name ~= "" and wishlist.name)
                 or "(unnamed)") or nil,
             activeSlot=activeRow and tonumber(activeRow.slot) or 0,
+            -- M4 (UX-04): the same verified active row's name, projected for
+            -- the shared destination presentation; nothing new is read.
+            activeSlotName=activeRow and activeRow.name or nil,
             matchedBuildId=input.matchedBuildId,previewBuildId=input.previewBuildId,
             dpsEchoes=Copy(echoes),
             isCommunityPreview=input.previewBuildId and true or false,

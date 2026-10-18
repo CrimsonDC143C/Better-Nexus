@@ -32,10 +32,19 @@ local checks=0
 local function check(v,m)assert(v,m);checks=checks+1 end
 local footer,save,area
 for _,f in ipairs(frame.regions)do
- if f:GetText():find('Rolled copies:',1,true)then footer=f end
+ if f:GetText():find('Planned rolled copies:',1,true)then footer=f end
+end
+-- M3: the Save control is labelled by its effect (Create & assign, else Create
+-- unassigned; legacy Create Wishlist). It is created before the Create
+-- unassigned alternative beside it, so the first match of the first label
+-- present is the apply button.
+for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+ for _,f in ipairs(frame.children)do
+  if f.kind=='Button' and f:GetText()==label then save=f;break end
+ end
+ if save then break end
 end
 for _,f in ipairs(frame.children)do
- if f.kind=='Button' and f:GetText()=='Create Wishlist' then save=f end
  if f.scripts.OnMouseWheel and f.width==332 then area=f end
 end
 assert(footer and save and area,'actual Selected Echoes footer/list/Save control')
@@ -68,12 +77,12 @@ local function lines(first,second)
   check(#ascii*6<=footer:GetWidth(),'summary line fits fixed footer width')
  end
 end
-lines('Rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
+lines('Planned rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
 H.locked={{spellId=200080,stacks=5},{spellId=200081,stacks=1}}
 H.Notify();A.Poll();r.Refresh()
 -- Two occupied locked records (holding 5 and 1 copies) occupy two of the six
 -- slots: "Currently locked" counts records, not the six held copies.
-lines('Currently locked: 2/6  \226\128\162  Rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
+lines('Currently locked: 2/6  \226\128\162  Planned rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
 H.locked={};H.Notify();A.Poll();r.Refresh()
 local function visible()
  local t={};for _,row in ipairs(area.children)do
@@ -95,12 +104,12 @@ c.SetPickOffset(999);r.Refresh();v=visible()
 check(#v==17 and v[17]==290085,'oversized offset clamps in actual renderer')
 c.SetSearch('Echo 085');r.Refresh();v=visible()
 check(#v==1 and v[1]==290085,'search shrinks scrolled list and clamps to top')
-lines('Rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
+lines('Planned rolled copies: 79/79','Locked targets: 6/6  \226\128\162  85 Echo/quality entries')
 c.SetSearch('');r.Refresh()
 c.BeginNewWishlist();c.LoadPendingEchoes({entries[1]});r.Refresh();v=visible()
 check(#v==1 and v[1]==290001,'smaller draft clamps to its first entry')
-lines('Rolled copies: 1/79','Locked targets: 0/6  \226\128\162  1 Echo/quality entries')
+lines('Planned rolled copies: 1/79','Locked targets: 0/6  \226\128\162  1 Echo/quality entries')
 c.BeginNewWishlist();r.Refresh()
 check(#visible()==0,'empty draft has no stranded rows')
-lines('Rolled copies: 0/79','Locked targets: 0/6  \226\128\162  0 Echo/quality entries')
+lines('Planned rolled copies: 0/79','Locked targets: 0/6  \226\128\162  0 Echo/quality entries')
 print('PASS wishlist_footer_layout checks='..checks)

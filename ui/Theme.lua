@@ -478,6 +478,24 @@ local function DisplayValue(value)
     return (tostring(value):gsub("|", "||"):gsub("%c", " "):sub(1, 32))
 end
 
+-- Every colour a palette paints with (see ButtonState and Paint*).
+local function PaintedColours(palette)
+    return {palette.border, palette.windowBorder, palette.hover, palette.accent,
+        palette.disabledBorder or Dim(palette.border)}
+end
+
+-- Compared by value, not by name: two palettes that paint the same colours
+-- look the same, so the menu offers them as one choice.
+local function SameColours(a, b)
+    local x, y = PaintedColours(a), PaintedColours(b)
+    for i = 1, #x do
+        for j = 1, 3 do
+            if x[i][j] ~= y[i][j] then return false end
+        end
+    end
+    return true
+end
+
 -- What is in effect and why, in words a player can read.
 function T.Current()
     local a = Active()
@@ -563,6 +581,10 @@ T.HELP = "Appearance changes only how Nexus windows look. Style sets the "
 
 -- Items for one flat 3.3.5 EasyMenu. A check mark, not only a colour, marks
 -- the active choice; a saved value this build does not know is named and kept.
+-- The style's own colours and any palette that paints the same colours are one
+-- "Default" row. It is checked for no saved colour and for a saved palette
+-- with those colours; opening the menu never rewrites either. Choosing it
+-- clears the saved colour, as "Style colours" did.
 function T.MenuItems(close)
     local a = Active()
     local function pick(fn, id)
@@ -587,16 +609,18 @@ function T.MenuItems(close)
     items[#items + 1] = {text="Appearance: colour", isTitle=true, notCheckable=true}
     local own = PALETTES[a.style.palette]
     items[#items + 1] = {
-        text="Style colours (" .. own.label .. ", " .. own.hue .. ")",
-        checked=not a.explicitPalette and not a.unknownPalette,
+        text="Default (" .. own.label .. ", " .. own.hue .. ")",
+        checked=not a.unknownPalette and (not a.explicitPalette or SameColours(a.palette, own)),
         func=pick(T.SetPalette, nil),
     }
     for _, palette in ipairs(T.Palettes()) do
-        items[#items + 1] = {
-            text=palette.label .. " (" .. palette.hue .. ")",
-            checked=a.explicitPalette and a.palette == palette,
-            func=pick(T.SetPalette, palette.id),
-        }
+        if not SameColours(palette, own) then
+            items[#items + 1] = {
+                text=palette.label .. " (" .. palette.hue .. ")",
+                checked=a.explicitPalette and a.palette == palette,
+                func=pick(T.SetPalette, palette.id),
+            }
+        end
     end
     if a.unknownPalette then
         items[#items + 1] = {notCheckable=true, disabled=true,

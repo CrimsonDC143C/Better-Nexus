@@ -162,8 +162,11 @@ do
  check(H.actions[takes][1]=='take','fixture: a Take was sent')
  H.Fire('PLAYER_LEAVING_WORLD');H.Board({});H.Notify();H.Advance(.5)
  local g,c=Geo(),Content()
+ -- M3 (UX-09): the waiting line is followed by the pause's plain reason line.
+ local paused=Nexus.Panel._lastModel and Nexus.Panel._lastModel.paused
  check(Same(g,base) and c.head=='Auto ON — paused' and #c.cards==0
-  and c.body=='Waiting for the game to confirm the last Echo action.','loading screen: the pause and the waiting line in the same footprint: ['..c.head..'] ['..c.body..'] '..Show(g))
+  and c.body=='Waiting for the game to confirm the last Echo action.\n'..Plain(Nexus.Readout.AutoHoldNote(paused))
+  and c.body:find('loading screen',1,true)~=nil,'loading screen: the pause and the waiting line in the same footprint: ['..c.head..'] ['..c.body..'] '..Show(g))
  H.Fire('PLAYER_ENTERING_WORLD');H.Advance(6)
  local e,ec=Geo(),Content()
  -- After the entry the hold is the wait for that Select's own result, and the

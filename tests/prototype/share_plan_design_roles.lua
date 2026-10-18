@@ -52,7 +52,11 @@ local function Create(name,ordinary,permanent)
  assert(d.pending==ordinary and d.pendingLock==permanent,name..': editor draft has '..ordinary..' ordinary / '..permanent..' locked')
  local before=#H.actions
  local b
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist' then b=f;break end end
+ -- M3: the Create action is labelled by its effect (new label first, then legacy).
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then b=f;break end end
+  if b then break end
+ end
  assert(b,'the real Create Wishlist button');b:Click();H.AcceptPopup()
  assert(not W.IsApplyPending(),name..': save completes')
  local upload

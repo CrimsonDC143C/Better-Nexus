@@ -4129,6 +4129,32 @@ function DPS.LocalOwnsDpsBucket(bucket)
         and DpsBucket("lk", me) == bucket then
         return true
     end
+    -- A compatibility shim may normalize the realm differently from the
+    -- game's native channel. Keep the current player's verified native row
+    -- from being suppressed by an equivalent peer claim, just as the default
+    -- current-character getter can read that exact row. This is a direct map
+    -- lookup; it does not rekey, promote, or traverse saved DPS records.
+    local nativeSender = type(Identity.NativeChannelSender) == "function"
+        and Identity.NativeChannelSender(me) or nil
+    local nativeOwner = nativeSender
+        and Identity.CanonicalOwnerFromTransport(nativeSender) or nil
+    if not nativeOwner or nativeOwner == playerKey then return false end
+    row = store.dummy and store.dummy[nativeOwner]
+    if type(row) == "table"
+        and DPS.VerifiedOwnerKey(row) == nativeOwner
+        and (tonumber(row.dps) or 0) > 0
+        and DPS.IsDurationEligible("dummy", row.duration)
+        and DpsBucket("dummy", me) == bucket then
+        return true
+    end
+    row = store.lk and store.lk[nativeOwner]
+    if type(row) == "table"
+        and DPS.VerifiedOwnerKey(row) == nativeOwner
+        and (tonumber(row.dps) or 0) > 0
+        and DPS.IsDurationEligible("lk", row.duration)
+        and DpsBucket("lk", me) == bucket then
+        return true
+    end
     return false
 end
 

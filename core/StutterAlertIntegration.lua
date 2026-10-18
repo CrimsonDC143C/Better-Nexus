@@ -37,7 +37,11 @@ local function CorrelationWindow(context)
         windowStart = math.min(windowStart, profilingAt - (profileWindowMs / 1000))
         windowEnd = math.max(windowEnd, profilingAt)
     end
-    return windowStart, windowEnd
+    return windowStart, windowEnd,
+        FiniteNumber(context.hitchStartTime), FiniteNumber(context.hitchEndTime),
+        profilingAt and profileWindowMs and profileWindowMs >= 0
+            and profilingAt - (profileWindowMs / 1000) or nil,
+        profilingAt
 end
 
 local function CopyProviderFields(fields)
@@ -53,15 +57,94 @@ local function CopyProviderFields(fields)
     return copied
 end
 
+local DIAGNOSTIC_NAMES = {}
+for _, name in ipairs({"orb.status","orb.read","orb.panel","echo.reconcile",
+    "hud.prepare","lifecycle.update","sync.update","gameadapter.poll",
+    "dps.update","lifecycle.phase.catalog"}) do DIAGNOSTIC_NAMES[name] = true end
+local DIAGNOSTIC_NUMBERS = {"id","parentId","depth","resetGeneration","clockGeneration",
+    "startedMs","endedMs","elapsedMs","childElapsedMs","residualMs","sessionStart",
+    "sessionEnd","sessionClockGeneration","heapBeforeKB","heapAfterKB","heapNetKB"}
+local DIAGNOSTIC_FLAGS = {"elapsedAvailable","childCoverageAvailable","residualAvailable",
+    "sessionWindowAvailable","heapAvailable","succeeded"}
+local DIAGNOSTIC_REASONS = {available=true,frozen_or_zero_window=true,
+    unavailable_or_changed=true,failed=true}
+local function DiagnosticOverlapUnsafe(performance, windowStart, windowEnd)
+    -- Optional extension lookup and data projection must never invalidate the
+    -- established v1 operations. rawget avoids optional-method metamethods;
+    -- the caller isolates the entire optional call with pcall.
+    local enabledMethod = type(performance)=="table" and rawget(performance,"DiagnosticEnabled") or nil
+    if type(enabledMethod)=="function" and enabledMethod()~=true then
+        return {version=1,enabled=false,spans={},unmatchedSpanCount=0}, {}
+    end
+    local method = type(performance)=="table" and rawget(performance,"SnapshotDiagnostics") or nil
+    if type(method)~="function" then return nil, {} end
+    local diagnostic = method()
+    if type(diagnostic)~="table" or rawget(diagnostic,"version")~=1 then return nil, {} end
+    local selected, unmatched = {}, 0
+    local enabled = rawget(diagnostic,"enabled")==true
+    local retained = rawget(diagnostic,"spans")
+    if enabled and type(retained)=="table" then
+        -- The product snapshot has a 32-row ring; optional replacement data
+        -- cannot widen collection or inject arbitrary span fields/names.
+        for index=1,32 do
+            local span = rawget(retained,index)
+            if span==nil then break end
+            local copy
+            if type(span)=="table" then
+                local name = rawget(span,"name")
+                if type(name)=="string" and DIAGNOSTIC_NAMES[name] then
+                    copy = {name=name}
+                    for _, key in ipairs(DIAGNOSTIC_NUMBERS) do copy[key]=FiniteNumber(rawget(span,key)) end
+                    for _, key in ipairs(DIAGNOSTIC_FLAGS) do copy[key]=rawget(span,key)==true end
+                    local reason = rawget(span,"sessionWindowReason")
+                    copy.sessionWindowReason = type(reason)=="string" and DIAGNOSTIC_REASONS[reason] and reason or nil
+                end
+            end
+            -- Actual session observations only. Frozen GetTime bounds cannot
+            -- be stretched using another clock's elapsed milliseconds.
+            if copy and copy.sessionWindowAvailable and copy.sessionStart and copy.sessionEnd
+                and copy.sessionEnd>copy.sessionStart and copy.elapsedAvailable
+                and copy.elapsedMs and copy.elapsedMs>=0 then
+                if copy.sessionEnd>=windowStart and copy.sessionStart<=windowEnd then
+                    selected[#selected+1]=copy
+                end
+            else unmatched=unmatched+1 end
+        end
+        table.sort(selected,function(a,b)
+            if a.elapsedMs~=b.elapsedMs then return a.elapsedMs>b.elapsedMs end
+            return (a.id or 0)>(b.id or 0)
+        end)
+        for index=#selected,MAX_OPERATIONS+1,-1 do selected[index]=nil end
+    end
+    return {version=1,enabled=enabled,clockGeneration=FiniteNumber(rawget(diagnostic,"clockGeneration")),
+        resetGeneration=FiniteNumber(rawget(diagnostic,"resetGeneration")),spans=selected,
+        unmatchedSpanCount=unmatched,
+        elapsedClock=rawget(diagnostic,"elapsedClock")=="injected millisecond clock" and "injected millisecond clock"
+            or rawget(diagnostic,"elapsedClock")=="debugprofilestop" and "debugprofilestop"
+            or rawget(diagnostic,"elapsedClock")=="GetTime milliseconds" and "GetTime milliseconds" or nil,
+        sessionClock=rawget(diagnostic,"sessionClock")=="injected session clock" and "injected session clock"
+            or rawget(diagnostic,"sessionClock")=="GetTime" and "GetTime" or nil,
+        heapMetric=rawget(diagnostic,"heapMetric")=="injected global Lua heap reader" and "injected global Lua heap reader"
+            or rawget(diagnostic,"heapMetric")=="collectgarbage count; global Lua heap" and "collectgarbage count; global Lua heap" or nil,
+        heapIncludesInstrumentation=true,
+        heapMeaning="global net Lua heap change; not allocated bytes or GC time",
+        residualMeaning="elapsed residual after valid direct-child coverage; not addon CPU"}, selected
+end
+
 local function CollectUnsafe(context)
-    local windowStart, windowEnd = CorrelationWindow(context)
+    local windowStart, windowEnd, frameStart, frameEnd, profileStart, profileEnd = CorrelationWindow(context)
     if not windowStart then return nil end
     local performance = Nexus and Nexus.Performance
     if not (performance and type(performance.RecentOperations) == "function") then
         return nil
     end
     local recent = performance.RecentOperations(windowStart, windowEnd, windowEnd)
-    if type(recent) ~= "table" or #recent == 0 then return nil end
+    if type(recent) ~= "table" then recent = {} end
+    local relationship = not profileStart and "unmatched"
+        or frameStart == profileStart and frameEnd == profileEnd and "exact" or "partial"
+    local diagnosticOk, diagnostic, diagnosticSpans = pcall(DiagnosticOverlapUnsafe,performance,windowStart,windowEnd)
+    if not diagnosticOk then diagnostic,diagnosticSpans=nil,{} end
+    if #recent == 0 and #diagnosticSpans == 0 then return nil end
 
     local ranked = {}
     for index, operation in ipairs(recent) do
@@ -87,13 +170,29 @@ local function CollectUnsafe(context)
             name=operation.name,
             durationMs=operation.durationMs,
             fields=CopyProviderFields(operation.fields),
+            startTime=operation.startTime, endTime=operation.endTime,
+            geometry="derived session end minus elapsed; not exact invocation bounds",
         }
     end
-    if #operations == 0 then return nil end
+    if #operations == 0 then
+        for index, span in ipairs(diagnosticSpans) do
+            operations[index] = {name=span.name,durationMs=span.elapsedMs,fields={},
+                startTime=span.sessionStart,endTime=span.sessionEnd,
+                geometry="observed session bounds",sequence=span.id,parent=span.parentId,
+                depth=span.depth,heapBeforeKB=span.heapBeforeKB,heapAfterKB=span.heapAfterKB,
+                heapDeltaKB=span.heapNetKB,heapAvailable=span.heapAvailable}
+        end
+    end
     local summary = operations[1].name == "automation.fallback.repair"
         and "A recent Nexus automation repair overlaps the attributed hitch."
         or "Recent bounded Nexus operations overlap the attributed hitch."
-    return {summary=summary, operations=operations}
+    if diagnostic then diagnostic.overlapStatus=#diagnosticSpans>0 and relationship or "unmatched" end
+    return {summary=summary, operations=operations,windowRelationship=relationship,
+        frameStartTime=frameStart,frameEndTime=frameEnd,
+        profileStartTime=profileStart,profileEndTime=profileEnd,
+        searchedWindowStart=windowStart,searchedWindowEnd=windowEnd,
+        correlationMeaning="temporal overlap only; not same-window addon CPU or causation",
+        diagnostics=diagnostic}
 end
 
 local function Collect(context)
@@ -186,6 +285,19 @@ local function CollectTimingSummary()
     return ok and type(result) == "table" and result or nil
 end
 
+-- User-requested report work only; never called from the hot path. These
+-- snapshots are detached and bounded and do not read clocks or Lua heap.
+local function CollectDiagnosticSnapshot()
+    local ok, result = pcall(function()
+        local performance = Nexus and Nexus.Performance
+        if not (performance and type(performance.SnapshotDiagnostics)=="function") then return nil end
+        return {version=1,diagnostics=performance.SnapshotDiagnostics(),
+            assignmentDetail=type(performance.SnapshotAssignmentDetail)=="function"
+                and performance.SnapshotAssignmentDetail() or nil}
+    end)
+    return ok and type(result)=="table" and result or nil
+end
+
 -- Registered table: StutterAlert calls Collect(self, context) for attributed
 -- hitches (the v1 contract, unchanged) and, when it supports it,
 -- CollectTimingSummary(self) while building a report.
@@ -193,6 +305,7 @@ local Provider = {
     TIMING_SUMMARY_VERSION = TIMING_SUMMARY_VERSION,
     Collect = function(_, context) return Collect(context) end,
     CollectTimingSummary = function() return CollectTimingSummary() end,
+    CollectDiagnosticSnapshot = function() return CollectDiagnosticSnapshot() end,
 }
 
 function Integration.Unregister()
@@ -229,4 +342,5 @@ end
 
 Integration.Collect = Collect
 Integration.CollectTimingSummary = CollectTimingSummary
+Integration.CollectDiagnosticSnapshot = CollectDiagnosticSnapshot
 Integration.Provider = Provider

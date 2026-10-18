@@ -110,3 +110,234 @@ function T.Annotation(value)
         ["target satisfied"]="Target already met",frozen="Frozen offer"})[value] or T.Message(value)
 end
 function T.Details(code) return "Details: "..tostring(code or "unknown") end
+
+------------------------------------------------------------------------
+-- M4 (UX-04/13/14/15): shared player-facing presentation of destinations,
+-- counts, record scope and terms. Every function below is a pure function of
+-- the facts its caller already holds: it reads no state, calls no service,
+-- writes nothing and schedules nothing. An unknown is said as unknown or
+-- unavailable, never as 0, and a planned or partial state is never called
+-- complete. Names pass through the existing display sanitizer (UTF-8 safe).
+------------------------------------------------------------------------
+
+-- A whole, finite, non-negative number, else nil (unknown).
+local function Whole(value)
+    value = tonumber(value)
+    if value and value == value and value >= 0 and value < math.huge then
+        return math.floor(value)
+    end
+    return nil
+end
+
+-- Cut at a character boundary (UTF-8 lead bytes), never inside a letter.
+local function Utf8Cut(text, maxChars)
+    maxChars = tonumber(maxChars)
+    if not maxChars or maxChars < 1 then return text end
+    local count, index, length = 0, 1, #text
+    while index <= length do
+        local byte = text:byte(index)
+        local width = (byte < 0xC0 and 1) or (byte < 0xE0 and 2) or (byte < 0xF0 and 3) or 4
+        count = count + 1
+        if count > maxChars then return text:sub(1, index - 1) .. "..." end
+        index = index + width
+    end
+    return text
+end
+
+-- A name as it may be shown (the existing display sanitizer), optionally
+-- shortened at a character boundary; nil when there is nothing to show.
+function T.SafeName(value, maxChars)
+    if value == nil then return nil end
+    local text = tostring(value)
+    local identity = Nexus.Identity
+    if identity and type(identity.DisplaySafeText) == "function" then
+        local ok, shown = pcall(identity.DisplaySafeText, text, 1024, false)
+        text = ok and shown or nil
+    end
+    if type(text) ~= "string" or text == "" then return nil end
+    return Utf8Cut(text, maxChars)
+end
+
+-- "Saved Build 'Fire PvE' (slot 2)", "Saved Build 2" or nil.
+function T.SavedBuildLabel(slot, name, maxChars)
+    slot = Whole(slot)
+    local shown = T.SafeName(name, maxChars)
+    if slot and slot >= 1 then
+        return shown and ("Saved Build '" .. shown .. "' (slot " .. slot .. ")")
+            or ("Saved Build " .. slot)
+    end
+    return shown and ("Saved Build '" .. shown .. "'") or nil
+end
+
+-- The captured destination of a view, confirmation or result, as lines.
+-- d.kind: "savedBuild", "firstRun", "unknown" (Saved Build data not loaded;
+-- d.reason "restoring": the saved assignment is being restored),
+-- "unconfirmed" (neither first-run nor a Saved Build can be confirmed) or
+-- anything else (nothing captured). d.slot / d.name: the Saved Build.
+-- d.active: true or false only when the caller knows it. d.unconfirmed: a
+-- Saved Build's plan whose Saved Build is not confirmed as the active one
+-- (no verified active row). d.empty: a numbered Saved Build that holds no
+-- Echoes. d.unavailable: it cannot be read now.
+-- d.character: an owner/character label the caller holds. d.wishlist and
+-- d.wishlistState ("assigned", "unassigned", "unavailable", "restoring" or
+-- nil when unknown). The destination is always the one the caller captured;
+-- this function never looks up a currently active slot.
+function T.DestinationLines(d)
+    d = type(d) == "table" and d or {}
+    local lines = {}
+    local character = T.SafeName(d.character)
+    if character then lines[#lines + 1] = "Character: " .. character end
+    if d.kind == "savedBuild" then
+        local label = T.SavedBuildLabel(d.slot, d.name) or "the selected Saved Build"
+        local state
+        if d.unavailable then
+            state = "not available right now"
+        elseif d.empty then
+            state = "empty: it holds no Echoes, so assigning to it is refused"
+        elseif d.active == true then
+            state = "active in the game"
+        elseif d.active == false then
+            state = "not active in the game"
+        elseif d.unconfirmed then
+            state = "not confirmed as the active Saved Build"
+        end
+        lines[#lines + 1] = "Destination: " .. label .. (state and (" - " .. state) or "")
+    elseif d.kind == "firstRun" then
+        lines[#lines + 1] = "Destination: first-run target (no Saved Build in use)"
+    elseif d.kind == "unknown" then
+        lines[#lines + 1] = d.reason == "restoring"
+            and "Destination: not known yet (the saved assignment is being restored)"
+            or "Destination: Saved Build data is not loaded yet"
+    elseif d.kind == "unconfirmed" then
+        lines[#lines + 1] = "Destination: not confirmed right now"
+    else
+        lines[#lines + 1] = "Destination: none captured"
+    end
+    local wishlist = T.SafeName(d.wishlist)
+    local state = d.wishlistState
+    if state == "assigned" then
+        lines[#lines + 1] = "Wishlist: " .. (wishlist and (wishlist .. " (assigned)") or "assigned")
+    elseif state == "unassigned" then
+        lines[#lines + 1] = "Wishlist: none assigned"
+    elseif state == "unavailable" then
+        lines[#lines + 1] = "Wishlist: " .. (wishlist and (wishlist .. " - ") or "") .. "unavailable right now"
+    elseif state == "restoring" then
+        lines[#lines + 1] = "Wishlist: restoring the saved assignment"
+    elseif wishlist then
+        lines[#lines + 1] = "Wishlist: " .. wishlist
+    end
+    return lines
+end
+
+-- One count vocabulary. These are different units and are never merged:
+-- planned copies (the plan), rolled copies this run, the Wishlist's copies
+-- found in a Saved Build, locked targets, and Echo families represented (a
+-- family counts once whatever its copies).
+local COUNT_UNITS = {
+    planned = "rolled copies planned",
+    run = "rolled copies this run",
+    savedBuild = "Wishlist copies in this Saved Build",
+    locked = "locked targets",
+    families = "Echo families represented",
+}
+T.COUNT_UNITS = COUNT_UNITS
+
+-- "12 / 79 rolled copies this run", or "Rolled copies this run: unavailable"
+-- when either side is unknown (never 0 / 0 or a guessed total).
+function T.CountText(kind, have, want)
+    local unit = COUNT_UNITS[kind] or "copies"
+    local h, w = Whole(have), Whole(want)
+    if h == nil or w == nil or w <= 0 then
+        return unit:sub(1, 1):upper() .. unit:sub(2) .. ": unavailable"
+    end
+    return h .. " / " .. w .. " " .. unit
+end
+
+-- The run's own progress line. Locked targets still to lock are said; the
+-- word "complete" is never used here (ProgressComplete decides that).
+-- `compact` gives the short form for a narrow line (still qualified).
+function T.RunProgressText(have, want, lockedOutstanding, compact)
+    local h, w, outstanding = Whole(have), Whole(want), Whole(lockedOutstanding)
+    if h == nil or w == nil or w <= 0 then
+        return compact and "Rolled: unavailable" or "Rolled copies this run: unavailable"
+    end
+    if outstanding and outstanding > 0 then
+        return h .. " / " .. w .. " rolled, " .. outstanding .. (compact and " to lock" or " still to lock")
+    end
+    return h .. " / " .. w .. (compact and " rolled" or " rolled copies this run")
+end
+
+-- Complete only when the rolled copies are met AND no locked target is
+-- outstanding; an unknown on either side is not complete.
+function T.ProgressComplete(have, want, lockedOutstanding)
+    local h, w, outstanding = Whole(have), Whole(want), Whole(lockedOutstanding)
+    return h ~= nil and w ~= nil and w > 0 and h >= w and outstanding ~= nil and outstanding == 0
+end
+
+-- Record scope (DPS records and leaderboards): what this client holds, not a
+-- complete or server-wide ranking.
+T.BEST_KNOWN = "Best known"
+T.RECORD_SCOPE = "Best known: the best shared record this client holds for these exact Echoes. "
+    .. "It is not a complete or server-wide ranking."
+T.LEADERBOARD_SCOPE = "Best known exact loadout per character"
+
+function T.CategoryName(category)
+    if category == "lk" then return "Lich King" end
+    if category == "dummy" then return "Training Dummy" end
+    if category == "combined" then return "Both records" end
+    return nil
+end
+
+-- The facts a record genuinely carries: its category, a positive fight
+-- duration, a positive level and a recorded date. A missing or zero value is
+-- left out, never shown as 0 or as a dash that reads like a value.
+function T.RecordDetailParts(row)
+    row = type(row) == "table" and row or {}
+    local parts = {}
+    local category = T.CategoryName(row.category)
+    if category then parts[#parts + 1] = category end
+    local duration = Whole(row.duration)
+    if duration and duration > 0 then
+        parts[#parts + 1] = string.format("%d:%02d fight", math.floor(duration / 60), duration % 60)
+    end
+    local level = Whole(row.level)
+    if level and level > 0 then parts[#parts + 1] = "Level " .. level end
+    local stamp = Whole(row.ts)
+    local formatDate = (type(date) == "function" and date) or (type(os) == "table" and os.date) or nil
+    if stamp and stamp > 0 and formatDate then
+        local ok, text = pcall(formatDate, "!%Y-%m-%d", stamp)
+        if ok and type(text) == "string" and text ~= "" then
+            parts[#parts + 1] = "Recorded " .. text .. " (UTC)"
+        end
+    end
+    return parts
+end
+
+-- The record's own owner flag: verified, not established, or nothing when
+-- the record does not say (unknown is not presented as either).
+function T.OwnerLine(row)
+    if type(row) ~= "table" then return nil end
+    if row.ownerVerified == true then return "Owner verified" end
+    if row.ownerVerified == false then return "Owner identity not established" end
+    return nil
+end
+
+-- One user meaning per label (UX-15). Internal identifiers, protocol fields
+-- and saved-data names keep their own spelling and are not listed here.
+T.Terms = {
+    menuAndStatus = "Menu and status",
+    bestKnown = T.BEST_KNOWN,
+    showRecords = "Show DPS records",
+    -- The game's own page that lists your Saved Builds.
+    myBuildsPage = "My Builds",
+    -- The Build Library scope that lists your Saved Builds and shared listings
+    -- (internal scope key "mine").
+    mineScope = "Mine",
+    firstRun = "first-run target",
+}
+T.GLOSSARY = "Counts: planned copies (the plan), rolled copies this run, the Wishlist's copies in a Saved Build "
+    .. "and locked targets are different counts, and Echo families represented counts a family once. "
+    .. "Unavailable is not 0, and a plan is not a finished build. Best known: the best shared DPS record this "
+    .. "client holds for the exact same Echoes; it is not a complete or server-wide ranking. My Builds is the "
+    .. "game's page of your Saved Builds; in Build Library, the Mine scope lists your Saved Builds and "
+    .. "shared listings. Menu and status: the ... button on the Nexus panel."

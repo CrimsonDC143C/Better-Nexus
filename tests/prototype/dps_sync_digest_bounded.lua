@@ -247,10 +247,59 @@ do
  check(advertisedStale==0,'7: no stale digest was returned')
 end
 
+-- Setup for sections 8 and 10, which assume no catalog work. Records in the
+-- sections above arm background catalog work (the evidence compaction walk,
+-- scheduled retention runs). Its commit replaces the saved DPS store, and
+-- while its candidate is pending the Sync gate reports catalog-not-ready
+-- before hashes-not-ready. Let that work finish through its own owners, then
+-- make sure no retention commit falls due for `seconds`. Retention is
+-- requested through its public entry only when its saved schedule is due
+-- sooner. Bounded. Nothing is cancelled, forced or skipped, and no clock is
+-- changed. The "DSD settle" line reports the frames, schedule and headroom.
+local function SavedStore() return rawget(rawget(NexusDB,'authorityBundle'),'dpsCapture') end
+local function RetentionDue()
+ local meta=rawget(rawget(NexusDB,'authorityBundle'),'dataRetention')
+ return type(meta)=='table' and tonumber(rawget(meta,'nextMaintenanceAt')) or nil
+end
+local function Settle(tag)
+ local quiet=0
+ for i=1,24000 do
+  local calm=Nexus.StartupStatus().syncGate=='open' and Phase()=='ready'
+   and Nexus.BuildCatalog.ManualPreparationStatus().ready==true
+   and not Nexus.Scheduler.Pending('data-compaction')
+   and not Nexus.Scheduler.Pending('data-retention.enforce')
+  quiet=calm and quiet+1 or 0
+  if quiet>=40 then return i-1 end
+  H.Advance(.05,.05)
+ end
+ check(false,tag..': setup: background catalog work settles: gate '..tostring(Nexus.StartupStatus().syncGate)
+  ..' phase '..tostring(Phase())..' catalog ready '..tostring(Nexus.BuildCatalog.ManualPreparationStatus().ready)
+  ..' compaction pending '..tostring(Nexus.Scheduler.Pending('data-compaction')~=nil)
+  ..' retention pending '..tostring(Nexus.Scheduler.Pending('data-retention.enforce')~=nil))
+end
+local function SettleCatalog(tag,seconds)
+ local clock0=os.clock()
+ check(Nexus.DataRetention.Limits().enabled~=true,tag..': setup: retention runs in its unlimited mode')
+ local settled=Settle(tag)
+ local due=RetentionDue()
+ check(due~=nil,tag..': setup: the retention schedule is saved')
+ local dueIn,waited,resettled=due-time(),0,0
+ if due-time()<seconds then
+  for _=1,6200 do if time()>=due then break end;waited=waited+1;H.Advance(.05,.05) end
+  check(Nexus.DataRetention.Request('test: retention before section '..tag)==true,tag..': setup: a retention run is requested')
+  resettled=Settle(tag)
+ end
+ print('DSD settle','section',tag,'settleFrames',settled,'dueIn',dueIn,'waitFrames',waited,'resettleFrames',resettled,
+  'headroom',(RetentionDue() or 0)-time(),'needed',seconds,'profileElapsedSeconds',string.format('%.2f',os.clock()-clock0))
+ check((RetentionDue() or 0)-time()>=seconds,tag..': setup: no retention commit falls due in the section: '
+  ..tostring((RetentionDue() or 0)-time()))
+end
+
 -- 8. Sync waits: while the digest is not ready the lifecycle Sync gate is
 -- closed on the hashes, and a manual Sync Now is "preparing"; once ready the
 -- request carries the canonical DPS digest.
 do
+ SettleCatalog('8',30)
  Nexus.Revisions.Advance(Nexus.Revisions.DPS_CHANGED,{scope='test'})
  D.GetSyncHash()
  H.Advance(.05,.05)
@@ -342,6 +391,7 @@ end
 -- store size, a bucket rebuild through that pump takes several updates, as it
 -- does at about 2000 builds; the immediate rebuild must not depend on it.
 do
+ SettleCatalog('10',100)
  local units=Digest.UNITS_PER_PUMP
  Digest.UNITS_PER_PUMP=16
  check(UntilReady(40000),'10: setup: the digest is ready')
@@ -350,6 +400,7 @@ do
  local n=0
  for _,period in ipairs({10,2}) do
   local notReady,accepted,stale=0,0,0
+  local store,catalogBusy=SavedStore(),0
   for i=1,600 do
    if i%period==0 then
     n=n+1
@@ -358,10 +409,13 @@ do
    end
    H.Advance(.05,.05)
    if Nexus.StartupStatus().syncGate=='hashes-not-ready' then notReady=notReady+1 end
+   if Nexus.StartupStatus().syncGate=='catalog-not-ready' then catalogBusy=catalogBusy+1 end
    local digest=D.GetSyncHash()
    if digest~=nil and digest~=D.GetSyncHashUncached() then stale=stale+1 end
   end
   print('DSD traffic','period',period,'accepted',accepted,'hashes-not-ready frames',notReady,'of 600')
+  check(SavedStore()==store and catalogBusy==0,'10: setup: no catalog work or commit during the traffic at period '
+   ..period..': store replaced '..tostring(SavedStore()~=store)..', catalog-not-ready frames '..catalogBusy)
   check(accepted>=600/period-1,'10: fixture: records accepted at period '..period..': '..accepted)
   check(notReady==0,'10: the Sync gate is never closed on the hashes at '..(20/period)..' records/s: '..notReady..' of 600 frames')
   check(stale==0,'10: no stale digest at '..(20/period)..' records/s: '..stale)

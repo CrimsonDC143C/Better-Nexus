@@ -101,11 +101,22 @@ function Reconciler.New(options)
         and options.publishResponseClaim or function() return false end
     local outstandingTransfers = type(options.outstandingTransfers) == "function"
         and options.outstandingTransfers or function() return 0 end
+    local requestOutstandingTransfers =
+        type(options.requestOutstandingTransfers) == "function"
+        and options.requestOutstandingTransfers or function() return nil end
     local cancelRequest = type(options.cancelRequest) == "function"
         and options.cancelRequest or function() return false end
     local noteSyncStat = assert(options.noteSyncStat,
         "Sync stat callback required")
     local log = assert(options.log, "log callback required")
+    local function ObserveClaim(kind, description, outcome, reason)
+        if type(options.observe) ~= "function" then return end
+        pcall(options.observe, kind, {
+            peer=description.responder,requester=description.requester,
+            requestId=description.requestId,dataKind=description.kind,
+            bucket=description.bucket,outcome=outcome,reason=reason,
+        })
+    end
 
     local pendingResponses, pendingLoadouts, continuations = {}, {}, {}
     local recentRequests = {}
@@ -298,6 +309,8 @@ function Reconciler.New(options)
         continuations[requester] = nil
         log("RX", "mesh request from %s scheduled (id=%s)",
             requester, tostring(requestId))
+        ObserveClaim("request_scheduled", {responder=requester,
+            requester=requester,requestId=requestId}, "scheduled")
         return true
     end
 
@@ -331,6 +344,17 @@ function Reconciler.New(options)
 
     local function ResponseClaimState(entry)
         if entry and entry.responseClaimUnavailable then return "unsafe" end
+        if entry and entry.localOwnerDpsAdmitted then
+            -- Bucket completion is queue admission, not complete API egress.
+            -- Preserve an admitted owner's chunks while other buckets prepare;
+            -- whole-response election would cancel their exact request scope.
+            local queued = requestOutstandingTransfers(entry.requester,
+                entry.requestId)
+            if queued ~= 0 then
+                return "unsafe"
+            end
+            entry.localOwnerDpsAdmitted = nil
+        end
         local hasBucket = false
         for _, bucket in pairs(entry and entry.buckets or {}) do
             hasBucket = true
@@ -390,6 +414,7 @@ function Reconciler.New(options)
             or "pending"
         if claimState == "pending" then
             StorePendingClaim(entry, claim)
+            ObserveClaim("response_claim", description, "pending", "preparation")
             return true
         end
         local claimRank = ClaimRank(entry, claim.responder)
@@ -406,9 +431,11 @@ function Reconciler.New(options)
             RememberRequest(entry, "elected peer")
             cancelRequest(entry.requestId, entry.requester)
             pendingResponses[key] = nil
+            ObserveClaim("response_claim", description, "suppressed", "equivalent claimant")
             log("RX", "suppressed equivalent response for deterministic claimant %s",
                 claim.responder)
         else
+            ObserveClaim("response_claim", description, "retained", "claim did not suppress")
             log("RX", "retained response after non-equivalent or owner-only claim from %s",
                 claim.responder)
         end
@@ -496,6 +523,7 @@ function Reconciler.New(options)
         if bucket and bucket.kind == "B"
             and not snapshotCurrent(bucket.snapshot) then
             R.ResetResponseEntry(entry)
+            ObserveClaim("bucket_claim", description, "retained", "snapshot changed")
             return true
         end
         if bucket and bucket.kind == "B"
@@ -505,6 +533,7 @@ function Reconciler.New(options)
             and bucket.snapshot.claimSafeByBucket[bucket.bucket] == true
             and tostring(bucket.hash) == tostring(description.hash) then
             entry.buckets[id] = nil
+            ObserveClaim("bucket_claim", description, "suppressed", "equivalent claimant")
             log("RX", "mesh bucket %s claimed by %s for %s", id,
                 tostring(description.responder), tostring(description.requester))
             if not next(entry.buckets) then
@@ -519,6 +548,7 @@ function Reconciler.New(options)
             and not localOwnsDpsBucket(bucket.bucket)
             and tostring(bucket.hash) == tostring(description.hash) then
             entry.buckets[id] = nil
+            ObserveClaim("bucket_claim", description, "suppressed", "equivalent claimant")
             log("RX", "mesh bucket %s claimed by %s for %s", id,
                 tostring(description.responder), tostring(description.requester))
             if not next(entry.buckets) then
@@ -527,6 +557,7 @@ function Reconciler.New(options)
             end
             return true
         end
+        ObserveClaim("bucket_claim", description, "retained", "claim did not suppress")
         return false
     end
 
@@ -967,6 +998,9 @@ function Reconciler.New(options)
             + projectedTransfers
         if bucket.kind == "D" and (tonumber(admittedCount) or 0) > 0 then
             bucket.responseAdmitted = true
+            if localOwnsDpsBucket(bucket.bucket) then
+                entry.localOwnerDpsAdmitted = true
+            end
         end
         local hasOtherBuckets = false
         for id in pairs(entry.buckets or {}) do
