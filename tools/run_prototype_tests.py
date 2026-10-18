@@ -7,6 +7,19 @@ from __future__ import annotations
 import argparse, ctypes.util, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 NAMES=['parse','boot','wishlist','lock_evidence','ownership','typed_hash','transport','automation','manual_sync','diagnostics','features','echoweaver_planner','startup','startup_evidence','startup_failure','startup_validation','startup_drift','startup_budget','startup_persistence','startup_source_change','role_selection','role_boundaries','role_persistence','role_export','current_locks','loading_status','loading_local','current_locks_reload','current_locks_exact','orbs','orbs_controls','orbs_ambiguity','orbs_same_echo','orbs_prerequisites','orbs_reload','echoweaver_orb_policy','orbs_ui','orbs_context','orbs_permanent','orbs_loading','help','terminology']
+NAMES += ['support_tome_permission']
+NAMES += ['tome_late_discovery']
+NAMES += ['tome_observation_workflow','tome_observation_gates','tome_observation_bounds','tome_observation_parity']
+NAMES += ['catalog_admission_origin','catalog_admission_limits','catalog_admission_rollback','catalog_admission_inbound','catalog_admission_legacy_field']
+NAMES += ['catalog_admission_bare','catalog_admission_bare_wire','catalog_admission_semantics']
+NAMES += ['catalog_admission_retained']
+NAMES += ['tome_pause_visibility', 'tome_pause_observation']
+NAMES += ['sync_replacement_budget', 'sync_replacement_budget_caller', 'sync_replacement_role_overlap', 'sync_replacement_roles_public', 'sync_replacement_roles_lifecycle']
+NAMES += ['wishlist_locked_design_save', 'orb_assignment_invalid_status', 'orb_resume_assignment_gate', 'orb_resume_context_gate', 'orb_resume_assignment_adoption', 'orb_resume_original_assignment_restore', 'orb_resume_compact_read_cost', 'orb_resume_nil_slot_pending', 'orb_resume_nil_slot_settled']
+# Accepted Claude tome regression fixtures (support is a dofile dependency only).
+NAMES += ['approved_tome_state_contract','approved_tome_rows_refresh']
+
+NAMES += ['native_wishlist_tome_sequence', 'progress_tome_refresh', 'progress_tome_refresh_controls', 'progress_owned_tooltips']
 NAMES += ['policy_lab','search_order_sim']  # retained repository-only experiments
 NAMES += ['orbs_review_sources','orbs_review_lifecycle','orbs_review_same_id','orbs_review_recheck','orbs_review_availability','orbs_review_ordering','orbs_review_disclosure','orbs_review_recovery','terminology_consumers']
 NAMES += ['select_recovery_provenance', 'select_recovery_transition']
@@ -43,6 +56,12 @@ NAMES += ['sync_channel_late_join']
 NAMES += ['sync_dps_native_channel_owner']
 NAMES += ['sync_dps_native_realm_shim']
 NAMES += ['sync_dps_current_native_owner']
+NAMES += ['sync_dps_native_bucket_claim','sync_dps_native_claim_reconciler','sync_dps_native_claim_wire']
+NAMES += ['sync_dps_native_claim_inflight_wire']
+NAMES += ['sync_dps_correlation_wire','sync_correlation_limits','sync_claim_correlation']
+NAMES += ['sync_requester_filter']
+NAMES += ['sync_dps_bare_native_context','sync_dps_bare_native_paced']
+NAMES += ['sync_dps_bare_requester_route']
 NAMES += ['startup_build_identity']
 NAMES += ['community_cursor_readers','sync_locked_roles_request','leaderboard_roles_names']
 NAMES += ['sync_dps_native_relay_scan']
@@ -143,6 +162,10 @@ NAMES += ['orb_rdf_balance_drift']
 NAMES += ['orb_rdf_recovery_followups']
 NAMES += ['orb_read_signature_cost','catalog_budget_exhausted']
 NAMES += ['hud_assignment_reads','poll_tome_pending_idle','catalog_idle_frames']
+NAMES += ['assignment_context_merge','assignment_detail_timing']
+NAMES += ['orb_recovery_guidance_diag','orb_boundary_diagnostics',
+          'stutter_diagnostic_spans','stutter_diagnostic_integration',
+          'support_targeted_diagnostics']
 NAMES += ['perf_lifecycle_phases']
 NAMES += ['lifecycle_counter_accounting']
 NAMES += ['sync_scalar_root_reject','tome_toggle_snapshot_isolation','startup_identity_repair_noop','panel_annotation_labels','help_decision_order']
@@ -225,6 +248,11 @@ NAMES += ['ui_theme_setup_dialogs']
 NAMES += ['help_theme_appearance']
 NAMES += ['log_viewer_theme_appearance']
 NAMES += ['overwrite_warning']
+NAMES += ['overwrite_warning_template_init']
+NAMES += ['tome_wishlist_revisit']
+NAMES += ['tome_wishlist_priority']
+NAMES += ['tome_state_journal','tome_state_observation']
+NAMES += ['tome_state_rows']
 NAMES += ['overwrite_auto_gate']
 NAMES += ['overwrite_warning_lifecycle']
 NAMES += ['overwrite_warning_clock']
@@ -239,6 +267,28 @@ NAMES += ['offline_peer_callbacks','offline_peer_scope_boundaries']
 NAMES += ['offline_peer_legacy_dps']
 NAMES += ['offline_peer_status_probe']
 NAMES += ['startup_legacy_relay_pair_width']
+
+# NX-03 slot projection catalog work (BOUND fails at 3d52b0e by design) and its semantic controls.
+NAMES += ['stutter_slot_projection','stutter_catalog_semantics']
+# NX-02 Orb display reconciliation work (BOUND fails at 3d52b0e by design) and its semantic controls.
+NAMES += ['stutter_orb_display','stutter_orb_authority']
+# NX-01 scheduled Echo catalog check work (BOUND fails at 3d52b0e by design) and its lifecycle controls.
+NAMES += ['stutter_catalog_budget','stutter_catalog_lifecycle']
+# CX-04 Orb run pump assignment reads (BOUND fails before the CX-04 fix by design) and its semantic controls.
+NAMES += ['stutter_orb_pump','stutter_orb_pump_authority']
+# NX-02 Orb display reuse expiry with display-only reads, backward clock and exact opt-ins (review B1).
+NAMES += ['stutter_orb_display_expiry']
+NAMES += ['dps_sync_digest_publication']  # DPS digest across an in-window catalog publication (public route).
+# Nexus Saved Build selection across native Wishlist changes (Journal picker/gear destinations) and its boundaries.
+NAMES += ['saved_build_wishlist_transition','saved_build_wishlist_destination_guards']
+# AutoLock: a native Wishlist row is neither ownership evidence nor an unlock context (review 03 B1).
+NAMES += ['saved_build_wishlist_autolock_guard']
+# Wishlist Editor entries follow the Nexus Saved Build selection; never a native Wishlist index (review 03 N1-N3).
+NAMES += ['saved_build_wishlist_editor_context']
+# Evidence-pending role picker: assignment follows the Nexus selection; an unknown native read refuses (review 07 R1, U).
+NAMES += ['saved_build_wishlist_evidence_picker']
+# Build Progress details: a validated Pending list is not drawn twice; unknown summaries keep raw lines (approved cleanup).
+NAMES += ['journal_pending_summary_dedup']
 
 # Wall-clock limit for one test process. It is a runner limit only: no test, timer or budget reads it.
 DEFAULT_TIMEOUT_SECONDS=45

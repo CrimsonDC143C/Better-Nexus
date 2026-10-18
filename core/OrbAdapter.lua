@@ -9,6 +9,13 @@ local owner, ownerContext
 local observations = { serial=0, grantedRef=nil, grantedSig=nil }
 local selectionSerial,selection=0,nil
 local watched={}
+-- Optional bounded provenance sink. It gets only our already-validated read,
+-- never a payload/name or a permission, and its failure cannot reach the host.
+local boundarySink
+function O.BoundarySink(sink) boundarySink=type(sink)=="function" and sink or nil end
+local function boundary(event,s)
+    if boundarySink and A.Orbs==O then pcall(boundarySink,event,s) end
+end
 local MAX_ROWS = 512
 local function integer(n, minimum)
     return type(n)=="number" and n==math.floor(n) and n<math.huge
@@ -34,8 +41,17 @@ end
 -- Every read: the Echo reconciliation only, not the five-second fallback
 -- signature (GameAdapter.EchoActiveSlotGeneration). The reconciliation stays
 -- for its effect: Echo changes (slot, owned, locked) are seen at this read.
-local function ctx(pe,svc,orb)
-    local active=A.EchoActiveSlotGeneration and A.EchoActiveSlotGeneration() or nil
+-- Display exception (NX-02): a display-only read (O.Read("display")) may reuse
+-- the last clean display reconciliation for under 1 s (GameAdapter rules).
+-- Its `active` is then retained and NON-AUTHORITATIVE; nothing reads it for
+-- an action. Every other field here is read fresh on every call, and every
+-- read without the display mode reconciles as before.
+local function ctx(pe,svc,orb,display)
+    local active=nil
+    if A.EchoActiveSlotGeneration then
+        if display then active=A.EchoActiveSlotGeneration(true)
+        else active=A.EchoActiveSlotGeneration() end
+    end
     local owned=A.Owned and A.Owned() or {}
     return {pe=pe,svc=svc,orb=orb,guid=UnitGUID and UnitGUID("player"),
         generation=owned.generation,level=A.Level and A.Level(),
@@ -172,7 +188,12 @@ end
 -- A refusal returns nil, its text and a fixed stage code naming the refusal
 -- site. The stage is diagnostics only (OrbRuntime's readiness observation);
 -- callers that act on the read use the first two values, as before.
-function O.Read()
+-- `mode` is "display" only for a display-only read (OrbRuntime.Status); any
+-- other value, or none, is the full read. Only the Echo reconciliation in ctx
+-- differs; every shown field below is read fresh either way. A display read
+-- authorizes nothing.
+function O.Read(mode)
+    local display=mode=="display"
     local pe=_G.ProjectEbonhold;local svc=pe and pe.PerkService;local orb=pe and pe.OrbService
     for _,name in ipairs({"IsStateKnown","GetCharges","IsOfferPending","ConfirmSpend","RequestCharges"}) do
         if type(orb)~="table" or type(orb[name])~="function" then
@@ -283,7 +304,7 @@ function O.Read()
     end})
     local s={known=true,charges=charges,offerPending=pending,board=board,boardKey=table.concat(parts,","),
         granted=granted,locked=locks,grantStamp=observations.serial,grantedKey=sig,lockedKey=signature(locks),
-        hostPending=host,autoAccept=auto,catalog=rows,context=ctx(pe,svc,orb),at=GetTime and GetTime() or 0,
+        hostPending=host,autoAccept=auto,catalog=rows,context=ctx(pe,svc,orb,display),at=GetTime and GetTime() or 0,
         selectionSerial=selectionSerial,selection=copy(selection),
         -- The Echo whose choice the game still holds unanswered (its own pick
         -- latch), or nil. Read only; used for the status text.
@@ -492,7 +513,9 @@ function O.Spend(token,key,expected,guard)
     end
     local id=tonumber(tostring(key):match("^(%d+):%d+$"));if not id then return nil,"REJECTED","Invalid source." end
     if guard and guard(s)~=true then return nil,"REJECTED","Assignment or source protection changed before submission. Resume only after reviewing the current assignment." end
+    boundary("host_call",s)
     local ok,value=pcall(ownerContext.orb.ConfirmSpend,id,1)
+    boundary(not ok and "host_error" or value==false and "host_false" or value==true and "host_true" or "host_other",nil)
     if not ok then return nil,"AMBIGUOUS","The spend call failed; its server outcome is unknown. No repeat will be sent." end
     if value==false then return nil,"REJECTED","The game refused the Orb spend." end
     return true,"SUBMITTED"
@@ -510,11 +533,21 @@ function O.Select(token,index,expectedBoard,id,guard)
         or s.boardKey~=expectedBoard then return nil,"REJECTED","The Orb offer changed or another action is pending." end
     if guard and guard(s)~=true then return nil,"REJECTED","The assigned target changed before selection. The original pending operation must be resolved." end
     selfSelecting=true
+    boundary("pick_call",s)
     local ok,v=pcall(ownerContext.svc.SelectPerk,id)
     selfSelecting=false
+    boundary((not ok or (v~=true and v~=false)) and "pick_unknown" or v==false and "pick_false" or "pick_true",nil)
     if not ok or (v~=true and v~=false) then return nil,"AMBIGUOUS","The selection outcome is unknown. No selection will be repeated." end
     if v==false then return nil,"REJECTED","The game refused the Orb choice. Resolve the offer manually." end
     return true,"SUBMITTED",s.grantStamp
+end
+do
+    local read=O.Read
+    function O.Read(...)
+        local perf=Nexus.Performance
+        if perf and type(perf.MeasureDiagnostic)=="function" then return perf.MeasureDiagnostic("orb.read",read,...) end
+        return read(...)
+    end
 end
 -- Passive transport observer (035) ---------------------------------------------
 -- The audited client (the owner's installed bytes; the reporter's build is NOT

@@ -9,7 +9,8 @@ end
 dofile('tests/prototype/assignment_journal_picker.lua')
 dofile=originalDofile
 assert(H)
-local function checkExport()
+-- `planA`: the edit control opened Plan A's complete design instead of Plan B's.
+local function checkExport(planA)
  local box=CreateFrame('EditBox',nil,UIParent)
  StaticPopupDialogs.NEXUS_EXPORT_WISHLIST.OnShow({editBox=box})
  local parsed=assert(Nexus.Codec.DecodeEBH1(box._nexusExplicitExportText))
@@ -17,20 +18,27 @@ local function checkExport()
  for _,row in ipairs(parsed.entries)do if row.locked then
   a=a or row.spellId==200080;b=b or row.spellId==200081
  end end
- assert(b and not a,'actual Journal edit control opens the selected complete design')
+ if planA then assert(a and not b,'actual row gear opens that row\'s complete design')
+ else assert(b and not a,'actual Journal edit control opens the selected complete design') end
 end
 Nexus.JournalTab.RefreshAssociations()
 assert(NexusAssociatedWishlistDesignButton:IsEnabled());NexusAssociatedWishlistDesignButton:Click();checkExport()
 NexusEditorFrame:Hide();ProjectEbonholdEchoJournal:Show();Nexus.JournalTab.RefreshAssociations()
 NexusActiveWishlistSelector:Click()
+-- The selector names the exact assignment (Plan B), so the list leaves it out;
+-- the equal-content Plan A is another Wishlist and stays, unmarked.
 local gear
-for _,row in ipairs(NexusWishlistOnlyPicker.children)do if row.nameButton then
+for _,row in ipairs(NexusWishlistOnlyPicker.children)do if row.nameButton and row:IsVisible() then
  local label=row.nameButton.text:GetText()
- if label:find('Plan A',1,true)then assert(not label:find('[Selected]',1,true),'equal rolled contents cannot mark Plan A as selected')end
- if label:find('Plan B',1,true)then assert(label:find('[Selected]',1,true),'exact assignment has selected marker');gear=row.gear end
+ if label:find('Plan A',1,true)then assert(not label:find('[Selected]',1,true),'equal rolled contents cannot mark Plan A as selected');gear=row.gear end
+ assert(not label:find('Plan B',1,true),'the exact assignment is named on the selector, not listed again')
 end end
-assert(gear);gear:Click();checkExport()
+assert(NexusActiveWishlistSelector.text:GetText():find('Plan B',1,true),'the selector names the exact assignment')
+assert(gear);gear:Click();checkExport(true)
+-- Back to the selected design through its Journal edit control.
+NexusEditorFrame:Hide();ProjectEbonholdEchoJournal:Show();Nexus.JournalTab.RefreshAssociations()
+NexusAssociatedWishlistDesignButton:Click();checkExport()
 H.granted={['Echo 81']={{spellId=200081,quality=1}}};H.Notify();H.A.Poll()
 assert(not Nexus.OrbRuntime.Start(1),'required copy after visible Journal assignment must remain reserved')
 assert(H.Count('orb-spend')==0 and H.Count('take')==0,'visible controls never bypass source protection')
-print('PASS Journal associated Edit, row gear, exact Selected marker, export and required-copy guard')
+print('PASS Journal associated Edit, row gear, exact selection named not listed, export and required-copy guard')

@@ -1,4 +1,4 @@
--- Independent review probe: actual clean Create -> select same row -> Unassign.
+-- Independent review probe: actual clean Create -> select same source -> Unassign.
 -- Real product handlers; retained synthetic harness and services only.
 local H=dofile('tests/prototype/harness.lua')
 H.playerLevel=1;wipe(H.db)
@@ -35,11 +35,26 @@ local initial=Nexus.Store.State()
 assert(initial.firstRunWishlist.assignmentId==initial.loadoutWishlists[1].assignmentId,'SETUP: initial handoff mismatch')
 print('INITIAL',initial.firstRunWishlist.assignmentId,initial.loadoutWishlists[1].assignmentId)
 journal();NexusActiveWishlistSelector:Click()
-local selected
+local offered
 for _,r in ipairs(NexusWishlistOnlyPicker.children)do
- if r.nameButton and r.nameButton:IsVisible() and r.nameButton.text:GetText():find(name,1,true)then selected=r;break end
+ if r.nameButton and r.nameButton:IsVisible() and r.nameButton.text:GetText():find(name,1,true)then offered=r;break end
 end
-assert(selected,'SETUP: created source missing from actual picker');selected.nameButton:Click()
+-- The selector names the created source, so the picker does not offer it again.
+assert(not offered and NexusActiveWishlistSelector.text:GetText():find(name:sub(1,17),1,true),
+ 'the selected source is named on the selector, not offered again in the picker')
+-- It is the only Wishlist: the picker says so on one line and Unassign follows.
+local picker=NexusWishlistOnlyPicker
+assert(picker.emptyRow and picker.emptyRow:IsVisible() and picker.emptyRow:GetText()=='No other wishlists found',
+ 'with only the selection, the picker says no other Wishlist exists: '..tostring(picker.emptyRow and picker.emptyRow:GetText()))
+assert(picker:GetHeight()==26+24+24+6 and picker.clearRow:IsVisible() and select(3,picker.clearRow:GetPoint(1))==-48,
+ 'the note takes one row and Unassign sits below it: height '..tostring(picker:GetHeight()))
+NexusActiveWishlistSelector:Click()
+-- The same-source selection is still possible through the adapter call a
+-- picker row makes; the guard below is about that state.
+local same={}
+for _,c in ipairs(Nexus.GameAdapter.GetWishlistCandidates())do if c.name==name then same[#same+1]=c end end
+assert(#same==1,'SETUP: exactly one created source candidate: '..#same)
+assert(Nexus.GameAdapter.SetFirstRunWishlist(same[1].slot,same[1]),'SETUP: same-source selection was refused')
 assert(Nexus.GameAdapter.AssignedWishlist().state=='ready','SETUP: selector assignment did not resolve')
 local before=Nexus.Store.State()
 print('RESELECTED',before.firstRunWishlist.assignmentId,before.loadoutWishlists[1].assignmentId)

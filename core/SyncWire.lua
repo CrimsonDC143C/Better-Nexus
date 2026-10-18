@@ -236,10 +236,28 @@ local function Route(payload,metadata)
     local target=type(metadata)=="table" and Name(metadata.requester)
     local p=target and peers[target]
     local escaped=payload:gsub("|","||")
+    -- A contextual DPS response to a short requester needs the native
+    -- channel's owner provenance. Pin every chunk to that existing route:
+    -- the addon size limit can otherwise move only its final short chunk.
+    -- This selects transport only; it grants no receive/record authority.
+    local transfer,requester,requestId,bucket=payload:match(
+        "^WLD2|[^|]+|([^|]+)|[^|]+|[^|]+|([^|]+)|([^|]+)|([^|]+)$")
+    local nativeDpsResponse = type(metadata)=="table"
+        and metadata.dataKind=="D" and target and not target:find("-",1,true)
+        and Nexus.Identity and Nexus.Identity.ValidPlayer(target)
+        and type(metadata.requestId)=="string" and #metadata.requestId<=96
+        and metadata.requestId:match("^c1%-[%w%._:@%+%-]+$")
+        and type(metadata.bucket)=="number" and metadata.bucket>=1 and metadata.bucket<=8
+        and metadata.bucket==math.floor(metadata.bucket)
+        and type(metadata.transferId)=="string"
+        and #metadata.transferId<=160 and not metadata.transferId:find("[%s%c|]")
+        and Nexus.Identity.ValidWireText(metadata.transferId,160,false)
+        and transfer==metadata.transferId and requester==target
+        and requestId==metadata.requestId and bucket==tostring(metadata.bucket)
     -- The addon route needs this side's handshake reply. When the saved Sync
     -- mode refuses handshakes, the peer never confirms this side and would
     -- reject the whisper, so directed traffic keeps the legacy route.
-    if p and p.addon and Now()-(p.confirmedAt or 0)<=PEER_TTL and HasAddonApi()
+    if not nativeDpsResponse and p and p.addon and Now()-(p.confirmedAt or 0)<=PEER_TTL and HasAddonApi()
         and ModeAllows("handshake")
         and #Wire.PREFIX+1+3+#escaped<=254 then
         return "addon",target,"P7:"..escaped

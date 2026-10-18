@@ -95,17 +95,23 @@ local B_ROWS={{spellId=200768,quality=0,stacks=2}}
 local A2_ROWS=H.Clone(planRows);A2_ROWS[#A2_ROWS+1]={spellId=200768,quality=0,stacks=1}
 -- No notification: the Journal row stays as it was built.
 local function rawSet(slot,value) H.perks.serverBuildSlots[slot]=value and H.Clone(value) or nil end
+-- The selector names the selected plan, so the open picker does not list it
+-- again; its edit control is the Journal design button. Like the row gear it
+-- replaces here, it opens the record captured before the slot changes (at the
+-- last Journal refresh, as the row's was when the picker opened).
 local function pickerGear()
  for _,f in ipairs(H.frames)do
   if f.kind=='Button' and f.glyph and f:IsVisible() and f~=NexusAssociatedWishlistDesignButton then
    local parent=f:GetParent()
    local label=parent and parent.nameButton and parent.nameButton.text and parent.nameButton.text:GetText() or ''
-   if label:find(NAME,1,true) then return f end
+   check(not label:find(NAME,1,true),'the selected plan is not offered again in the picker')
   end
  end
- error('picker gear absent')
+ check(NexusActiveWishlistSelector.text:GetText():find(NAME,1,true) and NexusAssociatedWishlistDesignButton:IsEnabled(),
+  'the selector names the selected plan and its Journal edit control is enabled')
+ return NexusAssociatedWishlistDesignButton
 end
--- The Journal picker row is built from mirror A; the slot may change; then the gear is clicked.
+-- The Journal is refreshed with mirror A; the slot may change; then the edit control is clicked.
 local function openFromRow(changeSlot)
  H=boot(H.Clone(saved),{[102]=H.Clone(MIRROR_A)})
  notices={}

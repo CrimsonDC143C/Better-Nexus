@@ -458,17 +458,38 @@ function Responder.ContextSuffix(context, includeBucket)
     return suffix
 end
 
-function Responder.ContextRequestId(context)
+-- A bare requester can name this player only at an authenticated native DPS
+-- boundary. The retained channel sender and current native player must agree
+-- on the exact game realm; general/qualified transports keep their rules.
+function Responder.IsLocalDpsRequester(requester, nativeChannelSender)
+    if IsLocalTransportSender(requester) then return true end
+    if not nativeChannelSender or not Identity.ValidPlayer(requester)
+        or requester:find("-", 1, true)
+        or not Identity.SamePlayer(requester, MyName())
+        or type(Identity.NativeChannelSender) ~= "function" then return false end
+    local sourceOwner = Identity.CanonicalOwnerFromTransport(nativeChannelSender)
+    local localOwner = Identity.CanonicalOwnerFromTransport(
+        Identity.NativeChannelSender(MyName()))
+    local requesterOwner = Identity.CanonicalOwnerFromTransport(
+        Identity.NativeChannelSender(requester))
+    return sourceOwner ~= nil and localOwner ~= nil
+        and requesterOwner == localOwner
+        and sourceOwner:match("@(.+)$") == localOwner:match("@(.+)$")
+end
+
+function Responder.ContextRequestId(context, nativeChannelSender)
     if type(context) ~= "table" then return nil end
-    if IsLocalTransportSender(context.requester) then return context.requestId end
+    if Responder.IsLocalDpsRequester(context.requester, nativeChannelSender) then
+        return context.requestId
+    end
     -- A valid context addressed elsewhere is accepted as ambient storage input,
     -- but it receives one bounded unrelated outcome against the local request.
     return "c1-foreign"
 end
 
-function Responder.NoteContextOutcome(context, outcome, reason)
+function Responder.NoteContextOutcome(context, outcome, reason, nativeChannelSender)
     if not Session or type(Session.NoteOutcome) ~= "function" then return false end
-    local requestId = Responder.ContextRequestId(context)
+    local requestId = Responder.ContextRequestId(context, nativeChannelSender)
     if requestId == nil then return false end
     return Session.NoteOutcome(requestId, outcome, reason)
 end
@@ -501,6 +522,19 @@ local function PeerObserve(kind, fields)
         and type(debugOwner.Record) == "function" then
         pcall(debugOwner.Record, kind, fields)
     end
+end
+
+function Responder.ObserveDps(kind, fields, context, transferId)
+    fields.requester = context and context.requester or nil
+    fields.requestId = context and context.requestId or nil
+    fields.bucket = context and context.bucket or nil
+    fields.dataKind, fields.transferId = "D", transferId
+    PeerObserve(kind, fields)
+end
+
+function Responder.SenderForm(sender)
+    return type(sender) == "string"
+        and (sender:find("-", 1, true) and "qualified" or "bare") or nil
 end
 
 local function SameTransportSender(declared, actual)
@@ -859,7 +893,28 @@ local function ObserveTransport(kind, fields, metadata, context)
     Operation.RunObserver(Reconciler, "SyncReconciler", kind, fields,
         metadata)
     Operation.RunObserver(Session, "SyncSession", kind, fields, metadata)
-    if type(status) ~= "table" then PeerObserve(kind, fields) end
+    if type(status) ~= "table" then
+        -- Copy the fixed scalar observation fields, never the queue envelope
+        -- or its payload/opaque operation owner, into the session trace.
+        local observed = {}
+        for _, key in ipairs({"outcome","reason","bytes","chunks","queue",
+            "attempts","operation"}) do
+            local value = type(fields) == "table" and fields[key] or nil
+            local valueType = type(value)
+            if valueType == "string" or valueType == "number"
+                or valueType == "boolean" then observed[key] = value end
+        end
+        if type(metadata) == "table" then
+            for _, key in ipairs({"requestId","requester","transferId",
+                "dataKind","bucket"}) do
+                local value = metadata[key]
+                local valueType = type(value)
+                if valueType == "string" or valueType == "number"
+                    or valueType == "boolean" then observed[key] = value end
+            end
+        end
+        PeerObserve(kind, observed)
+    end
 end
 
 local CompatibilityFactory = Nexus.SyncInternals
@@ -1292,6 +1347,7 @@ Reconciler = ReconcilerFactory.New({
                 transferId="bucket-claim:" .. tostring(entry.requester)
                     .. ":" .. tostring(entry.requestId) .. ":"
                     .. tostring(bucketState.kind) .. tostring(bucketState.bucket),
+                dataKind=bucketState.kind,bucket=bucketState.bucket,
                 queueClass="claim",
                 enqueuedAt=Now(),expiresAt=Now() + PENDING_MAX_AGE,
             })
@@ -1302,10 +1358,15 @@ Reconciler = ReconcilerFactory.New({
     outstandingTransfers=function()
         return Transport.Snapshot().requestOutstandingTransfers
     end,
+    requestOutstandingTransfers=function(requester, requestId)
+        return Transport.RequestSnapshot(requester, requestId)
+            .outstandingTransfers
+    end,
     cancelRequest=function(requestId, requester)
         return Transport.CancelRequest(requestId, requester)
     end,
     log=LogEvent,
+    observe=PeerObserve,
 })
 
 ------------------------------------------------------------------------
@@ -1852,12 +1913,12 @@ local function StoreSummary(data, transportSender, context, onComplete,
     }
     local oldComplete = OrdinaryComplete(old)
     if old and oldComplete then
-        local queued = Session.QueueReplacement(
+        local queued, recoveryWhy = Session.QueueReplacement(
             id, replacement, recoveryRequestId)
         if not queued then
             Responder.NoteContextOutcome(context, "rejected", "queue")
-            LogEvent("RX", "REJECT summary '%s': recovery queue full",
-                tostring(data.t))
+            LogEvent("RX", "REJECT summary '%s': %s",
+                tostring(data.t), tostring(recoveryWhy or "recovery queue full"))
             return false, false, "queue"
         end
         stats.received = stats.received + 1
@@ -2880,6 +2941,8 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
                 .. tostring(prepared.payload.d),
             buildId=tostring(prepared.payload.b or ""),
             dpsId=tostring(prepared.payload.f or ""),queueClass="bulk",
+            dataKind="D",bucket=prepared.responseScope
+                and prepared.responseScope.bucket or nil,
             enqueuedAt=Now(),expiresAt=Now() + PENDING_MAX_AGE,
         })
         if not queued then return false, queueWhy, prepared end
@@ -2889,10 +2952,15 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
             prepared.payload.p, #prepared.messages)
         if prepared.payload.x then
             stats.dpsRelayOffered = (stats.dpsRelayOffered or 0) + 1
-            PeerObserve("dps_offer", {peer=prepared.payload.x.n,
-                category=prepared.payload.c,
-                outcome=queueWhy == "duplicate" and "duplicate" or "admitted"})
         end
+        Responder.ObserveDps("dps_offer", {
+            peer=prepared.responseScope and prepared.responseScope.requester
+                or prepared.payload.x and prepared.payload.x.n,
+            category=prepared.payload.c,
+            relay=prepared.payload.x ~= nil,
+            outcome=queueWhy == "duplicate" and "duplicate" or "admitted"},
+            prepared.responseScope, tostring(prepared.payload.p) .. ":"
+                .. tostring(prepared.payload.t) .. ":" .. tostring(prepared.payload.d))
         if responseMode then Reconciler.NoteStat("dpsAdmissions", 1) end
         return true, queueWhy, nil, wireCost.chunks, wireCost.bytes,
             wireCost.transfers
@@ -3034,6 +3102,7 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
             or relayContext and relayContext.i or nil,
         transferId=transferId,buildId=tostring(payload.b or ""),
         dpsId=tostring(payload.f or ""),queueClass="bulk",
+        dataKind="D",bucket=responseScope and responseScope.bucket or nil,
         enqueuedAt=Now(),expiresAt=Now() + PENDING_MAX_AGE,
     })
     if not queued then return false, queueWhy, prepared end
@@ -3042,10 +3111,13 @@ function Sync.BroadcastDpsRecord(record, prepared, responseMode,
         tostring(payload.c), payload.d, payload.p, total)
     if relayContext then
         stats.dpsRelayOffered = (stats.dpsRelayOffered or 0) + 1
-        PeerObserve("dps_offer", {peer=relayContext.n,
-            category=payload.c,
-            outcome=queueWhy == "duplicate" and "duplicate" or "admitted"})
     end
+    Responder.ObserveDps("dps_offer", {
+        peer=responseScope and responseScope.requester
+            or relayContext and relayContext.n,
+        category=payload.c,relay=relayContext ~= nil,
+        outcome=queueWhy == "duplicate" and "duplicate" or "admitted"},
+        responseScope, transferId)
     if responseMode then Reconciler.NoteStat("dpsAdmissions", 1) end
     return true, queueWhy, nil, wireCost.chunks, wireCost.bytes,
         wireCost.transfers
@@ -3545,7 +3617,6 @@ local function HandleRequest(requester, peerBuildHash, peerDpsHash, requestId)
     })
     if accepted then
         stats.dpsRequestsReceived = (stats.dpsRequestsReceived or 0) + 1
-        PeerObserve("dps_request", {peer=requester,outcome="scheduled"})
     end
     return accepted
 end
@@ -3777,13 +3848,20 @@ Inbound = InboundFactory.New({
         end
     end,
     acceptPeer=AcceptPeer,
-    noteOutcome=function(context, outcome, reason)
-        return Responder.NoteContextOutcome(context, outcome, reason)
+    noteOutcome=function(context, outcome, reason, nativeChannelSender)
+        return Responder.NoteContextOutcome(context, outcome, reason,
+            nativeChannelSender)
     end,
     noteInbound=function(description)
-        if type(description) == "table" and description.requester
-            and not IsLocalTransportSender(description.requester) then
-            return false
+        if type(description) == "table" and description.requester then
+            local localRequester
+            if description.kind == "dps_chunk" or description.kind == "dps_commit" then
+                localRequester = Responder.IsLocalDpsRequester(
+                    description.requester, description.channelOwnerSender)
+            else
+                localRequester = IsLocalTransportSender(description.requester)
+            end
+            if not localRequester then return false end
         end
         local requestId = type(description) == "table"
             and description.requestId or nil
@@ -3826,15 +3904,20 @@ Inbound = InboundFactory.New({
         end
         return false
     end,
-    validateDpsRelay=function(record, sender, envelopeContext)
+    validateDpsRelay=function(record, sender, envelopeContext, transferId,
+        nativeChannelSender)
         local context = type(record) == "table" and record.x or nil
         local D = Nexus and Nexus.DpsCapture
         local player = type(record) == "table"
             and (record.p or record.player) or nil
         local category = type(record) == "table"
             and (record.c or record.category) or nil
-        local directOwner = Identity.TransportOwns(
-            type(record) == "table" and (record.o or record.ownerKey), sender)
+        local claimedOwner = type(record) == "table"
+            and (record.o or record.ownerKey)
+        local authoritySender = nativeChannelSender
+            and Identity.NativeChannelDpsOwnerSender(nativeChannelSender,
+                claimedOwner) or sender
+        local directOwner = Identity.TransportOwns(claimedOwner, authoritySender)
         local marked = Responder.SupportsRequestContext(context and context.i)
         -- Old protocol-7 responders can echo the marked request in relay JSON
         -- but cannot add the Stage 36.3 envelope suffix.  Preserve that
@@ -3854,7 +3937,7 @@ Inbound = InboundFactory.New({
         else
             valid = Session.AcceptsResponse(context and context.i)
                 and type(context) == "table"
-                and IsLocalTransportSender(context.n)
+                and Responder.IsLocalDpsRequester(context.n, nativeChannelSender)
                 and envelopeMatches
                 and ValidDpsRelayContext({n=context.n,i=context.i,b=context.b,
                     c=category}, player)
@@ -3862,7 +3945,7 @@ Inbound = InboundFactory.New({
         end
         if not valid then
             Responder.NoteContextOutcome(envelopeContext, "rejected",
-                "request_auth")
+                "request_auth", nativeChannelSender)
             if D and type(D.NoteReceiveRejection) == "function" then
                 D.NoteReceiveRejection(directOwner and "outside_request"
                     or type(context) == "table"
@@ -3871,17 +3954,26 @@ Inbound = InboundFactory.New({
             local rejectedKey = directOwner and "dpsDirectRejected"
                 or "dpsRelayRejected"
             stats[rejectedKey] = (stats[rejectedKey] or 0) + 1
-            PeerObserve("dps_commit", {peer=sender,outcome="rejected",
-                reason="outside requested response"})
+            Responder.ObserveDps("dps_commit", {peer=sender,outcome="rejected",
+                reason="outside requested response",relay=not directOwner,
+                senderForm=Responder.SenderForm(sender),
+                nativeOwnerContext=nativeChannelSender ~= nil},
+                envelopeContext, transferId)
         end
         return valid and true or false
     end,
-    commitDps=function(record, sender, relayed, context, channelOwnerSender)
+    commitDps=function(record, sender, relayed, context, channelOwnerSender,
+        transferId)
         local dps = Nexus and Nexus.DpsCapture
         local receiver = relayed and dps and dps.ReceiveRelayedRecord
             or dps and dps.ReceiveRecord
         if type(receiver) ~= "function" then
-            Responder.NoteContextOutcome(context, "rejected", "storage")
+            Responder.ObserveDps("dps_commit", {peer=sender,outcome="rejected",
+                reason="storage unavailable",relay=relayed,
+                senderForm=Responder.SenderForm(sender),
+                nativeOwnerContext=channelOwnerSender ~= nil},context,transferId)
+            Responder.NoteContextOutcome(context, "rejected", "storage",
+                channelOwnerSender)
             return false
         end
         local authoritySender = channelOwnerSender or sender
@@ -3897,16 +3989,22 @@ Inbound = InboundFactory.New({
             if ok and rejectionReason == "storage" then
                 stats.storageRejected = (stats.storageRejected or 0) + 1
             end
-            PeerObserve("dps_commit", {peer=sender,outcome="rejected",
-                reason=ok and rejectionReason or "receiver failure"})
-            Responder.NoteContextOutcome(context, "rejected", "storage")
+            Responder.ObserveDps("dps_commit", {peer=sender,outcome="rejected",
+                reason=ok and rejectionReason or "receiver failure",relay=relayed,
+                senderForm=Responder.SenderForm(sender),
+                nativeOwnerContext=channelOwnerSender ~= nil},
+                context,transferId)
+            Responder.NoteContextOutcome(context, "rejected", "storage",
+                channelOwnerSender)
             return false
         end
         local key = relayed and "dpsRelayAccepted" or "dpsDirectAccepted"
         stats[key] = (stats[key] or 0) + 1
-        PeerObserve("dps_commit", {peer=sender,outcome="accepted",
+        Responder.ObserveDps("dps_commit", {peer=sender,outcome="accepted",
             category=record.c or record.category,
-            relay=relayed and true or false})
+            relay=relayed and true or false,
+            senderForm=Responder.SenderForm(sender),
+            nativeOwnerContext=channelOwnerSender ~= nil},context,transferId)
         -- Never reuse payload-supplied authority hints for automatic egress.
         -- Only an exact transport-to-owner bridge may enter the established
         -- direct-owner redistribution path, and only for this client's own
@@ -3927,7 +4025,8 @@ Inbound = InboundFactory.New({
             and type(build.echoes) == "table" and #build.echoes > 0 then
             pcall(Sync.BroadcastBuild, build)
         end
-        Responder.NoteContextOutcome(context, "updated", "accepted")
+        Responder.NoteContextOutcome(context, "updated", "accepted",
+            channelOwnerSender)
         return true
     end,
     commitBuild=CommitReceivedBuild,

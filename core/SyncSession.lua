@@ -73,6 +73,8 @@ function Session.New(options)
     local manualPreparationOwner = nil
     local requestedLoadouts = {}
     local pendingReplacementCount = 0
+    local replacementOwners = {}
+    local replacementBudgetRejected = 0
     local recoveryQueue, recoveryHead, recoveryTail = {}, 1, 0
     local recoveryTicker = 0
     local lastSyncNewCount = 0
@@ -351,6 +353,34 @@ function Session.New(options)
         return true
     end
 
+    local function ReleaseReplacement(buildId, recovery)
+        if requestedLoadouts[buildId] ~= recovery then return false end
+        if recovery.replacement then
+            pendingReplacementCount = math.max(0,
+                pendingReplacementCount - 1)
+        end
+        replacementOwners[buildId] = nil
+        requestedLoadouts[buildId] = nil
+        return true
+    end
+
+    local function ExpireReplacements()
+        -- A late answer may already be assembling after the request's age
+        -- limit. Leave its exact identity intact until the existing inbound
+        -- owner and receive window finish; neither deadline is extended here.
+        if M.IsReceiving() or (options.inboundHasPending
+            and options.inboundHasPending()) then return end
+        local current = now()
+        -- Only replacement owners are scanned (at most maxRecoveryQueue),
+        -- never the session-long legacy/roles request inventory.
+        for buildId, recovery in pairs(replacementOwners) do
+            if recovery.sentAt and current > recovery.sentAt
+                + maxReceiveAge + math.max(0, inflightGrace) then
+                ReleaseReplacement(buildId, recovery)
+            end
+        end
+    end
+
     function M.ClearRequestedLoadout(buildId, promotedStamp)
         local recovery = requestedLoadouts[buildId]
         local replacement = type(recovery) == "table"
@@ -359,11 +389,7 @@ function Session.New(options)
             and Number(replacement.lastModified) > Number(promotedStamp) then
             return false
         end
-        if replacement then
-            pendingReplacementCount = math.max(0,
-                pendingReplacementCount - 1)
-        end
-        requestedLoadouts[buildId] = nil
+        if recovery then ReleaseReplacement(buildId, recovery) end
         return true
     end
 
@@ -375,7 +401,7 @@ function Session.New(options)
 
     -- Scalar summaries identify recovery work, not represented builds. Keep
     -- one bounded, session-only winner per build until its exact full payload
-    -- is durably accepted by the catalog.
+    -- is durably accepted or its terminal receive lifetime has ended.
     function M.QueueReplacement(buildId, replacement, requestId)
         if not options.validIdentifier(buildId)
             or type(replacement) ~= "table"
@@ -396,10 +422,11 @@ function Session.New(options)
             and Number(priorReplacement.lastModified) or nil
         if priorStamp and nextStamp <= priorStamp then return false end
         if not priorReplacement and ReplacementCount() >= maxRecoveryQueue then
-            if options.rejectRecoveryOverflow then
-                return options.rejectRecoveryOverflow(ReplacementCount())
-            end
-            return false
+            replacementBudgetRejected = math.min(9999,
+                replacementBudgetRejected + 1)
+            log("SYNC", "REJECT summary replacement: replacement budget exhausted (%d/%d)",
+                ReplacementCount(), maxRecoveryQueue)
+            return false, "replacement budget exhausted"
         end
         local copy = CopyReplacement(replacement)
         if type(prior) == "table" and not prior.sent then
@@ -407,6 +434,7 @@ function Session.New(options)
                 pendingReplacementCount = pendingReplacementCount + 1
             end
             prior.replacement = copy
+            replacementOwners[buildId] = prior
             prior.requestId = markedId or prior.requestId
             prior.at = current
             return true
@@ -416,6 +444,7 @@ function Session.New(options)
             at=current,sent=false,replacement=copy,
         }
         requestedLoadouts[buildId] = recovery
+        replacementOwners[buildId] = recovery
         if not priorReplacement then
             pendingReplacementCount = pendingReplacementCount + 1
         end
@@ -473,8 +502,10 @@ function Session.New(options)
     function M.QueueRolesRequest(buildId)
         if not options.validIdentifier(buildId) then return false end
         local prior = requestedLoadouts[buildId]
+        -- A roles-only request must not discard the stricter summary winner,
+        -- including an already-sent request whose full answer is still due.
+        if type(prior) == "table" and prior.replacement then return false end
         if type(prior) == "table" and not prior.sent then
-            if prior.replacement then return false end
             prior.roles = true
             return true
         end
@@ -503,6 +534,7 @@ function Session.New(options)
         recoveryTicker = recoveryTicker + Number(elapsed)
         if recoveryTicker < 1.5 then return end
         recoveryTicker = 0
+        ExpireReplacements()
         local transport = options.transportSnapshot()
         if Number(transport and transport.bulk) > 8 then return end
         local recovery = recoveryQueue[recoveryHead]
@@ -516,6 +548,12 @@ function Session.New(options)
             or recovery
         local requestId = type(recovery) == "table" and recovery.requestId
             or nil
+        if type(recovery) == "table"
+            and requestedLoadouts[buildId] ~= recovery then
+            recoveryQueue[recoveryHead] = nil
+            recoveryHead = recoveryHead + 1
+            return
+        end
         local build = options.catalogGet(buildId)
         local mode, grant = SyncMode(), ManualGrant()
         if mode == "off" or (mode == "manual" and not grant) then
@@ -578,6 +616,10 @@ function Session.New(options)
             end
         end
         if type(recovery) == "table" then recovery.sent = true end
+        if type(recovery) == "table" and recovery.replacement
+            and recovery.unsent then
+            ReleaseReplacement(buildId, recovery)
+        end
         recoveryQueue[recoveryHead] = nil
         recoveryHead = recoveryHead + 1
     end
@@ -996,6 +1038,7 @@ function Session.New(options)
             knownPeers=peerCount,
             recovery=RecoveryCount(),
             pendingReplacements=ReplacementCount(),
+            replacementBudgetRejected=replacementBudgetRejected,
             pass=Number(autoConverge.pass),
             terminal=autoConverge.terminal,
             requestQueued=pendingRequest ~= nil,
@@ -1020,6 +1063,7 @@ function Session.New(options)
         return {
             recovery=RecoveryCount(),
             pendingReplacements=ReplacementCount(),
+            replacementBudgetRejected=replacementBudgetRejected,
             pass=Number(autoConverge.pass),
             converging=autoConverge.active and true or false,
             receiving=M.IsReceiving(),
@@ -1104,6 +1148,8 @@ function Session.New(options)
         lastSyncNewCount = 0
         requestedLoadouts = {}
         pendingReplacementCount = 0
+        replacementOwners = {}
+        replacementBudgetRejected = 0
         recoveryQueue, recoveryHead, recoveryTail = {}, 1, 0
         recoveryTicker = 0
         autoConverge = {

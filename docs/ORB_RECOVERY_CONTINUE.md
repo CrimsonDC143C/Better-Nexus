@@ -17,6 +17,73 @@ result. Two situations leave a receipt that cannot be confirmed:
 Before 035 the block had no exit. The owner decided on a practical exit that keeps every
 fact that is known and claims nothing that is not.
 
+### Continue is conditional, not an exit for every unresolved record
+
+A restored record with **no retained client-observed spend** is outside Continue's class.
+Continue requires a retained observation of one Orb fewer *with that action's offer*.
+`spendConfirmed` is the compatibility field for that client observation; it is not a
+server acknowledgment. Missing retained history does not prove that a client never
+observed the event (a save may have failed), or that the server spent nothing. `UNOBSERVABLE`
+means the available facts cannot link the action to a result, not that Nexus knows the
+server completed or refused it.
+
+For a restored, idle, ineligible record the run page exposes **Why blocked...**. Opening
+it reads the same refusal explanation without invoking `ContinueBegin`, requesting a
+refresh or granting a consent token. Check and Continue remain disabled. Eligible
+records retain the existing **Continue...** -> **Check the game's state** -> explicit
+confirmation sequence. Existing checking, refused and completed states retain their
+progress/review labels.
+
+Start, Resume and reload cannot reconstruct missing history. Recheck can collect
+current facts; it cannot promise to settle an unobservable action. Preserve its record
+and exposure. Do not force a spend flag, erase the record, infer a refund or resend a
+spend or choice. Pausing before a planned dungeon transition prevents subsequent
+automatic submissions; it cannot cancel an already submitted action.
+
+### Boundary evidence in the private diagnostic build
+
+`OrbRuntime.BoundaryDiagnostics()` returns a detached, bounded support view without
+constructing runtime state, reading the game, writing saved data or authorizing anything.
+It records the existing Pump read's before/current charge relation (`equal`, `one_below`,
+`lower`, `higher`, `unknown`) and ownership relation (`before`, `source_removed`,
+`neither`, `unknown`), plus offer, pick and host flags and local lifecycle epoch/phase.
+Missing older history stays unknown. A local epoch is provenance, never server correlation.
+
+New small receipts may carry `boundaryJournal`: at most eight flat entries of nine
+whitelisted scalar fields. The first two keep receipt/pre-call provenance; only the recent
+six are evicted. Host-call disposition, observed reads, pick callbacks and leave/enter/logout
+events are facts, never an action gate. At an existing new live receipt-write boundary,
+the mandatory original receipt is written and verified first, omitting only this visit's
+new diagnostic field. A failed mandatory write is never retried to admit an action. On
+mandatory success, at most one optional journal write is attempted. Diagnostic rejection,
+error or invalid data falls back to session-only evidence and cannot reject that original
+receipt write. This adds one bounded Store attempt on the normal successful live write
+path; its cost is measured separately. Stable reads add no writes. `unsaved`
+and `durableRetained` distinguish memory observations from a verified Store write. Disk
+durability still depends on the game's normal save; a process crash is not covered.
+
+Failure-isolation tradeoff: each mandatory new live receipt save omits this visit's
+diagnostic field, even if its prior version was written successfully. If the optional
+write then fails, those earlier diagnostic entries are no longer claimed durable.
+`priorWrittenOmitted` records the bounded number omitted, `durableRetained` is zero,
+`persisted` is false and `unsaved` is true; valid evidence stays in the session journal.
+This deliberate diagnostic loss cannot erase raw picks or any original receipt fact.
+It never applies to a restored or foreign journal. There is no retry loop to restore it.
+
+Existing receipts, foreign same-name fields (including false), unknown archives and
+receipts without conservative archive headroom use **session-only** evidence. New receipts
+reserve4,096 bytes and400 edges for future evidence/archive envelope under the unchanged
+6,144-byte/1,200-edge limits; the full archive remains bounded by28,672 bytes and eight
+entries. Restored valid journals are kept unchanged: new diagnostics do not alter the
+receipt digest or invalidate a Continue token. The archive still stores its original
+receipt exactly, including any retained journal. Diagnostics add no new settlement,
+spending, selection or archive permission.
+
+Stable repeated reads compare the existing facts and do not allocate another journal
+row or snapshot. `orb.read`, `orb.status` and `orb.panel` use the optional default-off
+timing dispatcher. Timing and global net Lua-heap changes are diagnostic evidence, not
+exclusive CPU, allocation ownership or a native FPS improvement.
+
 ## Part 1: raw pick evidence (core/OrbAdapter.lua, core/OrbRuntime.lua)
 
 The `SelectPerk` hook first reads the plain facts of the callback from the game's own tables

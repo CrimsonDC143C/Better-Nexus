@@ -5,9 +5,13 @@
 -- the plan is not assigned to the Saved Build. Wording only: every action stays as it
 -- was (picker selection and the row gear still target the numbered slot and are
 -- refused, Unassign still clears the slot, the gear edits the first-run plan).
+-- The selector names the first-run plan, so the picker lists only the other
+-- Wishlist: the row checks below use that second server Wishlist (OTHER, equal
+-- contents in another slot, a distinct identity).
 -- Synthetic service mirrors only; no real account or game access.
 local T=dofile('tests/prototype/startup_support.lua')
 local NAME='W6-TEXT-PLAN'
+local OTHER='W6-OTHER-PLAN'
 local checks=0
 local function check(ok,msg) checks=checks+1; assert(ok,msg) end
 local notices={}
@@ -94,6 +98,7 @@ local function broke(r) if type(r)=='table' then r.echoes=nil;r.key='999999:1' e
 local function eachRow(d,fn) fn(d);for _,row in pairs(d.chars or {}) do if type(row)=='table' then fn(row) end end end
 local function reopen(slot2,active,mutate)
  local slots=H.Clone(mirror)
+ slots[103]={name=OTHER,verified=false,echoes=H.Clone(mirror[102].echoes)}
  if slot2~=nil then slots[2]=slot2 end
  local data=H.Clone(saved)
  if mutate then mutate(data) end
@@ -140,11 +145,17 @@ local function openPicker()
  check(NexusWishlistOnlyPicker:IsShown(),'actual selector opens its picker')
  return NexusWishlistOnlyPicker
 end
+-- The OTHER row; the selector names NAME, so the list leaves NAME out.
 local function pickerRow(p)
+ local found
  for _,r in ipairs(p.children)do
-  if r.nameButton and r:IsVisible() and r.nameButton.text:GetText():find(NAME,1,true) then return r end
+  if r.nameButton and r:IsVisible() then
+   local label=r.nameButton.text:GetText()
+   check(not label:find(NAME,1,true),'the plan the selector names is not listed again')
+   if label:find(OTHER,1,true) then found=r end
+  end
  end
- error('picker row missing: '..NAME)
+ return found or error('picker row missing: '..OTHER)
 end
 -- Everything the Journal, the HUD and the Orb panel say, for one boot.
 local function surfaces()
@@ -403,7 +414,7 @@ end
 do -- 4a'. The same transition, picker row selection: still the captured first-run target.
  local p=transition('4a-row',nil,0,2,emptyRow())
  pickerRow(p).nameButton:Click()
- check(not said('empty or unavailable'),'4a-row: selecting the first-run plan is not refused')
+ check(not said('empty or unavailable'),'4a-row: selecting a Wishlist for the first-run target is not refused')
  check(Nexus.Store.State().loadoutWishlists[2]==nil,'4a-row: nothing is assigned to the empty slot')
 end
 -- 4b. Opened at an empty Saved Build, the live context becomes slot 0.

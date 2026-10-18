@@ -935,6 +935,7 @@ local function MissingEchoSummary(plan, owned, catalog)
 end
 
 local function StepArm(level, plan, owned, slots, disabledLevers, static, locked)
+    if Adapter.TomeObservationBegin then Adapter.TomeObservationBegin() end
     local settings = Store.Settings()
     local automationAllowed = AutoAllowed()
     -- (a) Loadout selection is owned by the stock Echo Journal. Each saved
@@ -948,59 +949,97 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
             SetStatus("Choose or create a wishlist to begin your first run")
         end
     end
-    -- (b) disable off-wishlist conformant tome levers (one send per 0.5s)
-    if automationAllowed and settings.autoDisable and plan and not plan.advisorOnly
-        and Adapter.DiscoverySynced()
-        and not (Adapter.TomeMutationPaused
-            and Adapter.TomeMutationPaused()) then
-        if (GetTime() - lastLeverSendAt) <= 0.5 then
-            RequestStepAt(lastLeverSendAt + 0.5)
-            MeasurePhase("overlayRender", RenderIdlePanel,
-                plan, owned, slots, static.catalog, static, locked)
-            return
-        end
-        local optOut = settings.leverOptOut or {}
-        for _, lever in ipairs(plan.leverPlan.disable) do
-            if not optOut[lever] and not disabledLevers[lever]
-                and not leversDoneThisVisit[lever] then
-                if not Adapter.LeverHasKnownMember(lever) then
-                    -- unknown tome: its echo isn't in your pool, so there is
-                    -- nothing to disable. Skip (marking done so we never
-                    -- retry it -- this was the "no confirmation" spam).
-                    leversDoneThisVisit[lever] = true
-                else
-                    local ok = Adapter.ToggleLever(lever, true)
-                    if ok then
-                        leversDoneThisVisit[lever] = true
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("disabling off-wishlist tome lever " .. lever)
-                        break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
-                    end
-                end
-            end
-        end
-        -- (c) RE-ENABLE any confirmed-disabled lever the wishlist now
-        -- needs (a wishlist switch after earlier disables would otherwise
-        -- silently make convergence impossible)
-        if (GetTime() - lastLeverSendAt) > 0.5 then
-            for _, lever in ipairs(plan.leverPlan.keep) do
-                if disabledLevers[lever] == "confirmed" then
-                    local ok = Adapter.ToggleLever(lever, false)
-                    if ok then
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("re-enabling wishlist tome lever " .. lever)
-                        break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
+    -- (b) Re-enable needed tomes before pruning the off-wishlist pool. A
+    -- changed wishlist must not wait behind every unwanted disable while the
+    -- player can leave level 1. Both directions still share one 0.5s send gate.
+    -- Visit bits represent only evaluations this short-circuit actually makes:
+    -- Auto=1, permission=2, plan=4, not-advisor=8, discovery=16,
+    -- not-paused=32, spacing=64. An unvisited bit is unknown, not false.
+    local visited,passed,gate,allowed = 1,0,"auto",automationAllowed
+    if allowed then
+        passed=1;visited=visited+2;gate="permission";allowed=settings.autoDisable
+        if allowed then
+            passed=passed+2;visited=visited+4;gate="plan";allowed=plan
+            if allowed then
+                passed=passed+4;visited=visited+8;gate="advisor";allowed=not plan.advisorOnly
+                if allowed then
+                    passed=passed+8;visited=visited+16;gate="discovery";allowed=Adapter.DiscoverySynced()
+                    if allowed then
+                        passed=passed+16;visited=visited+32;gate="pause"
+                        allowed=not (Adapter.TomeMutationPaused and Adapter.TomeMutationPaused())
+                        if allowed then passed=passed+32;gate="eligible" end
                     end
                 end
             end
         end
     end
+    if allowed then
+        visited=visited+64
+        if (GetTime() - lastLeverSendAt) <= 0.5 then
+            if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,"spacing",#plan.leverPlan.keep,#plan.leverPlan.disable) end
+            if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
+            RequestStepAt(lastLeverSendAt + 0.5)
+            MeasurePhase("overlayRender", RenderIdlePanel,
+                plan, owned, slots, static.catalog, static, locked)
+            return
+        end
+        passed=passed+64
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,#plan.leverPlan.keep,#plan.leverPlan.disable) end
+        for _, lever in ipairs(plan.leverPlan.keep) do
+            if disabledLevers[lever] == "confirmed" then
+                local ok = Adapter.ToggleLever(lever, false)
+                if ok then
+                    -- This accepted re-enable invalidates an earlier disable
+                    -- attempt. Adapter pending/mirror checks still own whether
+                    -- another direction can be sent; this is not confirmation.
+                    leversDoneThisVisit[lever] = nil
+                    lastLeverSendAt = GetTime()
+                    RequestStepAt(lastLeverSendAt + 0.5)
+                    SetStatus("re-enabling wishlist tome lever " .. lever)
+                    break
+                else
+                    RequestStepAt(GetTime() + 0.5)
+                end
+            end
+        end
+        -- (c) Disable off-wishlist conformant controls only if this beat did
+        -- not restore a needed control. Keep the existing unknown/opt-out and
+        -- once-per-visit refusal protections for the remaining disables.
+        if (GetTime() - lastLeverSendAt) > 0.5 then
+            local optOut = settings.leverOptOut or {}
+            for _, lever in ipairs(plan.leverPlan.disable) do
+                if optOut[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"opt_out") end
+                elseif disabledLevers[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"disabled") end
+                elseif leversDoneThisVisit[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"visit_done") end
+                else
+                    -- Unknown or unreadable discovery is not an attempted
+                    -- disable. Leave it eligible for a later normal step; do
+                    -- not consume its visit marker or schedule a retry.
+                    if Adapter.LeverHasKnownMember(lever) then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"candidate") end
+                        local ok = Adapter.ToggleLever(lever, true)
+                        if ok then
+                            leversDoneThisVisit[lever] = true
+                            lastLeverSendAt = GetTime()
+                            RequestStepAt(lastLeverSendAt + 0.5)
+                            SetStatus("disabling off-wishlist tome lever " .. lever)
+                            break
+                        else
+                            RequestStepAt(GetTime() + 0.5)
+                        end
+                    else
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"no_known_member") end
+                    end
+                end
+            end
+        end
+    else
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,0,0) end
+    end
+    if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
     MeasurePhase("overlayRender", RenderIdlePanel,
         plan, owned, slots, static.catalog, static, locked)
 end
@@ -1926,7 +1965,15 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
     local ownedBySpell = {}
     for id, n in pairs((owned and owned.bySpell) or {}) do ownedBySpell[id] = n end
     local activeIdx = slots and tonumber(slots.activeSlot)
-    local activeRow = activeIdx and activeIdx > 0 and slots.bySlot and slots.bySlot[activeIdx]
+    -- Only a whole native active index in 1..the declared Saved Build range
+    -- (the bound the adapter's association writers use) names a Saved Build.
+    -- A higher index is a native Wishlist: its row lists desired Echoes, not
+    -- owned ones, so it is neither ownership evidence below nor a context for
+    -- the destructive unlock, also while Nexus keeps a Saved Build selected.
+    local declaredSavedBuilds = slots and (tonumber(slots.maxSlots) or 5) or 5
+    local activeRow = activeIdx and activeIdx >= 1 and activeIdx <= declaredSavedBuilds
+        and activeIdx == math.floor(activeIdx)
+        and slots.bySlot and slots.bySlot[activeIdx]
     trace[#trace + 1] = string.format("active loadout: slot=%s echoes=%s",
         tostring(activeIdx),
         tostring(activeRow and type(activeRow.echoes) == "table" and #activeRow.echoes or "n/a"))
@@ -3490,11 +3537,11 @@ end
 local function JournalData()
     local catalog = Adapter.Catalog()
     local wishlist = Adapter.Wishlist()
-    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), Store.Settings())
+    local settings = Store.Settings()
+    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), settings)
     local owned = Adapter.Owned()
     local slots = Adapter.Slots()
     local flags = EffectiveFlags()
-    local disabledLevers = Adapter.DisabledLevers()
     local sections = {}
 
     if not wishlist then
@@ -3538,15 +3585,82 @@ local function JournalData()
         sections[#sections + 1] = { title = "Extra copies compared with the plan", lines = fillerLines }
     end
 
-    local leverLines = {}
-    for _, lever in ipairs(plan.leverPlan.disable) do
-        leverLines[#leverLines + 1] = string.format("lever %d: disable%s", lever,
-            disabledLevers[lever] and " (done)" or "")
+    local tomeHold = actionHold.worldLeaving and "world transition in progress"
+        or (actionHold.worldSettleUntil and GetTime() < actionHold.worldSettleUntil
+            and "character data is settling after a world transition") or nil
+    local tomes = Adapter.TomeStateObservation(tomeHold)
+    local coverage = {
+        string.format("Known client catalog: %d tomes; coverage of the whole game is unverified.", #tomes.rows),
+        "Client mirror observed when this page was refreshed; server freshness and current server state are unverified.",
+        "Missing Tomes means undiscovered Wishlist requirements; disabled tomes and pending requests are separate below.",
+    }
+    if not tomes.catalogAvailable then coverage[#coverage + 1] = "Catalog unavailable; no complete tome list can be shown." end
+    if tomes.stale then
+        coverage[#coverage + 1] = "State may be stale: " .. table.concat(tomes.reasons, "; ") .. "."
+    end
+    sections[#sections + 1] = { title="Tome state coverage", lines=coverage }
+    -- Each state section has readable lines and the same entries as
+    -- structured tomeRows for the Journal's icon rows. The request title must
+    -- not begin with "Pending": the Journal reads every such title as the
+    -- Wishlist's missing-family list, and a second one makes progress unknown.
+    -- Enabled tomes, usually the longest list, come last.
+    local disabled = { title="Disabled tomes (client mirror)", lines={}, tomeRows={} }
+    local requests = { title="Tome requests awaiting confirmation", lines={}, tomeRows={} }
+    local unknown = { title="Unknown or mixed tome state", lines={}, tomeRows={} }
+    local enabled = { title="Enabled tomes (client mirror)", lines={}, tomeRows={} }
+    local plans = {}
+    if wishlist then
+        -- Keep also holds the player's opt-outs, not only Wishlist families.
+        local optOut = type(settings) == "table" and type(settings.leverOptOut) == "table"
+            and settings.leverOptOut or {}
+        for _, lever in ipairs(plan.leverPlan.disable) do plans[lever] = "plan: disable" end
+        for _, lever in ipairs(plan.leverPlan.keep) do
+            plans[lever] = optOut[lever] and "plan: keep enabled (opted out of automatic disabling)"
+                or "plan: keep enabled (a Wishlist family uses it)"
+        end
     end
     for _, lever in ipairs(plan.leverPlan.skippedNonConformant) do
-        leverLines[#leverLines + 1] = string.format("lever %d: skipped (non-conformant data)", lever)
+        plans[lever] = "automatic toggle skipped: unsupported availability data"
     end
-    sections[#sections + 1] = { title = "Tome levers", lines = leverLines }
+    for _, row in ipairs(tomes.rows) do
+        local status, target
+        if row.observed == "disabled" then status, target = "Disabled", disabled
+        elseif row.observed == "enabled" and row.known == true then status, target = "Enabled", enabled
+        elseif row.observed == "mixed" then status, target = "Mixed", unknown
+        elseif row.known == false and row.observed == "enabled" then status, target = "Undiscovered", unknown
+        else status, target = "Unknown", unknown end
+        local reason = row.reason
+        if row.known == false then
+            reason = (reason and (reason .. "; ") or "") .. "undiscovered in the client mirror"
+        elseif row.known == nil then
+            reason = (reason and (reason .. "; ") or "") .. "discovery state unavailable"
+        end
+        if tomes.stale then status = status .. " (stale)" end
+        -- One entry per tome. Its status is always the observation; a
+        -- pending request lists the same entry again, direction in pending.
+        local detail = {
+            name=row.name, icon=row.icon, iconSource=row.iconSource, leverId=row.lever,
+            observed=row.observed, pending=row.pending, known=row.known,
+            reason=reason, echoNames=row.echoNames, status=status,
+            plan=plans[row.lever], stale=tomes.stale,
+        }
+        local tail = (reason and ("; " .. reason) or "") .. (detail.plan and ("; " .. detail.plan) or "")
+        target.tomeRows[#target.tomeRows + 1] = detail
+        target.lines[#target.lines + 1] = row.name .. ": " .. status .. tail
+        if row.pending then
+            requests.tomeRows[#requests.tomeRows + 1] = detail
+            requests.lines[#requests.lines + 1] = row.name .. ": "
+                .. (row.pending == "unknown" and "request direction unknown" or (row.pending .. " requested"))
+                .. "; awaiting confirmation; last observed: " .. status .. tail
+        end
+    end
+    for _, section in ipairs({disabled, requests, unknown, enabled}) do
+        if #section.lines == 0 then
+            section.lines[1] = section == requests and "No pending requests recorded for tomes in the known catalog."
+                or (tomes.stale and "None observed; state may be stale." or "None observed in this client catalog.")
+        end
+        sections[#sections + 1] = section
+    end
     local est = "no estimate (advisor mode)"
     if wishlist then
         -- The estimate counts known deficits only; no future offer is assumed.

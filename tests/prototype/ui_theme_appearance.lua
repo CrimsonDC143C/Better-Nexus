@@ -43,7 +43,8 @@ check(Settings()==before and NexusDB.settings.uiStyle==nil and NexusDB.settings.
  'reading and showing the appearance writes nothing')
 
 -- 3. Every colour has its exact name and a plain hue word; a check mark, not
--- a colour, marks the active entry.
+-- a colour, marks the active entry. The style's own colours are named in its
+-- Default row (section 12).
 local NAMES={sapphire={'Nexus Sapphire','blue'},emerald={'Nexus Emerald','green'},
  amethyst={'Nexus Amethyst','purple'},ember={'Nexus Ember','orange'}}
 local items=T.MenuItems()
@@ -56,7 +57,8 @@ for _,palette in ipairs(T.Palettes())do
  end
  local found=false
  for _,item in ipairs(items)do
-  if item.text==palette.label..' ('..palette.hue..')' then found=true end
+  if item.text==palette.label..' ('..palette.hue..')'
+   or item.text=='Default ('..palette.label..', '..palette.hue..')' then found=true end
  end
  check(found,'the menu shows the name with its hue: '..palette.label)
 end
@@ -179,4 +181,126 @@ before=Settings()
 check(T.Current().palette=='sapphire','a future read-only saved root keeps its explicit non-purple palette')
 F.Reload(F.OrbService);T=Nexus.Theme
 check(T.Current().palette=='sapphire' and Settings()==before,'the future saved choice persists byte-for-byte through reload')
-print('PASS ui_theme_appearance: Vista/Amethyst by default, explicit and unknown choices kept, owner-routed writes, no repaint allocation, exempt card untouched checks='..checks)
+
+-- 12. Per style, the style's own colours and any palette that paints the same
+-- RGB are one "Default" row (tester: the top two colours look the same).
+-- Equivalence is computed here from the painted colours, never from names;
+-- every other colour keeps its row; one check mark; reading writes nothing and
+-- never migrates a saved value; only an explicit choice writes.
+local function painted(p)
+ local d=p.disabledBorder or {p.border[1]*0.5,p.border[2]*0.5,p.border[3]*0.5}
+ local out={}
+ for _,c in ipairs({p.border,p.windowBorder,p.hover,p.accent,d})do
+  for j=1,3 do out[#out+1]=string.format('%.6f',c[j]) end
+ end
+ return table.concat(out,',')
+end
+local function colourRows()
+ local rows,inColour={},false
+ for _,item in ipairs(T.MenuItems())do
+  if item.isTitle then inColour=item.text=='Appearance: colour'
+  elseif inColour then rows[#rows+1]=item end
+ end
+ return rows
+end
+local function rowNamed(rows,text)
+ local found,n=nil,0
+ for _,item in ipairs(rows)do if item.text==text then found=item;n=n+1 end end
+ return found,n
+end
+local function checkedRows(rows)
+ local out={}
+ for _,item in ipairs(rows)do if item.checked and item.func then out[#out+1]=item end end
+ return out
+end
+local function defaultText(own) return 'Default ('..own.label..', '..own.hue..')' end
+for _,styleId in ipairs({'vista','slate'})do
+ local own=T.PALETTES[T.STYLES[styleId].palette]
+ check(painted(T.Resolve(styleId,nil).palette)==painted(T.Resolve(styleId,own.id).palette),
+  styleId..': no saved colour and an explicit '..own.id..' paint the same RGB')
+ local other
+ for _,p in ipairs(T.Palettes())do if not other and painted(p)~=painted(own) then other=p end end
+ check(other~=nil,'SETUP: '..styleId..' has a colour that paints differently')
+ for _,case in ipairs({{tag='no saved colour'},{tag='explicit default',value=own.id},
+  {tag='explicit other',value=other.id},{tag='unknown',value='aurora'}})do
+  Boot(function(d)d.settings.uiStyle=styleId;d.settings.uiPalette=case.value;d.settings.defaultRowSentinel='keep'end)
+  T=Nexus.Theme
+  local label=styleId..', '..case.tag
+  before=Settings()
+  local rows=colourRows();T.Refresh();Nexus.OrbPanel.Show()
+  check(Settings()==before and NexusDB.settings.uiPalette==case.value and NexusDB.settings.uiStyle==styleId,
+   label..': reading and rendering the menu writes and migrates nothing')
+  local default,n=rowNamed(rows,defaultText(own))
+  check(default and n==1,label..': exactly one Default row names the style colours')
+  for _,item in ipairs(rows)do
+   check(not (item.text or ''):find('Style colours',1,true),label..': no separate "Style colours" row')
+  end
+  local distinct={}
+  for _,p in ipairs(T.Palettes())do
+   local _,m=rowNamed(rows,p.label..' ('..p.hue..')')
+   if painted(p)==painted(own) then
+    check(m==0,label..': '..p.id..' paints the Default colours and is not listed again')
+   else
+    check(m==1,label..': the distinct colour '..p.id..' keeps its own row')
+    distinct[#distinct+1]=p
+   end
+  end
+  check(#checkedRows(rows)<=1,label..': at most one colour carries the check mark')
+  local checked=checkedRows(rows)[1]
+  if case.value==nil or case.value==own.id then
+   check(checked==default,label..': the Default row carries the check mark')
+  elseif case.value==other.id then
+   check(checked and checked.text==other.label..' ('..other.hue..')',label..': the saved distinct colour is checked')
+  else
+   local kept=false
+   for _,item in ipairs(rows)do if (item.text or ''):find('it stays saved',1,true)then kept=true end end
+   check(checked==nil and kept,label..': an unknown saved colour checks nothing and is named as kept')
+  end
+  F.Reload(F.OrbService);T=Nexus.Theme
+  check(Settings()==before,label..': reopening keeps the saved values byte-for-byte')
+ end
+end
+-- An intentional Default choice clears only the colour, through the owner.
+Boot(function(d)d.settings.uiStyle='vista';d.settings.uiPalette='amethyst';d.settings.defaultRowSentinel='keep'end)
+T=Nexus.Theme
+local own=T.PALETTES[T.STYLES.vista.palette]
+local unrelated2=Without({uiPalette=true})
+local default=rowNamed(colourRows(),defaultText(own))
+check(default and default.checked,'SETUP: an explicit default colour shows the checked Default row')
+default.func()
+check(NexusDB.settings.uiPalette==nil and Without({uiPalette=true})==unrelated2 and not T.Current().explicitPalette,
+ 'choosing Default clears only the saved colour')
+check(rowNamed(colourRows(),defaultText(own)).checked and #checkedRows(colourRows())==1,'and Default alone stays checked')
+-- An explicit default colour stays pinned across a style change until the
+-- player chooses again; reopening keeps it.
+Boot(function(d)d.settings.uiStyle='vista';d.settings.uiPalette='amethyst'end);T=Nexus.Theme
+local slateOwn=T.PALETTES[T.STYLES.slate.palette]
+local amethyst=T.PALETTES.amethyst
+local slateItem
+for _,item in ipairs(T.MenuItems())do if item.text=='Nexus Slate' then slateItem=item end end
+check(slateItem and slateItem.func,'SETUP: the Slate style row')
+slateItem.func()
+check(NexusDB.settings.uiStyle=='slate' and NexusDB.settings.uiPalette=='amethyst','a style change keeps the saved explicit colour')
+local function slateChecks(label)
+ local rows=colourRows()
+ local d=rowNamed(rows,defaultText(slateOwn))
+ local a=rowNamed(rows,amethyst.label..' ('..amethyst.hue..')')
+ check(T.Current().style=='slate' and T.Current().palette=='amethyst' and T.Current().explicitPalette,label..': Slate keeps the pinned colour')
+ if painted(amethyst)~=painted(slateOwn) then
+  check(d and not d.checked and a and a.checked and #checkedRows(rows)==1,label..': the pinned colour, not Slate Default, is checked')
+ end
+end
+slateChecks('after the style change')
+before=Settings()
+F.Reload(F.OrbService);T=Nexus.Theme
+slateChecks('after reopening')
+check(Settings()==before,'reopening rewrites nothing')
+T.SetStyle('vista')
+check(NexusDB.settings.uiPalette=='amethyst' and rowNamed(colourRows(),defaultText(own)).checked,
+ 'back on Vista the pinned colour is still saved and shows as Default')
+-- No saved colour follows the style: Slate then shows its own Default.
+Boot(function(d)d.settings.uiStyle='vista'end);T=Nexus.Theme
+T.SetStyle('slate')
+check(NexusDB.settings.uiPalette==nil and rowNamed(colourRows(),defaultText(slateOwn)).checked,
+ 'without a saved colour Slate checks its own Default')
+print('PASS ui_theme_appearance: Vista/Amethyst by default, one Default row per style by painted colour, explicit and unknown choices kept, owner-routed writes, no repaint allocation, exempt card untouched checks='..checks)

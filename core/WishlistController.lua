@@ -521,6 +521,26 @@ function Controller.New(options)
             and Adapter.GetLoadoutWishlist(slot) or nil
     end
 
+    -- The Saved Build Nexus selects, as the Echo Journal names it (the
+    -- adapter's SelectedSavedBuild): the native active slot when it is a Saved
+    -- Build, else the one kept while a native Wishlist is active. An adapter
+    -- without that facade gives the native active slot only when it is a whole
+    -- number in 1..declared. Never a Wishlist index. The native slot stays in
+    -- Slots().activeSlot. `slots` is the caller's own read (no second read);
+    -- none or an unknown one selects nothing.
+    function M.SelectedSavedBuild(slots)
+        if type(slots) ~= "table" or slots.activeKnown == false then return nil end
+        if Adapter and type(Adapter.SelectedSavedBuild) == "function" then
+            return (Adapter.SelectedSavedBuild(slots))
+        end
+        local active = tonumber(slots.activeSlot)
+        if active and active >= 1 and active <= (tonumber(slots.maxSlots) or 5)
+            and active == math.floor(active) then
+            return active
+        end
+        return nil
+    end
+
     -- The runtime's own settings (Store.Settings), so the editor shows exactly
     -- what locked-Echo slot automation will do.
     function M.AutoLockEnabled()
@@ -1113,7 +1133,10 @@ function Controller.New(options)
     function M.BeginNewWishlist()
         M.ResetNewWishlistDraft()
         local slots = Adapter and Adapter.Slots and Adapter.Slots()
-        local active = slots and tonumber(slots.activeSlot) or 0
+        -- The selected Saved Build, as the Journal names it. A new plan's
+        -- destination is fixed here, as the draft begins (with draftActions);
+        -- a later change of selection never retargets it.
+        local active = M.SelectedSavedBuild(slots) or 0
         local maxSlots = slots and (tonumber(slots.maxSlots) or 5) or 5
         local activeRow = slots and slots.bySlot and slots.bySlot[active]
         if active >= 1 and active <= maxSlots and activeRow
@@ -1126,7 +1149,7 @@ function Controller.New(options)
 
     function M.BeginShow()
         local slots = Adapter and Adapter.Slots and Adapter.Slots()
-        local active = slots and tonumber(slots.activeSlot) or 0
+        local active = M.SelectedSavedBuild(slots) or 0
         -- The Saved Builds the server declares (Slots() uses 5 when it
         -- declares nothing), not a fixed five.
         local maxSlots = slots and (tonumber(slots.maxSlots) or 5) or 5
@@ -1330,12 +1353,28 @@ function Controller.New(options)
         return "Nexus"
     end
 
-    local function CommitLockDesignTargets(echoes)
+    local function PrepareLockDesignTargets()
         local existing = LockDesignTargets()
         local lockedBySpell = LockedBySpell()
-        local fresh = DraftModel.PlanLockCommit(state.pending, state.pendingLock,
+        local catalog = Catalog()
+        local fresh, reason = DraftModel.PlanLockCommit(state.pending, state.pendingLock,
             state.fulfilledDraftTargets,
-            state.candidateContext and {} or existing, lockedBySpell, Catalog())
+            state.candidateContext and {} or existing, lockedBySpell, catalog)
+        if not fresh then
+            state.applyRetry = nil
+            notify("|cffff6060Nexus:|r Not saved: the locked-target design is invalid or no longer "
+                .. "matches the Echo catalog. Nothing was uploaded or assigned; your edits are kept. "
+                .. "Review the locked targets before saving again.")
+            return nil, reason or "invalid_locked_design"
+        end
+        return {targets=fresh,lockedBySpell=lockedBySpell,catalog=catalog}
+    end
+
+    local function CommitLockDesignTargets(echoes, prepared)
+        -- Use the exact design and catalog validated before this upload. A
+        -- second planning pass after it could silently turn a changed or
+        -- invalid design into an empty assignment.
+        local fresh, lockedBySpell = prepared.targets, prepared.lockedBySpell
         local nextKey = (Adapter and Adapter.WishlistKey
             and Adapter.WishlistKey(echoes)) or 0
         local committed, commitReason = UpdateStoreState(function(character)
@@ -1355,7 +1394,7 @@ function Controller.New(options)
             -- Do not append arbitrary currently-owned locks. Only this user's
             -- explicit design belongs to the saved plan's role evidence.
             local designed=DraftModel.ExportEntries(state.pending,state.pendingLock,
-                {},Catalog(),state.fulfilledDraftTargets)
+                {},prepared.catalog,state.fulfilledDraftTargets)
             local hasLocked=false
             for _,echo in ipairs(designed) do
                 echo.locked=echo.locked==true
@@ -1383,7 +1422,7 @@ function Controller.New(options)
     -- assignment identity; the content key when neither has one): saving
     -- another Wishlist never takes over the first-run target. A new plan
     -- does when the first-run plan is the current target by the Echo
-    -- Journal's rule (no active Saved Build in the declared range, or an
+    -- Journal's rule (no selected Saved Build, M.SelectedSavedBuild, or an
     -- empty one; see ui/JournalTab.lua). Slot data that is not loaded yet
     -- proves neither; the second result then says so.
     local function FirstRunOwnsSave()
@@ -1391,7 +1430,7 @@ function Controller.New(options)
         if context then return IsFirstRunPlan(context) end
         local slots = Adapter and Adapter.Slots and Adapter.Slots()
         if type(slots) ~= "table" or slots.activeKnown == false then return false, true end
-        local active = tonumber(slots.activeSlot) or 0
+        local active = M.SelectedSavedBuild(slots) or 0
         local maxSlots = tonumber(slots.maxSlots) or 5
         local row = slots.bySlot and slots.bySlot[active]
         local populated = row and type(row.echoes) == "table" and #row.echoes > 0
@@ -1568,6 +1607,8 @@ function Controller.New(options)
         -- and a spaced retry all pass here, so a design above six is never
         -- uploaded and keeps no retry.
         if DesignLimitRefusal() then return false, "design_limit" end
+        local preparedDesign, designReason = PrepareLockDesignTargets()
+        if not preparedDesign then return false, designReason end
         -- The editor this upload belongs to: a callback during the host call can
         -- open another one, and the upload is bookkept against this one only.
         local submitting = state.editingContext
@@ -1591,7 +1632,7 @@ function Controller.New(options)
                 notify("|cffff6060Nexus:|r Wishlist uploaded, but the editor changed; local targets were not reassigned. Review and save again.")
                 return false, "uploaded_draft_changed"
             end
-            local committed, commitReason, designTargets = CommitLockDesignTargets(echoes)
+            local committed, commitReason, designTargets = CommitLockDesignTargets(echoes, preparedDesign)
             if not committed then
                 state.applyRetry = nil
                 notify("|cffff6060Nexus:|r Wishlist uploaded, but local designed targets could not be saved. Your draft is preserved.")
@@ -1783,6 +1824,8 @@ function Controller.New(options)
             return nil, "empty"
         end
         if DesignLimitRefusal() then return nil, "design_limit" end
+        local preparedDesign, designReason = PrepareLockDesignTargets()
+        if not preparedDesign then return nil, designReason end
         local emptySlot = EmptyDestination()
         if emptySlot then
             NotSavedEmptyDestination(emptySlot)

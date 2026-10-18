@@ -4,6 +4,7 @@
 -- Synthetic service mirrors only; no real account or game access.
 local T=dofile('tests/prototype/startup_support.lua')
 local NAME='W15-PLAN'
+local OTHER='W15-OTHER'
 local checks=0
 local function check(ok,msg) checks=checks+1; assert(ok,msg) end
 local notices={}
@@ -72,15 +73,19 @@ local function populated(slot)
  local row=Nexus.GameAdapter.Slots().bySlot[slot]
  return row~=nil and #row.echoes>0
 end
-local function pickerGear()
+-- The gear of the listed row `name`. The selector names the plan wherever it is
+-- the selection, and the picker then does not list it: its Journal edit
+-- control is the design button.
+local function pickerGear(name)
  for _,f in ipairs(H.frames)do
   if f.kind=='Button' and f.glyph and f:IsVisible() and f~=NexusAssociatedWishlistDesignButton then
    local row=f:GetParent()
    local label=row and row.nameButton and row.nameButton.text and row.nameButton.text:GetText() or ''
-   if label:find(NAME,1,true) then return f end
+   if label:find(name,1,true) then return f end
   end
  end
- error('picker gear absent')
+ check(name==NAME and NexusActiveWishlistSelector.text:GetText():find(NAME,1,true),'picker gear absent: '..name)
+ return NexusAssociatedWishlistDesignButton
 end
 
 -- A first-run plan made through the real editor (active slot 0 = no Saved Build).
@@ -97,25 +102,30 @@ local saved=H.Clone(NexusDB)
 
 local function reopen(slot2,active)
  local slots=H.Clone(mirror)
+ -- Another server Wishlist, equal contents in another slot: a distinct
+ -- identity the picker lists beside the selected plan.
+ slots[104]={name=OTHER,verified=false,echoes=H.Clone(mirror[102].echoes)}
  if slot2~=nil then slots[2]={name=slot2.name or '',verified=false,echoes=slot2.echoes} end
  H=boot(H.Clone(saved),slots,active or 2)
  notices={}
  return H
 end
-local function editViaPicker()
+local function editViaPicker(name)
  journal()
  NexusActiveWishlistSelector:Click()
- pickerGear():Click()
+ pickerGear(name or NAME):Click()
  selected(201172).plus:Click()
 end
 
--- 1. Empty active Saved Build + first-run plan, public picker gear, Save.
+-- 1. Empty active Saved Build + first-run plan, public picker gear, Save. The
+-- selector names the first-run plan, so the gear is that of the other listed
+-- Wishlist; it binds the empty Saved Build as its destination all the same.
 reopen({echoes={}})
 do
  local before=snapshot()
  check(before.firstRunWishlist and before.firstRunWishlist.key=='201172:1','precondition: a first-run plan exists')
  check(populated(2)==false,'precondition: active slot 2 is empty')
- editViaPicker()
+ editViaPicker(OTHER)
  button('Save Wishlist'):Click()
  check(H.popup==nil,'no confirmation is offered for a destination that cannot hold the Wishlist')
  check(#H.actions==0,'nothing is uploaded')
@@ -126,7 +136,7 @@ do
  -- the draft is kept: the same editor can still save once the slot has Echoes
  H.perks.serverBuildSlots[2].echoes={{spellId=200767,quality=0,stacks=1,locked=false}}
  button('Save Wishlist'):Click();H.AcceptPopup();H.Advance(4)
- check(#H.actions==1 and H.actions[1][1]=='upload' and H.actions[1][2]==102,'once the slot has Echoes the same draft saves')
+ check(#H.actions==1 and H.actions[1][1]=='upload' and H.actions[1][2]==104,'once the slot has Echoes the same draft saves')
  check(snapshot().loadoutWishlists[2] and snapshot().loadoutWishlists[2].key=='201172:2','and is assigned to that Saved Build')
 end
 

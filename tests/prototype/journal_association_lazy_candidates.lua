@@ -84,10 +84,11 @@ check(candidates==0,'a quiet open Journal never walks the Wishlist candidates: '
 check(assignment>=1 and assignment<=200/15+2,'the assignment is resolved once per refresh: '..assignment)
 
 -- 2. Opening the picker reads the candidates once and lists the server
--- Wishlists.
+-- Wishlists other than the selection the selector names.
 local listed,reads=Picker()
 check(reads==1,'opening the picker reads the candidates once: '..reads)
-check(listed:find('Plan A',1,true)~=nil and listed:find('Plan B',1,true)~=nil,'the picker lists the server Wishlists: '..listed)
+check(listed:find('Plan A',1,true)~=nil and listed:find('Plan B',1,true)==nil and Selector():find('Plan B',1,true)~=nil,
+ 'the picker lists the other server Wishlists: '..listed)
 
 -- 3. An announced Wishlist slot rename (OnDataChanged): the refresh costs
 -- no candidate walk, the recorded assignment keeps its name, and the
