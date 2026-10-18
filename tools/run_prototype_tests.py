@@ -301,6 +301,8 @@ NAMES += ['manual_refresh_projection_consistency']
 NAMES += ['ux_save_intents','ux_auto_assignment_consent','ux_automation_scope']
 # UX M3 review repair: a spaced Save changes keeps its bound confirmation; every Auto-ON assignment route asks before any role or assignment write (EXPECT fails on combined-03 2594d591 by design).
 NAMES += ['ux_save_retry_intent','ux_assignment_consent_routes']
+# UX M4: captured destination presentation, one qualified count vocabulary, record scope/detail and terminology lint (EXPECT fails on accepted M3 ab3cb307 by design).
+NAMES += ['ux_destination_context','ux_qualified_counts','ux_record_scope_terms']
 
 # Wall-clock limit for one test process. It is a runner limit only: no test, timer or budget reads it.
 DEFAULT_TIMEOUT_SECONDS=45

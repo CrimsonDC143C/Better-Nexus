@@ -67,6 +67,72 @@ StaticPopupDialogs["NEXUS_UPDATE_RELEASES"] = {
 
 local function SafeText(v) return v ~= nil and tostring(v) or "" end
 
+-- M4 (UX-04): the destination this panel's run belongs to, as lines, from the
+-- facts the shown model already carries: the verified active Saved Build
+-- (progress.activeSlot / activeSlotName), the run's Wishlist and the saved
+-- assignment state and note. Pure: it reads only the model it is given and
+-- calls no adapter, service or request (UserText.DestinationLines words it).
+function M.DestinationLines(model)
+    local text = Nexus.UserText
+    if type(model) ~= "table" or not (text and type(text.DestinationLines) == "function") then
+        return {}
+    end
+    local pr = type(model.progress) == "table" and model.progress or {}
+    local assignment = type(model.assignment) == "table" and model.assignment or {}
+    local slot = tonumber(pr.activeSlot) or 0
+    local state = assignment.state
+    local d = {wishlist = pr.wishlistName or assignment.name}
+    -- The HUD always shows the logged-in character's run (J3: the destination
+    -- names its character). A client read at hover time; no service or state.
+    if type(UnitName) == "function" then
+        local ok, name = pcall(UnitName, "player")
+        if ok and type(name) == "string" and name ~= "" then d.character = name end
+    end
+    -- The adapter's own first-run facts (GameAdapter A.Wishlist: its first-run
+    -- return and its unavailable first-run mirror), copied by Main into the
+    -- HUD model as assignment.note. A missing verified active row is not
+    -- evidence of first-run (M4 final review B1).
+    local note = type(assignment.note) == "string" and assignment.note or ""
+    local unavailableFirstRun = "First-run wishlist data is temporarily unavailable"
+    local firstRun = note == "First-run wishlist target"
+        or note:sub(1, #unavailableFirstRun) == unavailableFirstRun
+    if state == "loading" then
+        d.kind = "unknown"
+    elseif assignment.emptySlot == true then
+        -- The selected numbered Saved Build holds no Echoes (named when the
+        -- verified active row is known).
+        d.kind, d.empty = "savedBuild", true
+        if slot > 0 then d.slot, d.name = slot, pr.activeSlotName end
+    elseif slot > 0 then
+        d.kind, d.slot, d.name, d.active = "savedBuild", slot, pr.activeSlotName, true
+    elseif firstRun then
+        d.kind = "firstRun"
+    elseif state == "restoring" then
+        -- Unknown is said as unknown, not as nothing captured (review NB2).
+        d.kind, d.reason = "unknown", "restoring"
+    elseif state == "ready" or note:find("^Loadout %d+ ") then
+        -- A Saved Build's plan with no verified active row: a kept Saved
+        -- Build while a native Wishlist slot is active, or a slot payload
+        -- without the verified field. Which Saved Build, and whether it is
+        -- active, is not in this model, so neither is claimed (review B1).
+        d.kind, d.unconfirmed = "savedBuild", true
+    elseif state == "unavailable" or pr.wishlistName then
+        -- The model does not say whether this plan is the first-run target
+        -- or a Saved Build's: neither is claimed.
+        d.kind = "unconfirmed"
+    else
+        d.kind = "none"
+    end
+    d.wishlistState = (state == "ready" and "assigned") or (state == "unassigned" and "unassigned")
+        or (state == "unavailable" and "unavailable")
+        or ((state == "restoring" or state == "loading") and "restoring") or nil
+    -- An empty Saved Build holds no Wishlist of its own (assigning to it is
+    -- refused); a name beside it would be the first-run Wishlist, so none is
+    -- presented as its assignment.
+    if d.empty then d.wishlist, d.wishlistState = nil, nil end
+    return text.DestinationLines(d)
+end
+
 -- Read-only. Opening it marks the shown target as seen, so its chat notice is
 -- not repeated. It changes nothing else.
 function M.ShowUpdateStatus()
@@ -508,14 +574,24 @@ local function AddDpsTooltip(widget, title, personal, global)
         else
             GameTooltip:AddLine("No personal record for this exact loadout.", 0.65, 0.65, 0.65, true)
         end
+        local text = Nexus.UserText
         if global then
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("Best known shared result: " .. FmtDps(global.dps), 1, 0.82, 0)
             local player = global.displayPlayer
                 or ShortName(global.player or "Unknown", 80)
             GameTooltip:AddLine("Held by " .. player, 0.8, 0.8, 0.8)
+            -- M4 (UX-14): only the facts the record carries (duration,
+            -- level, date) and its own owner flag; unknown stays unsaid.
+            local parts = text and text.RecordDetailParts and text.RecordDetailParts(global) or {}
+            if #parts > 0 then GameTooltip:AddLine(table.concat(parts, " - "), 0.75, 0.75, 0.75, true) end
+            local ownerLine = text and text.OwnerLine and text.OwnerLine(global)
+            if ownerLine then GameTooltip:AddLine(ownerLine, 0.75, 0.75, 0.75) end
+        else
+            GameTooltip:AddLine("No shared record for this exact loadout is known to this client.", 0.65, 0.65, 0.65, true)
         end
         GameTooltip:AddLine(" ")
+        if text and text.RECORD_SCOPE then GameTooltip:AddLine(text.RECORD_SCOPE, 0.45, 0.75, 1, true) end
         GameTooltip:AddLine("Records only match identical Echo IDs and stack quantities.", 0.45, 0.75, 1, true)
         GameTooltip:Show()
     end)
@@ -681,6 +757,13 @@ local function EnsureFrame()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Open My Builds", 1, 1, 1)
         GameTooltip:AddLine("Open the server My Builds page. Choosing a different Saved Build there changes the active loadout.", 0.75, 0.75, 0.75, true)
+        -- M4 (UX-04): what this panel's run belongs to, from the facts the
+        -- shown model already carries (M.DestinationLines). Read-only.
+        local lines = M.DestinationLines(M._lastModel)
+        if #lines > 0 then
+            GameTooltip:AddLine(" ")
+            for _, line in ipairs(lines) do GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true) end
+        end
         GameTooltip:Show()
     end)
     switchBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1129,6 +1212,9 @@ local function EnsureFrame()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Import or create a wishlist", 1, 1, 1)
         GameTooltip:AddLine("Paste a wishlist string or build one directly in Nexus.", 0.9, 0.9, 0.9, true)
+        -- M4 (M2 O1): this button only opens the editor. The editor's own
+        -- Create & assign / Create unassigned actions are what save.
+        GameTooltip:AddLine("This opens the Wishlist editor with a draft. Nothing is saved or assigned until you press Create & assign or Create unassigned there.", 0.75, 0.75, 0.75, true)
         GameTooltip:Show()
     end)
     setupImportBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1217,7 +1303,8 @@ local function EnsureFrame()
     buildsBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Build Library", 1, 1, 1)
-        GameTooltip:AddLine("Open My Builds and browse shared community builds.", 0.8, 0.8, 0.8, true)
+        -- M4 (UX-15): "My Builds" is the game's page; the library scope is Mine.
+        GameTooltip:AddLine("Browse shared community builds, and under Mine your Saved Builds and shared listings.", 0.8, 0.8, 0.8, true)
         GameTooltip:Show()
     end)
     buildsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1365,7 +1452,8 @@ local function EnsureFrame()
     end)
     menuBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
-        GameTooltip:AddLine("Nexus Settings", 1, 1, 1)
+        -- M4 (UX-15, M3 NB9): one name for this button everywhere.
+        GameTooltip:AddLine("Menu and status", 1, 1, 1)
         GameTooltip:AddLine("Performance display, wishlist tools, HUD mode, appearance, and panel settings.", 0.8, 0.8, 0.8, true)
         -- model.status (Main.lua's statusLine, including "error (see /nexus
         -- err)") was set on every render but never read anywhere in this file --
@@ -1400,7 +1488,7 @@ local function EnsureFrame()
     bestDpsText:SetPoint("BOTTOM", frame, "BOTTOM", 0, 33)
     bestDpsText:SetSize(280, 14)
     bestDpsText:SetJustifyH("CENTER")
-    bestDpsText:SetText("|cff888888Best DPS: hit a training dummy to record|r")
+    bestDpsText:SetText("|cff888888Your best DPS: hit a training dummy to record|r")
     bestDpsHit = HitFrame(frame, bestDpsText)
     bestDpsHit:SetScript("OnEnter", function(self)
         local info = M._lastModel and M._lastModel.bestDps
@@ -1593,17 +1681,22 @@ local function RenderPerformance(pr, completed)
     local topDummy, topLK = dummy.global, lk.global
 
     local count = tonumber(pr.total) or 0
+    -- M4 (UX-14): the shared column is the best record this client knows for
+    -- these exact Echoes, not a global ranking (UserText.BEST_KNOWN).
+    local text = Nexus.UserText
+    local bestKnown = text and text.BEST_KNOWN or "Best known"
     if completed then
         performanceLabel:SetText("TRAINING DUMMY")
         setLabelText:SetText("")
         dummyLabel:SetText("Your Best")
-        dummyGlobal:SetText("Global Best")
+        dummyGlobal:SetText(bestKnown)
         lkPersonalLabel:SetText("LICH KING")
         lkLabel:SetText("Your Best")
-        lkGlobal:SetText("Global Best")
+        lkGlobal:SetText(bestKnown)
     else
         performanceLabel:SetText("DPS RECORDS")
-        setLabelText:SetText("Target build · " .. count .. " Echoes")
+        -- M4 (UX-13): the plan's rolled copies, not Echo rows or names.
+        setLabelText:SetText("Target build · " .. count .. " rolled copies")
         dummyLabel:SetText("Your Dummy")
         lkLabel:SetText("Your Lich King")
     end
@@ -1613,8 +1706,8 @@ local function RenderPerformance(pr, completed)
         dummyGlobalValue:SetText(topDummy and ("|cffffd200" .. FmtDps(topDummy.dps) .. "|r") or "|cff777777—|r")
         lkGlobalValue:SetText(topLK and ("|cffffd200" .. FmtDps(topLK.dps) .. "|r") or "|cff777777—|r")
     else
-        dummyGlobal:SetText(topDummy and ("Global  |cffffd200" .. FmtDps(topDummy.dps) .. "|r") or "Global  —")
-        lkGlobal:SetText(topLK and ("Global  |cffffd200" .. FmtDps(topLK.dps) .. "|r") or "Global  —")
+        dummyGlobal:SetText(topDummy and (bestKnown .. "  |cffffd200" .. FmtDps(topDummy.dps) .. "|r") or (bestKnown .. "  —"))
+        lkGlobal:SetText(topLK and (bestKnown .. "  |cffffd200" .. FmtDps(topLK.dps) .. "|r") or (bestKnown .. "  —"))
     end
 
     AddDpsTooltip(dummyHit, "Training Dummy", myDummy, topDummy)
@@ -1906,9 +1999,10 @@ local function RenderBestDps(model, complete, noBuild, activeRoll, statusVisible
     if dummyBest or lkBest then
         local dummyText = dummyBest and ("|cff4dff80" .. FmtDps(dummyBest.dps) .. "|r") or "|cff777777—|r"
         local lkText = lkBest and ("|cff4dff80" .. FmtDps(lkBest.dps) .. "|r") or "|cff777777—|r"
-        bestDpsText:SetText("|cffb8b8b8Best DPS:|r  Dummy " .. dummyText .. "  |cff666666•|r  Lich King " .. lkText)
+        -- M4 (UX-14): the character's own records, not a shared ranking.
+        bestDpsText:SetText("|cffb8b8b8Your best DPS:|r  Dummy " .. dummyText .. "  |cff666666•|r  Lich King " .. lkText)
     else
-        bestDpsText:SetText("|cff888888Best DPS: hit a training dummy to record|r")
+        bestDpsText:SetText("|cff888888Your best DPS: hit a training dummy to record|r")
     end
     if not noBuild then
         bestDpsText:Show()
@@ -2220,7 +2314,13 @@ local function ApplyModel(model, signatures, roll)
         frame:SetHeight((showPerformance and (rollBlock and 448 or 325) or (rollBlock and 388 or 267)) - statusHeightReduction + toLockExtra)
         SetPoint(progressLabel, "TOPLEFT", frame, "TOPLEFT", 12, contentTop)
         SetPoint(progressValue, "TOPLEFT", frame, "TOPLEFT", 12, contentTop - 17)
-        progressValue:SetText(string.format("%d / %d complete", owned, total))
+        -- M4 (UX-13): rolled copies this run, with the locked targets still to
+        -- lock; never "complete" while a locked target is outstanding. The
+        -- short form keeps clear of the MISSING TOMES box on the same row.
+        local text = Nexus.UserText
+        progressValue:SetText(text and text.RunProgressText
+            and text.RunProgressText(owned, total, #toLockNamesCache, #unknownTomesCache > 0)
+            or string.format("%d / %d rolled copies this run", owned, total))
 
         SetPoint(needLabel, "TOPLEFT", frame, "TOPLEFT", 12, contentTop - 42)
         needLabel:SetText("STILL NEEDED")

@@ -701,7 +701,7 @@ local function ShowLoadoutSwitchMenu(anchor)
     for slot = 1, count do
         local data = slots and slots.bySlot and slots.bySlot[slot]
         local name = data and tostring(data.name or "") or ""
-        if name == "" then name = "Loadout " .. tostring(slot) end
+        if name == "" then name = "Saved Build " .. tostring(slot) end
         local linked = View and View.GetLoadoutWishlist and View.GetLoadoutWishlist(slot)
         candidates[#candidates + 1] = {
             slot = slot,
@@ -781,7 +781,7 @@ local function ShowLoadoutSwitchMenu(anchor)
                 row:Disable()
                 row:SetScript("OnClick", nil)
                 row:SetScript("OnMouseDown", nil)
-                row._label:SetText("|cff666666Loadout " .. tostring(targetSlot) .. "  Empty|r")
+                row._label:SetText("|cff666666Saved Build " .. tostring(targetSlot) .. "  Empty|r")
             end
             row:Show()
         else
@@ -1285,8 +1285,12 @@ local function EnsureFrame()
     wishlistNameBox:SetSize(260, 22)
     wishlistNameBox:SetPoint("LEFT", wishlistNameLabel, "RIGHT", 10, 0)
     wishlistNameBox:SetAutoFocus(false)
-    -- Raw names are limited to 48 bytes. A display-only projection can double
-    -- every pipe, so the editable widget must admit the full inert form.
+    -- M4 (PRIORITY.N14): the field admits 96 letters; a display-only
+    -- projection can double every pipe, so it must admit the full inert form.
+    -- A typed name is not shortened by Nexus. A generated copy name is capped
+    -- at 96 letters / 120 bytes at a whole UTF-8 letter (WishlistModel
+    -- UniqueName), the name size an EBH1 code carries (Codec). The server's
+    -- own Wishlist name limit is not known here and is not assumed.
     wishlistNameBox:SetMaxLetters(96)
     wishlistNameBox._NexusSetRawText = function(self, value)
         local raw = tostring(value or "")
@@ -1755,11 +1759,12 @@ local function EnsureFrame()
         local editingContext = EditingContext()
         local blocked = Controller.ApplyBlockReason()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
-        GameTooltip:AddLine(editingContext and "Save this assigned Wishlist" or "Create a server wishlist", 1, 0.8, 0.3)
+        -- M4 (UX-15): one word, Wishlist (it is kept on the server).
+        GameTooltip:AddLine(editingContext and "Save this assigned Wishlist" or "Create a Wishlist", 1, 0.8, 0.3)
         GameTooltip:AddLine(blocked and ("Unavailable: "
             .. (SafeDisplay(blocked, 1024, false) or "unknown reason")) or (editingContext and
             ("Edits only: " .. (SafeDisplay(editingContext.name, 1024, false) or "Wishlist")) or
-            "Uploads the pending Echo list as a new server wishlist."), 0.8, 0.8, 0.8, true)
+            "Uploads the pending Echo list as a new Wishlist on the server."), 0.8, 0.8, 0.8, true)
         for _, line in ipairs(M.ApplyIntentLines()) do GameTooltip:AddLine(line, 0.8, 0.8, 0.8, true) end
         GameTooltip:AddLine("A confirmation is shown before anything is replaced.", 0.8, 0.8, 0.8, true)
         GameTooltip:Show()
@@ -2426,7 +2431,8 @@ local function RefreshView(catalogRevision)
         footerParts[#footerParts + 1] = "Currently locked: " .. lockedCount
             .. (lockedMaximum and ("/" .. lockedMaximum) or "")
     end
-    footerParts[#footerParts + 1] = "Rolled copies: " .. PendingTotal() .. "/79"
+    -- M4 (UX-13): the editor counts a plan, so its rolled copies are planned.
+    footerParts[#footerParts + 1] = "Planned rolled copies: " .. PendingTotal() .. "/79"
     local totalDesigned = designedCount + toLockCount
     local targetParts = { "Locked targets: " .. totalDesigned .. "/6" }
     -- realEntryCount, not #list -- the spliced-in "replaces" ghost rows are

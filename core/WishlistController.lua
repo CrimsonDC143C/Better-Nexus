@@ -2189,7 +2189,7 @@ function Controller.New(options)
             -- while saved data can be written.
             trace.writeMode, trace.writeReason = SessionOnlyWrite()
             notify("|cff4dff80Nexus:|r Wishlist saved ("
-                .. DraftModel.EchoListTotal(echoes) .. "/79 rolled copies; planned locked targets are separate)."
+                .. DraftModel.EchoListTotal(echoes) .. "/79 rolled copies planned; planned locked targets are saved separately)."
                 .. (trace.writeMode and " Saved data cannot be written right now, so its assignment and locked "
                     .. "targets on this character last this session only." or ""))
             return true

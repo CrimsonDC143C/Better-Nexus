@@ -258,7 +258,7 @@ local SELECTOR_LINES={
   ..'Assigning by itself does not change any Saved Build.',
  'With Auto ON, Nexus may replace the active Saved Build with a finished run that '
   ..'has more overall Wishlist progress, or equal progress after cleanup or an even swap of requested '
-  ..'copies. At level 80 after a finished run, Auto checks again right away when you change the assignment. '
+  ..'copies. At level 80, a changed assignment makes Auto check a finished run it has not saved yet. '
   ..'Saving edits to the assigned Wishlist can also lead to a replacement without a new run.',
  'The replaced build may hold an Echo you value, even one obtained with Orbs: '
   ..'Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged.',

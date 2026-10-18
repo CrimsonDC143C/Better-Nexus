@@ -81,8 +81,10 @@ local TOME_STALE = "This reading may be stale; Tome state coverage gives the rea
 local DeselectOurTab
 -- Assignment only records the target. The automatic save (Auto ON, autoSave,
 -- Ratchet.Dominates) is what may replace the active Saved Build. A changed
--- assignment marks the projection dirty, so at level 80 with a finished run
--- the save check runs again at once against the new Wishlist.
+-- assignment marks the adapter's data dirty (MarkWishlistProjectionDirty);
+-- Auto's next update step (AutomationRuntime RunUpdate -> StepSave) then
+-- checks a finished level-80 run not yet saved this visit against the newly
+-- assigned Wishlist. M4 (FN7): the copy states that trigger, not a latency.
 local ASSIGN_NOTE = "Assigning by itself does not change any Saved Build."
 -- An empty numbered Saved Build holds no Wishlist of its own and refuses an
 -- assignment. The name the Journal shows beside it is the retained first-run
@@ -94,7 +96,7 @@ local EMPTY_SLOT_SELECTOR = "This Saved Build is empty, so no Wishlist can be as
     .. "A name shown here is the first-run Wishlist, not an assignment to this Saved Build. " .. ASSIGN_NOTE
 local AUTO_SAVE_WARNING = "With Auto ON, Nexus may replace the active Saved Build with a finished run that "
     .. "has more overall Wishlist progress, or equal progress after cleanup or an even swap of requested "
-    .. "copies. At level 80 after a finished run, Auto checks again right away when you change the assignment. "
+    .. "copies. At level 80, a changed assignment makes Auto check a finished run it has not saved yet. "
     .. "Saving edits to the assigned Wishlist can also lead to a replacement without a new run."
 local AUTO_SAVE_ORBS = "The replaced build may hold an Echo you value, even one obtained with Orbs: "
     .. "Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged."
