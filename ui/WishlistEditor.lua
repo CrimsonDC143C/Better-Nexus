@@ -458,8 +458,20 @@ function RolePicker.Accept()
         return LoadImportedWishlist({entries=echoes,name=name,class=class},name)
     end
     if state.assign then
+        -- One slots read. An unknown or missing read proves no target, so it
+        -- refuses before roles are confirmed or anything is written; it is
+        -- never taken as "no Saved Build" (first run). A known read is
+        -- compared through the Saved Build Nexus selects, projected from this
+        -- same read (0 = none): the authority the Journal captured
+        -- state.activeSlot from. The raw native slot can be a Wishlist index
+        -- and is not compared. state.activeSlot stays the destination; a
+        -- different current selection refuses and never retargets it.
         local slots=Adapter and Adapter.Slots and Adapter.Slots()
-        if not slots or tonumber(slots.activeSlot or 0)~=state.activeSlot then
+        if type(slots)~="table" or slots.activeKnown==false then
+            RolePicker.Message("Loadout data is not available right now. Nothing was confirmed or assigned; wait for it to load, then confirm again.")
+            return false
+        end
+        if (wishlistController.SelectedSavedBuild(slots) or 0)~=state.activeSlot then
             RolePicker.Message("The active loadout changed. Cancel and select the intended loadout again.")
             return false
         end
@@ -878,7 +890,9 @@ end
 
 function M.Show()
     local slots=Adapter and Adapter.Slots and Adapter.Slots()
-    local active=slots and tonumber(slots.activeSlot) or 0
+    -- The selected Saved Build, never a native Wishlist index: an association
+    -- stored under one stays stored but is not opened as a loadout here.
+    local active=wishlistController.SelectedSavedBuild(slots) or 0
     if active>0 and Adapter.GetLoadoutWishlistState then
         local candidate,status=Adapter.GetLoadoutWishlistState(active)
         if status=="evidence-pending" and candidate then return M.OpenForWishlist(candidate,active) end

@@ -14,6 +14,7 @@ local MAX_TEXT = 96
 local MAX_EVENT_REPORT = 220
 local events, first, count = {}, 1, 0
 local enabled, startedAt, stoppedAt, intendedPeer = false, 0, 0, nil
+local intendedRequester, intendedNativeRequester
 local dropped, expired, revisionSource = 0, 0, nil
 local counters = {}
 local selectedBuildId
@@ -25,6 +26,10 @@ local ALLOWED_FIELDS = {
     received=true,duplicate=true,tombstone=true,
     operation=true,attempts=true,
 }
+-- Correlation comes only from existing scalar request/transfer envelopes.
+-- Keep wire-sized IDs exact; reject oversized or non-scalar values rather
+-- than truncating two distinct IDs into the same apparent request.
+local CORRELATION_TEXT = {requestId=96,requester=96,transferId=160}
 
 -- Owner-boundary evidence has no player or build identifiers. Keep these
 -- fields typed even if a caller supplies unexpected values.
@@ -49,6 +54,43 @@ end
 
 local function CleanPeer(value)
     return Identity.DisplayPlayer(value)
+end
+
+local function CorrelationText(key, value)
+    return type(value) == "string" and value ~= ""
+        and #value <= CORRELATION_TEXT[key]
+        and CleanText(value, #value) == value
+        and (key ~= "requester" or Identity.ValidPlayer(value))
+end
+
+local function SetRequesterFilter(value)
+    intendedRequester = Identity.PlayerKey(value, true)
+    -- A short selection may match this exact native realm, pinned once at
+    -- selection. Never strip a supplied requester's realm or alias realms.
+    local native
+    if intendedRequester and not value:find("-", 1, true) then
+        local ok, sender = pcall(Identity.NativeChannelSender, value)
+        if ok then native = sender end
+    end
+    intendedNativeRequester = native and Identity.PlayerKey(native, true) or nil
+end
+
+local function RequestCorrelation(fields)
+    if not CorrelationText("requestId", fields.requestId)
+        or not CorrelationText("requester", fields.requester) then return false end
+    -- Wire IDs obey the existing identifier grammar. Generated legacy scopes
+    -- instead bind the exact valid requester and an integer clock suffix.
+    if not fields.requestId:match("^[%w%._:@%+%-]+$") then
+        local prefix = "legacy-" .. fields.requester .. "-"
+        if fields.requestId:sub(1, #prefix) ~= prefix
+            or not fields.requestId:sub(#prefix + 1):match("^%d+$") then return false end
+    end
+    return true
+end
+
+local function RequesterMatches(value)
+    local key = Identity.PlayerKey(value, true)
+    return key ~= nil and (key == intendedRequester or key == intendedNativeRequester)
 end
 
 local function ResetEvents()
@@ -94,6 +136,7 @@ end
 
 function PeerDebug.SetPeer(value)
     intendedPeer = CleanPeer(value)
+    SetRequesterFilter(value)
     return intendedPeer
 end
 
@@ -104,6 +147,7 @@ function PeerDebug.Start(peer)
     end
     ResetEvents()
     intendedPeer = cleaned
+    SetRequesterFilter(peer)
     startedAt, stoppedAt, enabled = Now(), 0, true
     PeerDebug.Record("session_start", {
         peer=intendedPeer or "any",outcome="active",
@@ -121,6 +165,7 @@ end
 function PeerDebug.Clear()
     ResetEvents()
     enabled, startedAt, stoppedAt, intendedPeer = false, 0, 0, nil
+    intendedRequester, intendedNativeRequester = nil, nil
     return true
 end
 
@@ -128,9 +173,17 @@ function PeerDebug.Record(kind, fields)
     if not CheckAge() then return false end
     kind = CleanText(kind, 40)
     if kind == "" then return false end
-    if intendedPeer and type(fields) == "table" and fields.peer ~= nil then
-        local eventPeer = CleanPeer(fields.peer)
-        if not eventPeer or not Identity.SamePlayer(eventPeer, intendedPeer) then
+    if intendedPeer and type(fields) == "table" then
+        local correlated = kind ~= "owner_boundary" and RequestCorrelation(fields)
+        local requesterMatches = correlated and RequesterMatches(fields.requester)
+        if fields.peer ~= nil then
+            local eventPeer = CleanPeer(fields.peer)
+            if not eventPeer then return false end
+            if not Identity.SamePlayer(eventPeer, intendedPeer)
+                and not requesterMatches then return false end
+        elseif correlated and not requesterMatches then
+            -- Global observations keep their old behavior; a real request
+            -- envelope must not bypass the selection merely by having no peer.
             return false
         end
     end
@@ -143,6 +196,23 @@ function PeerDebug.Record(kind, fields)
                 if type(value) == "string" and OWNER_SOURCES[value] then
                     event.fields[key] = value
                 end
+            elseif kind ~= "owner_boundary" and CORRELATION_TEXT[key] then
+                if CorrelationText(key, value) then
+                    event.fields[key] = value
+                end
+            elseif kind ~= "owner_boundary" and key == "dataKind" then
+                if value == "B" or value == "D" then event.fields[key] = value end
+            elseif kind ~= "owner_boundary" and key == "bucket" then
+                if type(value) == "number" and value >= 1 and value <= 8
+                    and value == math.floor(value) then event.fields[key] = value end
+            elseif kind ~= "owner_boundary" and key == "relay" then
+                if type(value) == "boolean" then event.fields[key] = value end
+            elseif kind ~= "owner_boundary" and key == "senderForm" then
+                if value == "bare" or value == "qualified" then
+                    event.fields[key] = value
+                end
+            elseif kind ~= "owner_boundary" and key == "nativeOwnerContext" then
+                if type(value) == "boolean" then event.fields[key] = value end
             elseif kind ~= "owner_boundary" and ALLOWED_FIELDS[key] then
                 local valueType = type(value)
                 if valueType == "number" then
@@ -179,6 +249,12 @@ local function SnapshotEvents()
         out[#out + 1] = copy
     end
     return out
+end
+
+-- Detached, bounded session evidence. No records, payloads or SV references.
+function PeerDebug.Events()
+    CheckAge()
+    return SnapshotEvents()
 end
 
 function PeerDebug.Stats()
@@ -264,21 +340,48 @@ end
 local function FormatFields(fields)
     local keys = {}
     for key in pairs(fields or {}) do keys[#keys + 1] = key end
-    table.sort(keys)
-    local out, used = {}, 0
-    for _, key in ipairs(keys) do
-        local part = key .. "=" .. CleanText(fields[key], MAX_TEXT)
-        local separator = #out > 0 and 1 or 0
-        if used + separator + #part > MAX_EVENT_REPORT then
-            local remaining = MAX_EVENT_REPORT - used - separator
-            if remaining >= 4 then
-                out[#out + 1] = part:sub(1, remaining - 3) .. "..."
+    if not (fields.requestId or fields.requester or fields.transferId) then
+        -- Keep the established descriptive report/paging behavior unchanged
+        -- for events without a correlation envelope.
+        table.sort(keys)
+        local out, used = {}, 0
+        for _, key in ipairs(keys) do
+            local part = key .. "=" .. CleanText(fields[key], MAX_TEXT)
+            local separator = #out > 0 and 1 or 0
+            if used + separator + #part > MAX_EVENT_REPORT then
+                local remaining = MAX_EVENT_REPORT - used - separator
+                if remaining >= 4 then out[#out + 1] = part:sub(1, remaining - 3) .. "..." end
+                break
             end
-            break
+            out[#out + 1] = part
+            used = used + separator + #part
         end
-        out[#out + 1] = part
-        used = used + separator + #part
+        return table.concat(out, " ")
     end
+    local priority = {requestId=1,outcome=2,requester=3,dataKind=4,bucket=5,transferId=6}
+    table.sort(keys, function(left, right)
+        local l, r = priority[left] or 7, priority[right] or 7
+        return l == r and left < right or l < r
+    end)
+    local out, used, omitted, omittedFields = {}, 0, {}, 0
+    -- Reserve enough room to name all three omitted correlation fields and
+    -- count omitted descriptive fields. Never print a partial ID as proof.
+    local budget = MAX_EVENT_REPORT - 56
+    for _, key in ipairs(keys) do
+        local part = key .. "=" .. CleanText(fields[key],
+            CORRELATION_TEXT[key] or MAX_TEXT)
+        local separator = #out > 0 and 1 or 0
+        if used + separator + #part <= budget then
+            out[#out + 1] = part
+            used = used + separator + #part
+        elseif CORRELATION_TEXT[key] then
+            omitted[#omitted + 1] = key
+        else
+            omittedFields = omittedFields + 1
+        end
+    end
+    if #omitted > 0 then out[#out + 1] = "omitted=" .. table.concat(omitted, ",") end
+    if omittedFields > 0 then out[#out + 1] = "fields_omitted=" .. omittedFields end
     return table.concat(out, " ")
 end
 
@@ -373,7 +476,7 @@ function PeerDebug.Report()
         string.format("status=%s age=%.1fs retained=%d/%d dropped=%d expired=%d peer=%s",
             enabled and "active" or "stopped", math.max(0, Now() - startedAt),
             count, MAX_EVENTS, dropped, expired, intendedPeer or "any"),
-        string.format("event_scope=observation peer_filter=%s peer_events=%s global_events=included routing=unchanged",
+        string.format("event_scope=observation peer_filter=%s peer_events=%s correlated_events=peer_or_exact_requester global_events=included routing=unchanged",
             intendedPeer or "any", intendedPeer and "filtered" or "all"),
         "counter_scope=addon_session event_history=peer_test_session",
         string.format("version=%s build=%s protocol=%s channel=%s index=%s connected=%s receiving=%s quiet_in=%.1fs",

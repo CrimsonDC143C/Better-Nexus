@@ -996,7 +996,7 @@ local function EnsurePostPopup()
     -- shown; it does not depend on the Community window, a view refresh, Sync
     -- housekeeping or a receive window.
     local statusElapsed=0
-    p:SetScript("OnUpdate",function(_,elapsed)
+    local function OnPostStatusUpdate(_,elapsed)
         statusElapsed=statusElapsed+(tonumber(elapsed) or 0)
         if statusElapsed<0.5 then return end
         statusElapsed=0
@@ -1004,6 +1004,14 @@ local function EnsurePostPopup()
             local text=PostStatusText()
             if p._shareStatus:GetText()~=text then p._shareStatus:SetText(text) end
         end
+    end
+    p:SetScript("OnUpdate", OnPostStatusUpdate)
+    p:HookScript("OnHide", function(self)
+        self:SetScript("OnUpdate", nil)
+        statusElapsed = 0
+    end)
+    p:HookScript("OnShow", function(self)
+        self:SetScript("OnUpdate", OnPostStatusUpdate)
     end)
     local shareStatus=p:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); shareStatus:SetPoint("TOPLEFT",16,-396); shareStatus:SetSize(334,96); shareStatus:SetJustifyH("LEFT"); shareStatus:SetJustifyV("TOP"); p._shareStatus=shareStatus
     if Nexus.LayoutMetrics and Nexus.LayoutMetrics.ApplyFontTree then
@@ -2222,9 +2230,13 @@ local function EnsureFrame()
     frame:SetScript("OnDragStart",function(self) self:StartMoving() end)
     frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
 
-    local retryTicker, statusTicker, dataTicker = 0, 0, 0
+    local retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
+    local PUMP_INTERVAL = 0.1
     local lastReceiving = false
-    frame:SetScript("OnUpdate",function(self,elapsed)
+    -- Named so Hide can detach it. Hidden frames already skip OnUpdate in
+    -- 3.3.5a; clearing the script makes dormancy explicit and prevents any
+    -- accidental re-Show of a child from keeping this pump alive.
+    local function OnFrameUpdate(self,elapsed)
         if not self:IsShown() then return end
         local controller = ControllerInstance()
         local receivingNow = Nexus.Sync and Nexus.Sync.IsReceiving
@@ -2256,28 +2268,48 @@ local function EnsureFrame()
             lastReceiving = receivingNow
         end
 
-        if type(controller.HasPendingSavedLoadoutImport) == "function"
-            and controller.HasPendingSavedLoadoutImport() then
-            local _, pending = PrepareData(false)
-            if not pending then M.Refresh() end
-        end
+        local importPending = type(controller.HasPendingSavedLoadoutImport) == "function"
+            and controller.HasPendingSavedLoadoutImport()
         if receiveEnded and refreshDirty then
             virtualStats.deferredRefreshes =
                 virtualStats.deferredRefreshes + 1
             M.Refresh()
             return
         end
-        local projections = Nexus and Nexus.ViewProjections
+
+        -- Dirty-flag gate: PumpBuilds only while new data, a pending job, a
+        -- cold open, or a saved-loadout import needs work. Cap at 10 Hz.
         local coldStart = virtualStats.dataBinds == 0
-        if projections and (not receivingNow or coldStart)
-            and type(projections.PumpBuilds) == "function" then
-            -- A receive window may already be active when the browser first
-            -- opens. Keep that cold persisted projection moving, but retain an
-            -- existing last-good publication until the burst becomes quiet.
-            if receivingNow and coldStart then M.Refresh() end
-            local ok, published, pumpError = pcall(projections.PumpBuilds)
-            if ok and published then M.Refresh() end
-            if ok and pumpError then M.Refresh() end
+        local needPump = refreshDirty or viewDiagnostic.projectionPending
+            or coldStart or importPending
+        if not needPump then
+            pumpTicker = 0
+        else
+            pumpTicker = pumpTicker + elapsed
+            if pumpTicker >= PUMP_INTERVAL then
+                pumpTicker = 0
+                if importPending then
+                    local _, pending = PrepareData(false)
+                    if not pending then M.Refresh() end
+                elseif refreshDirty and not viewDiagnostic.projectionPending
+                    and not receivingNow then
+                    -- MarkDataDirty clears projectionPending; request a job
+                    -- before PumpBuilds can advance one.
+                    M.Refresh()
+                end
+                local projections = Nexus and Nexus.ViewProjections
+                if projections and (not receivingNow or coldStart)
+                    and type(projections.PumpBuilds) == "function" then
+                    -- A receive window may already be active when the browser
+                    -- first opens. Keep that cold persisted projection moving,
+                    -- but retain an existing last-good publication until the
+                    -- burst becomes quiet.
+                    if receivingNow and coldStart then M.Refresh() end
+                    local ok, published, pumpError = pcall(projections.PumpBuilds)
+                    if ok and published then M.Refresh() end
+                    if ok and pumpError then M.Refresh() end
+                end
+            end
         end
 
         -- Cheap safety probe for missed invalidations. An unchanged tick does
@@ -2317,13 +2349,22 @@ local function EnsureFrame()
                 virtualStats.periodicSkips = virtualStats.periodicSkips + 1
             end
         end
-    end)
-    frame:Hide()
-    frame:HookScript("OnHide",function()
+    end
+    local function PauseFrameUpdates()
+        frame:SetScript("OnUpdate", nil)
+        retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
         if dropPanel then dropPanel:Hide() end
         if sortPanel then sortPanel:Hide() end
         if dropdownShield then dropdownShield:Hide() end
-    end)
+        HidePostMenus()
+    end
+    local function ResumeFrameUpdates()
+        frame:SetScript("OnUpdate", OnFrameUpdate)
+    end
+    frame:SetScript("OnUpdate", OnFrameUpdate)
+    frame:Hide()
+    frame:HookScript("OnHide", PauseFrameUpdates)
+    frame:HookScript("OnShow", ResumeFrameUpdates)
 
     pcall(function()
         frame:SetBackdrop({
@@ -3516,7 +3557,11 @@ end
     end
 
     function M.Hide()
-        if frame then frame:Hide() end
+        if not frame then return end
+        -- Hide drives PauseFrameUpdates (OnHide): OnUpdate cleared, menus shut.
+        -- Share/Edit popups are separate UIParent frames and keep their own
+        -- lifetime so an in-flight Share status line can finish while closed.
+        frame:Hide()
     end
 
     function M.IsShown()

@@ -1051,10 +1051,13 @@ local function PlanLockCommit(pending, pendingLock, fulfilledTargets, existingTa
     for _, row in pairs(type(pendingLock) == "table" and pendingLock or {}) do
         if type(row.replaces) == "number" then replaced[row.replaces] = true end
     end
-    local fulfilledEntries = TargetMapEntries(type(fulfilledTargets) == "table"
-        and fulfilledTargets or {}, catalog) or {}
-    local existingEntries = TargetMapEntries(type(existingTargets) == "table"
-        and existingTargets or {}, catalog) or {}
+    local fulfilledEntries = TargetMapEntries(fulfilledTargets == nil and {} or fulfilledTargets, catalog)
+    local existingEntries = TargetMapEntries(existingTargets == nil and {} or existingTargets, catalog)
+    -- A bad row is not an empty design. Dropping it here would also drop
+    -- unrelated fulfilled targets and let a successful save replace them.
+    if not fulfilledEntries or not existingEntries then
+        return nil, "invalid_locked_design"
+    end
     for _, target in ipairs(fulfilledEntries) do
         for _, replacement in ipairs(target.replacements) do
             replaced[replacement] = true
@@ -1102,7 +1105,8 @@ local function PlanLockCommit(pending, pendingLock, fulfilledTargets, existingTa
     for id, rows in pairs(plannedRows) do
         fresh[id] = TargetRecord(rows, plannedReplacements[id])
     end
-    return TargetMapEntries(fresh, catalog) and fresh or {}
+    if not TargetMapEntries(fresh, catalog) then return nil, "invalid_locked_design" end
+    return fresh
 end
 
 local function ReconcileLocked(pending, pendingLock, fulfilledTargets, lockedBySpell)

@@ -68,6 +68,7 @@ function Transport.New(options)
         "requester", "requestId", "transferId", "shareId", "buildId", "dpsId",
         "queueClass", "enqueuedAt", "expiresAt", "attempts",
         "chunkOrdinal", "chunkTotal", "category",
+        "dataKind", "bucket",
         "operationKind", "operationId", "operationVersion", "operationKey",
         "manualGrant",
     }
@@ -544,7 +545,8 @@ function Transport.New(options)
         stats.admittedPackets = (stats.admittedPackets or 0) + #payloads
         stats.admittedBytes = (stats.admittedBytes or 0) + admittedBytes
         observe("queue_admitted", {outcome="admitted",chunks=#payloads,
-            queue=QueueDepth(isControl),queueClass=queueClass})
+            queue=QueueDepth(isControl),queueClass=queueClass},
+            CopyMetadata(metadata, queueClass, 1, #payloads))
         return true, nil, operationStatus
     end
 

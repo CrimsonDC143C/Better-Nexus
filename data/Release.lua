@@ -6,10 +6,10 @@ Nexus = Nexus or {}
 Nexus.Release = {
     version = "1.20.0-beta.1",
     baseVersion = "1.19.5",
-    buildLabel = "source",
+    buildLabel = "test.2026101704-84de97741ebd",
     -- "development" in the repository. tools/build_package.py writes
     -- "public-test" only for an explicitly public package, else "internal".
-    channel = "development",
+    channel = "internal",
     published = false,
     releasesUrl = "https://github.com/Viscerals/Better-Nexus/releases",
 }

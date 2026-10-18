@@ -1,7 +1,8 @@
 -- Nexus: ui/JournalTab.lua
 -- A "Nexus Progress" tab (formerly "Nexus Advisor") inside ProjectEbonhold's
--- Echo Journal: a read-only Build Progress summary first, then the plain text
--- sections supplied by an injected dataProvider callback behind Show details.
+-- Echo Journal: a read-only Build Progress summary first, then the sections
+-- supplied by an injected dataProvider callback behind Show details: plain
+-- text, or icon rows where a section supplies structured tomeRows.
 -- Structures relied on (captured live against this exact client):
 --   frame  ProjectEbonholdEchoJournal
 --   tabs   ProjectEbonholdEchoJournalTab1..N (CharacterFrameTabButton
@@ -63,8 +64,20 @@ local OFF_UNAVAILABLE = "Off Wishlist: unavailable. The list of these families c
 local NEUTRAL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 local ROW_H, TILE = 26, 24
 local detailsShown = false
+-- Set by M.Invalidate after a semantic change; cleared by every page refresh.
+local refreshPending = false
 local detailsButton, buildsButton, introHover, countsHover
 local rowPool, rowsUsed = {}, 0
+-- Tome state rows behind Show details have their own pool, so their theme
+-- colours and tooltip entries never carry over into the Missing rows.
+local tomePool, tomesUsed = {}, 0
+local TOME_STATUS_W = 120
+-- The provider's request section. Its title does not begin with "Pending",
+-- which Summarize reads as the Wishlist's missing-family list.
+local TOME_REQUESTS = "Tome requests awaiting confirmation"
+local PENDING_BADGE = { enable = "Enable pending", disable = "Disable pending" }
+local TOME_SCOPE = "Observed when this page was refreshed; server state and freshness are unverified."
+local TOME_STALE = "This reading may be stale; Tome state coverage gives the reason."
 local DeselectOurTab
 -- Assignment only records the target. The automatic save (Auto ON, autoSave,
 -- Ratchet.Dominates) is what may replace the active Saved Build. A changed
@@ -186,6 +199,9 @@ local function Summarize(sections)
     else
         s.known, s.title, s.pending, s.off = true, head, pending, off
         s.total, s.represented, s.missing, s.offCount = total, rep, miss, offN
+        -- The one section these Missing rows were validated from (Show
+        -- details draws it without repeating them).
+        s.pendingSection = pendingSec
     end
     return s
 end
@@ -314,49 +330,141 @@ local function RowLeave(self)
     if GameTooltip then GameTooltip:Hide() end
 end
 
+-- A provider string worth showing, or nil.
+local function Filled(value)
+    return type(value) == "string" and value ~= "" and value or nil
+end
+
+local function RequestText(pending)
+    local request = pending == "enable" and "Enable requested"
+        or pending == "disable" and "Disable requested" or "Request direction unknown"
+    return request .. "; awaiting confirmation. A request is not a confirmed change."
+end
+
+-- The complete tome entry: the observation and any request kept apart, the
+-- supplied reason and plan, its Echoes, the raw control ID and where the icon
+-- came from. Only the supplied entry is read.
+local function TomeRowEnter(self)
+    if self.hover then self.hover:Show() end
+    local t = self.tome
+    if not (GameTooltip and type(t) == "table") then return end
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine(t.name, 1, 1, 1, true)
+    local observed = Filled(t.status) or "Unknown"
+    if self.tomeRequest then
+        GameTooltip:AddLine(RequestText(t.pending), 1, 0.82, 0, true)
+        GameTooltip:AddLine("Last observed in the client mirror: " .. observed, 0.82, 0.82, 0.82, true)
+    else
+        GameTooltip:AddLine("Client mirror: " .. observed, 0.82, 0.82, 0.82, true)
+        if t.pending ~= nil then GameTooltip:AddLine(RequestText(t.pending), 1, 0.82, 0, true) end
+    end
+    if Filled(t.reason) then GameTooltip:AddLine(t.reason, 0.82, 0.82, 0.82, true) end
+    if Filled(t.plan) then GameTooltip:AddLine(t.plan, 0.82, 0.82, 0.82, true) end
+    local names = {}
+    if type(t.echoNames) == "table" then
+        for i = 1, #t.echoNames do names[#names + 1] = Filled(t.echoNames[i]) end
+    end
+    if #names > 0 then
+        GameTooltip:AddLine((#names == 1 and "Echo: " or "Echoes: ") .. table.concat(names, ", "),
+            0.82, 0.82, 0.82, true)
+    end
+    if t.leverId ~= nil then GameTooltip:AddLine("Control ID: " .. tostring(t.leverId), 0.6, 0.6, 0.6, true) end
+    local icon = not self.tomeIcon and "No icon was supplied, so a neutral icon is shown."
+        or t.iconSource == "tome spell" and "Icon: the tome's spell icon."
+        or t.iconSource == "representative Echo spell"
+            and "Icon: a member Echo's spell icon; the tome's own icon was unavailable."
+        or "Icon: as supplied; its source was not stated."
+    GameTooltip:AddLine(icon, 0.6, 0.6, 0.6, true)
+    if t.stale == true then GameTooltip:AddLine(TOME_STALE, 1, 0.63, 0.25, true) end
+    GameTooltip:AddLine(TOME_SCOPE, 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+end
+
+-- A section's structured tome rows, or nil so that its text lines are shown:
+-- a plain non-empty sequence whose every entry carries a readable name.
+local function TomeRows(list)
+    if type(list) ~= "table" or #list == 0 then return nil end
+    local count = 0
+    for _ in pairs(list) do count = count + 1 end
+    if count ~= #list then return nil end
+    for i = 1, #list do
+        if type(list[i]) ~= "table" or not Filled(list[i].name) then return nil end
+    end
+    return list
+end
+
+-- One row frame for either pool. A striped row (the tome rows) also gets a
+-- background whose faint shade alternates with its neighbours.
+local function NewRow(statusWidth, striped)
+    local row = CreateFrame("Frame", nil, child)
+    row:SetHeight(ROW_H)
+    row:EnableMouse(true)
+    if striped then
+        row.background = row:CreateTexture(nil, "BACKGROUND")
+        row.background:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.background:SetAllPoints(row)
+    end
+    row.hover = row:CreateTexture(nil, "BACKGROUND")
+    row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.hover:SetAllPoints(row)
+    row.hover:SetVertexColor(0.30, 0.40, 0.52, 0.18)
+    row.separator = row:CreateTexture(nil, "BORDER")
+    row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.separator:SetHeight(1)
+    row.separator:SetPoint("BOTTOMLEFT", 0, 0)
+    row.separator:SetPoint("BOTTOMRIGHT", 0, 0)
+    row.separator:SetVertexColor(0.22, 0.24, 0.28, 0.55)
+    row.tile = row:CreateTexture(nil, "ARTWORK")
+    row.tile:SetTexture("Interface\\Buttons\\WHITE8X8")
+    row.tile:SetSize(TILE, TILE)
+    row.tile:SetPoint("LEFT", 2, 0)
+    row.tile:SetVertexColor(0.08, 0.10, 0.13, 0.95)
+    row.icon = row:CreateTexture(nil, "OVERLAY")
+    row.icon:SetSize(TILE - 4, TILE - 4)
+    row.icon:SetPoint("CENTER", row.tile, "CENTER", 0, 0)
+    row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    row.status = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.status:SetPoint("RIGHT", -4, 0)
+    row.status:SetWidth(statusWidth)
+    row.status:SetJustifyH("RIGHT")
+    row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    row.label:SetPoint("LEFT", row.tile, "RIGHT", 6, 0)
+    row.label:SetPoint("RIGHT", row.status, "LEFT", -6, 0)
+    row.label:SetJustifyH("LEFT")
+    -- Both texts keep one line at the row's height, so neither can grow
+    -- into the next row; the row tooltip has the complete name.
+    if Nexus.LayoutMetrics then
+        pcall(Nexus.LayoutMetrics.OneLineLabel, row.label, nil, ROW_H - 6)
+        pcall(Nexus.LayoutMetrics.OneLineLabel, row.status, nil, ROW_H - 6)
+    end
+    return row
+end
+
 local function AcquireRow()
     rowsUsed = rowsUsed + 1
     local row = rowPool[rowsUsed]
     if not row then
-        row = CreateFrame("Frame", nil, child)
-        row:SetHeight(ROW_H)
-        row:EnableMouse(true)
-        row.hover = row:CreateTexture(nil, "BACKGROUND")
-        row.hover:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.hover:SetAllPoints(row)
-        row.hover:SetVertexColor(0.30, 0.40, 0.52, 0.18)
-        row.separator = row:CreateTexture(nil, "BORDER")
-        row.separator:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.separator:SetHeight(1)
-        row.separator:SetPoint("BOTTOMLEFT", 0, 0)
-        row.separator:SetPoint("BOTTOMRIGHT", 0, 0)
-        row.separator:SetVertexColor(0.22, 0.24, 0.28, 0.55)
-        row.tile = row:CreateTexture(nil, "ARTWORK")
-        row.tile:SetTexture("Interface\\Buttons\\WHITE8X8")
-        row.tile:SetSize(TILE, TILE)
-        row.tile:SetPoint("LEFT", 2, 0)
-        row.tile:SetVertexColor(0.08, 0.10, 0.13, 0.95)
-        row.icon = row:CreateTexture(nil, "OVERLAY")
-        row.icon:SetSize(TILE - 4, TILE - 4)
-        row.icon:SetPoint("CENTER", row.tile, "CENTER", 0, 0)
-        row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-        row.status = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        row.status:SetPoint("RIGHT", -4, 0)
-        row.status:SetWidth(78)
-        row.status:SetJustifyH("RIGHT")
-        row.label = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.label:SetPoint("LEFT", row.tile, "RIGHT", 6, 0)
-        row.label:SetPoint("RIGHT", row.status, "LEFT", -6, 0)
-        row.label:SetJustifyH("LEFT")
-        -- Both texts keep one line at the row's height, so neither can grow
-        -- into the next row; the row tooltip has the complete name.
-        if Nexus.LayoutMetrics then
-            pcall(Nexus.LayoutMetrics.OneLineLabel, row.label, nil, ROW_H - 6)
-            pcall(Nexus.LayoutMetrics.OneLineLabel, row.status, nil, ROW_H - 6)
-        end
+        row = NewRow(78)
         row:SetScript("OnEnter", RowEnter)
         row:SetScript("OnLeave", RowLeave)
         rowPool[rowsUsed] = row
+    end
+    row.hover:Hide()
+    row:Show()
+    return row
+end
+
+local function AcquireTomeRow()
+    tomesUsed = tomesUsed + 1
+    local row = tomePool[tomesUsed]
+    if not row then
+        row = NewRow(TOME_STATUS_W, true)
+        -- Names take the style's readable text colour; each badge's role is
+        -- set per entry. The theme repaints both when either choice changes.
+        if Nexus.Theme then pcall(Nexus.Theme.StyleLabel, row.label, "text") end
+        row:SetScript("OnEnter", TomeRowEnter)
+        row:SetScript("OnLeave", RowLeave)
+        tomePool[tomesUsed] = row
     end
     row.hover:Hide()
     row:Show()
@@ -413,8 +521,9 @@ local function PageButton(kind)
         b:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
             GameTooltip:AddLine(detailsShown and "Hide details" or "Show details", 1, 1, 1)
-            GameTooltip:AddLine("The full page notes and every section as received, unchanged: target, pending, "
-                .. "extra copies, Echo availability controls, notes, estimate and version.", 0.82, 0.82, 0.82, true)
+            GameTooltip:AddLine("The full page notes and every section as received: target, pending, "
+                .. "extra copies, tome states and their coverage, notes, estimate and version. Tome states "
+                .. "are listed as rows; hover a row for its complete entry.", 0.82, 0.82, 0.82, true)
             GameTooltip:Show()
         end)
         b:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -444,7 +553,27 @@ local function DoRefresh()
         if okP and type(res) == "table" then data = res elseif not okP then failed = true end
     end
 
-    linesUsed, rowsUsed = 0, 0
+    -- Pooled family and tome rows may be rebound below to other entries, and
+    -- the counts hover's off-Wishlist note may change; a tooltip one of them
+    -- owns would keep describing the old entry. The static intro and any
+    -- other owner's tooltip stay.
+    if GameTooltip and type(GameTooltip.GetOwner) == "function" then
+        local okOwner, owner = pcall(GameTooltip.GetOwner, GameTooltip)
+        if okOwner and owner ~= nil then
+            local owned = countsHover ~= nil and owner == countsHover
+            for i = 1, #rowPool do
+                if owned then break end
+                owned = rowPool[i] == owner
+            end
+            for i = 1, #tomePool do
+                if owned then break end
+                owned = tomePool[i] == owner
+            end
+            if owned then GameTooltip:Hide() end
+        end
+    end
+
+    linesUsed, rowsUsed, tomesUsed = 0, 0, 0
     local width = math.floor((scroll and scroll:GetWidth()) or 0)
     if width < 100 then width = 292 end
     width = width - 12
@@ -489,6 +618,36 @@ local function DoRefresh()
         row.tipRaw = raw ~= name and raw or nil
         row.tipIcon = not icon and "No single Echo family has exactly this name, so a neutral icon is shown."
             or nil
+        cy = cy - ROW_H
+    end
+
+    -- One tome row from the supplied entry only: its icon, name and
+    -- observation, or in the request section the request direction. Nothing
+    -- here reads the catalog or the game; the tooltip has the full entry.
+    local function AddTomeRow(t, index, requests)
+        local row = AcquireTomeRow()
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", child, "TOPLEFT", 14, cy)
+        row:SetWidth(width - 8)
+        local icon = t.icon
+        if not ((type(icon) == "string" and icon ~= "") or type(icon) == "number") then icon = nil end
+        row.icon:SetTexture(icon or NEUTRAL_ICON)
+        row.icon:SetAlpha(icon and 1 or 0.5)
+        row.background:SetVertexColor(0.55, 0.60, 0.68, index % 2 == 1 and 0.08 or 0.03)
+        local request = requests and t.pending ~= nil
+        row.label:SetText(t.name)
+        row.status:SetText(request and (PENDING_BADGE[t.pending] or "Request pending")
+            or Filled(t.status) or "Unknown")
+        -- Requests and clean observations take the palette accent; mixed,
+        -- unknown, undiscovered and possibly stale readings are muted.
+        local clean = t.stale ~= true and (t.observed == "disabled"
+            or (t.observed == "enabled" and t.known == true))
+        local role = (request or clean) and "accent" or "muted"
+        if row.badgeRole ~= role and Nexus.Theme then
+            row.badgeRole = role
+            pcall(Nexus.Theme.StyleLabel, row.status, role)
+        end
+        row.tome, row.tomeRequest, row.tomeIcon = t, request, icon ~= nil
         cy = cy - ROW_H
     end
 
@@ -590,10 +749,25 @@ local function DoRefresh()
                 local sec = sections[i]
                 if type(sec) == "table" then
                     AddLine(tostring(sec.title or ""), "GameFontNormalSmall")
-                    local lines = sec.lines
-                    if type(lines) == "table" then
-                        for j = 1, #lines do
-                            AddLine(tostring(lines[j] or ""), nil, 8)
+                    -- Structured tome rows stand in for the same entries'
+                    -- text lines; every other section keeps its lines.
+                    local tomes = TomeRows(sec.tomeRows)
+                    if tomes then
+                        local requests = sec.title == TOME_REQUESTS
+                        for j = 1, #tomes do AddTomeRow(tomes[j], j, requests) end
+                    elseif s.known and sec == s.pendingSection and #s.pending > 0 then
+                        -- This exact section validated the summary, so its
+                        -- families are already the Missing rows above; they
+                        -- are not listed twice. Any other section, or a
+                        -- Pending list the summary did not validate, keeps
+                        -- its lines as received. The data is not changed.
+                        AddLine("|cff8a8a8aListed above under Missing (" .. #s.pending .. ").|r", nil, 8)
+                    else
+                        local lines = sec.lines
+                        if type(lines) == "table" then
+                            for j = 1, #lines do
+                                AddLine(tostring(lines[j] or ""), nil, 8)
+                            end
                         end
                     end
                     cy = cy - 4
@@ -609,13 +783,28 @@ local function DoRefresh()
 
     for i = linesUsed + 1, #linePool do linePool[i]:Hide() end
     for i = rowsUsed + 1, #rowPool do rowPool[i]:Hide() end
+    for i = tomesUsed + 1, #tomePool do
+        tomePool[i]:Hide()
+        tomePool[i].tome = nil
+    end
     child:SetWidth(width + 12)
     child:SetHeight(-cy + 8)
 end
 
 function M.Refresh()
     if not (installed and panel and panel:IsShown()) then return end
+    -- Consumed first: a change marked during this refresh is kept for the next.
+    refreshPending = false
     pcall(DoRefresh)
+end
+
+-- A semantic change (GameAdapter) marks the page. Only a bit: no provider,
+-- adapter or service read and no frame work here. The association scanner
+-- refreshes a visible page with its details open on its next beat; a hidden
+-- or collapsed page reads nothing until its normal refresh on opening. A
+-- newer client mirror shown this way is still no server acknowledgment.
+function M.Invalidate()
+    refreshPending = true
 end
 
 
@@ -973,21 +1162,33 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
     if wishlistPicker.clearRow then wishlistPicker.clearRow:Hide() end
     wishlistPicker:ClearAllPoints()
     wishlistPicker:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
+    -- The selector already names the selected Wishlist, so the list offers
+    -- only the others. Only that one identity (IsAssignedPickerRow) is left
+    -- out: a row with the same name or contents is another Wishlist and stays.
+    -- With no name on the selector the selection stays listed and marked.
+    local shown = wishes
+    if linked and tostring(linked.name or "") ~= "" then
+        shown = {}
+        for i=1,#wishes do
+            if not IsAssignedPickerRow(linked, wishes[i]) then shown[#shown+1] = wishes[i] end
+        end
+    end
     local width, rowH = 245, 24
     wishlistPicker:SetWidth(width)
-    local count = math.max(1, #wishes)
+    local count = math.max(1, #shown)
     wishlistPicker:SetHeight(26 + count * rowH + (linked and 24 or 0) + 6)
 
-    if #wishes == 0 then
+    if #shown == 0 then
         local row = wishlistPicker.emptyRow
         if not row then
             row = wishlistPicker:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
             wishlistPicker.emptyRow = row
         end
-        row:ClearAllPoints(); row:SetPoint("TOPLEFT", 10, -28); row:SetText("No server wishlists found"); row:Show()
+        row:ClearAllPoints(); row:SetPoint("TOPLEFT", 10, -28)
+        row:SetText(#wishes == 0 and "No server wishlists found" or "No other wishlists found"); row:Show()
     else
-        for i=1,#wishes do
-            local c = wishes[i]
+        for i=1,#shown do
+            local c = shown[i]
             local cSlot = c.slot
             local cName = c.name
             local cKey = c.key
@@ -1136,7 +1337,7 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
         end
         row:SetFrameLevel(wishlistPicker:GetFrameLevel() + 2)
         row.emptySlot = emptySlot
-        row:ClearAllPoints(); row:SetPoint("TOPLEFT",6,-24-#wishes*rowH); row:SetPoint("RIGHT",-6,0)
+        row:ClearAllPoints(); row:SetPoint("TOPLEFT",6,-24-count*rowH); row:SetPoint("RIGHT",-6,0)
         row:SetScript("OnClick", function()
             if tonumber(active) and tonumber(active) > 0 then A.ClearLoadoutWishlist(active)
             elseif A.ClearFirstRunWishlist then A.ClearFirstRunWishlist() end
@@ -1157,7 +1358,11 @@ local function RefreshAssociationRows()
     local slots = A and A.Slots and A.Slots()
     if not slots then HideRowButtons(); return end
 
-    local active = tonumber(slots.activeSlot) or 0
+    -- The Saved Build this panel targets (GameAdapter.SelectedSavedBuild): the
+    -- native active slot when it is a Saved Build, or the Saved Build Nexus kept
+    -- while a Wishlist is natively active. 0 when there is none, so a Wishlist
+    -- number above the Saved Build range never reaches a callback below.
+    local active = A.SelectedSavedBuild and A.SelectedSavedBuild(slots) or 0
     local maxSlots = tonumber(slots.maxSlots) or 5
     local activeRow = slots.bySlot and slots.bySlot[active]
     local populated = activeRow and type(activeRow.echoes) == "table" and #activeRow.echoes > 0
@@ -1248,6 +1453,12 @@ local function EnsureAssociationScanner()
                 HideRowButtons()
             end
         end)
+        -- At most one coalesced page refresh per beat, and only for a marked
+        -- page that is visible (ancestor-aware) with its details open.
+        if refreshPending and detailsShown and installed and panel then
+            local okVisible, visible = pcall(panel.IsVisible, panel)
+            if okVisible and visible then pcall(M.Refresh) end
+        end
     end)
 end
 

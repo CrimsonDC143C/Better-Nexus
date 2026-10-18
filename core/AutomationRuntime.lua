@@ -21,6 +21,26 @@ Nexus.MainInternals.AutomationRuntime = AutomationRuntime
 -- so it cannot close over the constructor-local `Store` directly.
 local boundStore
 
+-- Level-1 Auto prompt: file-scope dialog + enable callback so AutomationRuntime.New
+-- stays under Lua 5.1's 200-local ceiling. New assigns the enable callback once
+-- M.ToggleAuto exists; StepArm only StaticPopup_Show's with that latch.
+local level1AutoPromptEnable
+StaticPopupDialogs = StaticPopupDialogs or {}
+StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"] = {
+    text = "Your wishlist requires Echo Tome changes, but Auto is OFF. Enable Auto to configure them before you level past 1?",
+    button1 = "Yes",
+    button2 = "No",
+    OnAccept = function()
+        if type(level1AutoPromptEnable) == "function" then
+            level1AutoPromptEnable()
+        end
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
 -- Run status (last save status/refusal, audit run counter) and the retired
 -- flat lockDesignTargets key live in the saved root, or for a read-only saved
 -- root in the Store owner's session-only table, which starts with copies of
@@ -111,23 +131,40 @@ function AutomationRuntime.New(options)
     local GetTime = assert(options.now, "AutomationRuntime requires clock")
     local ActiveSlotRow = function(slots) return ViewModel.ActiveSlotRow(slots) end
 
-local autoEnabled = false          -- session-level master switch (panel button / slash)
-local quickStartChecked = false   -- one-time-per-session guard for the quick-start check
-local pollAccum = 0
-local POLL = 0.2
-local FALLBACK_RECOMPUTE = 5
-local nextStepAt = nil
-local nextAutoLockAt = nil
-local lastFullStepAt = -math.huge
-local lastStaticProbeAt = -math.huge
-local lastFallbackCheckAt = -math.huge
-local fallbackSignature = nil
-local forceStep = true
-local authorizationStepPending = false
-local staticInvalidated = true
-local staticCache = nil
-local staticProbeInProgress = false
-local catalogRevisionUnsubscribe = nil
+-- Packed cadence constants (one local): keeps AutomationRuntime.New under
+-- Lua 5.1's 200-local limit while exposing poll/lever/action/autolock timing.
+local cadence = {
+    poll=0.2,
+    fallbackRecompute=5,
+    -- Sequential tome toggles: 1 accept per beat. The Ebonhold service drops
+    -- simultaneous ToggleTomeEcho calls; a short spacing still clears a full
+    -- leverPlan at ~6/s without bloating tomeTogglePending.
+    leverInterval=0.15,
+    leverBurst=1,
+    actionIntentBeat=0.4,
+    actionConfirmTimeout=10,
+    autoLockStateVersion=1,
+    autoLockConfirmTimeout=10,
+    autoLockMaxAdapterAttempts=2,
+}
+-- Packed session/scheduler flags (one local) — frees ~14 slots in New().
+local sched = {
+    autoEnabled=false,          -- panel/slash master switch
+    quickStartChecked=false,    -- one-time quick-start guard
+    pollAccum=0,
+    nextStepAt=nil,
+    nextAutoLockAt=nil,
+    lastFullStepAt=-math.huge,
+    lastStaticProbeAt=-math.huge,
+    lastFallbackCheckAt=-math.huge,
+    fallbackSignature=nil,
+    forceStep=true,
+    authorizationStepPending=false,
+    staticInvalidated=true,
+    staticCache=nil,
+    staticProbeInProgress=false,
+    catalogRevisionUnsubscribe=nil,
+}
 local recomputeStats = {
     polls=0, fullSteps=0, skipped=0, dirty=0,
     deadlines=0, fallbacks=0, fallbackChecks=0, fallbackRepairs=0,
@@ -197,18 +234,20 @@ local function FinishPhase(performance, name, startedAt)
     end
 end
 
-local SAFE_ACTION_TYPES = {
-    take=true,banish=true,freeze=true,reroll=true,wait=true,
-}
-local SAFE_TRIGGERS = {
-    forced=true,dirty=true,deadlines=true,fallbacks=true,explicit=true,
-    other=true,
-}
-local SAFE_FALLBACK_COMPONENTS = {
-    none=true,signature=true,service=true,level=true,slots=true,
-    activeSlot=true,granted=true,locked=true,discovery=true,
-    tomeSafety=true,state=true,settings=true,associations=true,
-    association=true,firstRun=true,catalogRevision=true,
+local safeTokens = {
+    actionTypes={
+        take=true,banish=true,freeze=true,reroll=true,wait=true,
+    },
+    triggers={
+        forced=true,dirty=true,deadlines=true,fallbacks=true,explicit=true,
+        other=true,
+    },
+    fallbackComponents={
+        none=true,signature=true,service=true,level=true,slots=true,
+        activeSlot=true,granted=true,locked=true,discovery=true,
+        tomeSafety=true,state=true,settings=true,associations=true,
+        association=true,firstRun=true,catalogRevision=true,
+    },
 }
 local function ControlledToken(value, allowed, fallback)
     value = tostring(value or fallback)
@@ -216,7 +255,7 @@ local function ControlledToken(value, allowed, fallback)
 end
 local function MarkActionAttempt(actionType)
     lastStepContext.actionAttempted = true
-    lastStepContext.actionType = SAFE_ACTION_TYPES[actionType]
+    lastStepContext.actionType = safeTokens.actionTypes[actionType]
         and actionType or "other"
 end
 
@@ -299,18 +338,22 @@ local function ReadProjection(name, catalogRevision, level, callback)
     return value
 end
 
-local armAttempts, armedConfirmed, armPendingSince = 0, false, nil
-local armTargetSlot = nil
-local boardsSinceArm = 0
+-- Packed ARM/SAVE visit + level-1 lever-send state (one local).
+-- leverLastAt / cadence.lever* pace ToggleTomeEcho without waiting on mirror
+-- confirmation between different levers (pending remains per-lever).
+-- promptedForAuto latches the level-1 "enable Auto for tomes" StaticPopup once
+-- per wishlist; cleared when Auto turns on or the wishlist fingerprint changes.
+local arm = {
+    attempts=0,confirmed=false,pendingSince=nil,targetSlot=nil,
+    boardsSinceArm=0,leverLastAt=0,
+    promptedForAuto=false,promptWishlistKey=nil,
+}
 local leversDoneThisVisit = {}
-local lastLeverSendAt = 0
 
 -- RUN state
 local lastDecision = nil
 local actionIntent = nil
 local actionDecisionRevision = 0
-local ACTION_INTENT_BEAT = 0.4
-local ACTION_CONFIRM_TIMEOUT = 10
 local actionLifecycleStats = {
     prepared=0,submitted=0,confirmed=0,rejected=0,
     uncertain=0,expired=0,superseded=0,preauthFailed=0,
@@ -323,9 +366,6 @@ local lastActionLifecycle = {
 -- separate eventually-consistent locked projection. One accepted adapter
 -- submission is allowed per exact identity/lifetime; a short spacing refusal
 -- may be retried once without extending that lifetime.
-local AUTO_LOCK_STATE_VERSION = 1
-local AUTO_LOCK_CONFIRM_TIMEOUT = 10
-local AUTO_LOCK_MAX_ADAPTER_ATTEMPTS = 2
 local autoLockLifecycleStats = {
     prepared=0,submitted=0,awaitingConfirmation=0,confirmed=0,
     rejected=0,expired=0,superseded=0,spacingRetries=0,
@@ -391,20 +431,23 @@ local actionHold = { externalUntil = 0, worldLeaving = false,
     -- this runtime. Memory only. Helpers: SelectPoll, SelectWait, Effective.
     select = { seen = 0, requests = 0, lastAt = nil } }
 
--- SAVE state
-local savedThisVisit = false
-local slotsRefreshAt = nil
-local saveVerifySlot, saveVerifyAt, seedVerify, saveVerifySnap = nil, nil, nil, nil
-local saveVerifyExpectedActive, saveVerifySummary, saveVerifyName = nil, nil, nil
-local saveObserveSchedule = { 0.5, 1, 2, 4, 8, 15, 30 }
-local saveObserveIndex, saveObserveReadyAt = 1, nil
-local noChangeReportedVisit = false
-local saveGateAuditedVisit = false
-local auditRunId = 0
-local auditRunStarted = nil
-local lastLevelSeen = nil
-local lastRunBoundaryGeneration = 0
-local demotionsClearedThisSession = false
+-- Packed SAVE-visit state (one local): frees ~17 slots under Lua 5.1's
+-- 200-local limit on AutomationRuntime.New.
+local save = {
+    savedThisVisit=false,
+    slotsRefreshAt=nil,
+    verifySlot=nil, verifyAt=nil, seedVerify=nil, verifySnap=nil,
+    verifyExpectedActive=nil, verifySummary=nil, verifyName=nil,
+    observeSchedule={ 0.5, 1, 2, 4, 8, 15, 30 },
+    observeIndex=1, observeReadyAt=nil,
+    noChangeReportedVisit=false,
+    gateAuditedVisit=false,
+    auditRunId=0,
+    auditRunStarted=nil,
+    lastLevelSeen=nil,
+    lastRunBoundaryGeneration=0,
+    demotionsClearedThisSession=false,
+}
 
 local statusLine = "loading"
 
@@ -422,7 +465,7 @@ local statusLine = "loading"
         if not when or when ~= when or when >= math.huge or when <= -math.huge then
             return false
         end
-        if not nextStepAt or when < nextStepAt then nextStepAt = when end
+        if not sched.nextStepAt or when < sched.nextStepAt then sched.nextStepAt = when end
         return true
     end
 
@@ -430,15 +473,15 @@ local statusLine = "loading"
         when = tonumber(when)
         if not when or when ~= when or when >= math.huge
             or when <= -math.huge then return false end
-        if not nextAutoLockAt or when < nextAutoLockAt then
-            nextAutoLockAt = when
+        if not sched.nextAutoLockAt or when < sched.nextAutoLockAt then
+            sched.nextAutoLockAt = when
         end
         return RequestStepAt(when)
     end
 
     local function RequestRecompute()
-        forceStep = true
-        staticInvalidated = true
+        sched.forceStep = true
+        sched.staticInvalidated = true
         return true
     end
 
@@ -485,11 +528,11 @@ local function DemoteFlag(name, reason)
 end
 
 ------------------------------------------------------------------------
--- One FSM step (the whole loop; called from OnUpdate at POLL cadence)
+-- One FSM step (the whole loop; called from OnUpdate at poll cadence)
 ------------------------------------------------------------------------
 
 local function AutoAllowed()
-    if not autoEnabled then return false, "manual mode" end
+    if not sched.autoEnabled then return false, "manual mode" end
     if actionHold.worldLeaving then return false, "loading screen (waiting for world entry)" end
     if actionHold.worldSettleUntil then
         if GetTime() < actionHold.worldSettleUntil or not Adapter.Ready() then
@@ -704,8 +747,8 @@ local function WishlistProgress(plan, owned, catalog, lockOnlyFamilies, wishlist
     local lockedOwned, designTargets
     if type(plan) == "table" and type(plan.wishedFamilies) == "table" then
         lockedOwned = Adapter and Adapter.LockedOwned and Adapter.LockedOwned()
-        if wishlist == nil and staticCache then
-            designTargets = staticCache.targets
+        if wishlist == nil and sched.staticCache then
+            designTargets = sched.staticCache.targets
         else
             designTargets = LockDesignTargetsFor(wishlist)
         end
@@ -831,13 +874,13 @@ local function ObserveAllSlots(slots, snap, catalog, elapsed)
         local exact = row and ExactEchoList(row.echoes, catalog) or {}
         local exactOk = row and SlotMatchesSnapshot(row, snap, catalog) or false
         local familyOk = row and CountsEqual(family, snap and snap.byFamily) or false
-        if exactOk and tonumber(slot) == tonumber(saveVerifySlot) then exactMatch = true end
+        if exactOk and tonumber(slot) == tonumber(save.verifySlot) then exactMatch = true end
         AppendAudit("SAVE_OBSERVE", {
             level = Adapter.Level(), activeSlot = slots.activeSlot or 0,
             targetSlot = slot,
             result = exactOk and "EXACT_MATCH" or (familyOk and "FAMILY_MATCH" or (row and "DIFFERENT" or "EMPTY")),
             reason = string.format("+%.1fs requested=%s", tonumber(elapsed) or 0,
-                tostring(saveVerifySlot or 0)),
+                tostring(save.verifySlot or 0)),
             incumbent = family,
             candidate = snap and CopyCounts(snap.byFamily) or {},
             exact = exact,
@@ -935,6 +978,7 @@ local function MissingEchoSummary(plan, owned, catalog)
 end
 
 local function StepArm(level, plan, owned, slots, disabledLevers, static, locked)
+    if Adapter.TomeObservationBegin then Adapter.TomeObservationBegin() end
     local settings = Store.Settings()
     local automationAllowed = AutoAllowed()
     -- (a) Loadout selection is owned by the stock Echo Journal. Each saved
@@ -948,59 +992,198 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
             SetStatus("Choose or create a wishlist to begin your first run")
         end
     end
-    -- (b) disable off-wishlist conformant tome levers (one send per 0.5s)
-    if automationAllowed and settings.autoDisable and plan and not plan.advisorOnly
-        and Adapter.DiscoverySynced()
-        and not (Adapter.TomeMutationPaused
-            and Adapter.TomeMutationPaused()) then
-        if (GetTime() - lastLeverSendAt) <= 0.5 then
-            RequestStepAt(lastLeverSendAt + 0.5)
-            MeasurePhase("overlayRender", RenderIdlePanel,
-                plan, owned, slots, static.catalog, static, locked)
-            return
+    -- Level-1 smart prompt: Auto is OFF but the wishlist's leverPlan does not
+    -- match live tome state. One StaticPopup per wishlist fingerprint; Yes
+    -- routes through ToggleAuto (overwrite warning / Orb gates intact).
+    -- Locals stay inside this do-block so they never join New()'s 200-local pool.
+    do
+        local wishlistKey = static and static.wishlistKey or nil
+        if arm.promptWishlistKey ~= wishlistKey then
+            arm.promptWishlistKey = wishlistKey
+            arm.promptedForAuto = false
         end
-        local optOut = settings.leverOptOut or {}
-        for _, lever in ipairs(plan.leverPlan.disable) do
-            if not optOut[lever] and not disabledLevers[lever]
-                and not leversDoneThisVisit[lever] then
-                if not Adapter.LeverHasKnownMember(lever) then
-                    -- unknown tome: its echo isn't in your pool, so there is
-                    -- nothing to disable. Skip (marking done so we never
-                    -- retry it -- this was the "no confirmation" spam).
-                    leversDoneThisVisit[lever] = true
-                else
-                    local ok = Adapter.ToggleLever(lever, true)
-                    if ok then
-                        leversDoneThisVisit[lever] = true
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("disabling off-wishlist tome lever " .. lever)
+        if level == 1 and not sched.autoEnabled and not arm.promptedForAuto
+            and plan and not plan.advisorOnly and type(plan.leverPlan) == "table"
+            and type(disabledLevers) == "table" then
+            local mismatch, index, lever, keepList, disableList, optOut = false
+            keepList = plan.leverPlan.keep
+            disableList = plan.leverPlan.disable
+            if type(keepList) == "table" then
+                for index = 1, #keepList do
+                    lever = keepList[index]
+                    if disabledLevers[lever] then
+                        mismatch = true
                         break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
                     end
                 end
             end
-        end
-        -- (c) RE-ENABLE any confirmed-disabled lever the wishlist now
-        -- needs (a wishlist switch after earlier disables would otherwise
-        -- silently make convergence impossible)
-        if (GetTime() - lastLeverSendAt) > 0.5 then
-            for _, lever in ipairs(plan.leverPlan.keep) do
-                if disabledLevers[lever] == "confirmed" then
-                    local ok = Adapter.ToggleLever(lever, false)
-                    if ok then
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("re-enabling wishlist tome lever " .. lever)
+            if not mismatch and type(disableList) == "table" then
+                optOut = settings.leverOptOut or {}
+                for index = 1, #disableList do
+                    lever = disableList[index]
+                    if not optOut[lever] and not disabledLevers[lever]
+                        and (not Adapter.LeverHasKnownMember
+                            or Adapter.LeverHasKnownMember(lever)) then
+                        mismatch = true
                         break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
+                    end
+                end
+            end
+            if mismatch then
+                arm.promptedForAuto = true
+                if type(StaticPopup_Show) == "function" then
+                    StaticPopup_Show("NEXUS_LEVEL1_AUTO_TOMES")
+                end
+            end
+        end
+    end
+    -- (b) Re-enable needed tomes before pruning the off-wishlist pool. A
+    -- changed wishlist must not wait behind every unwanted disable while the
+    -- player can leave level 1. Both directions share cadence.leverInterval
+    -- and fire at most cadence.leverBurst (1) ToggleLever accept per beat.
+    -- Different levers may still be in-flight (pending) at once; we never
+    -- send a second request in the same beat, and never re-call a pending lever.
+    -- ReconcileTomePending owns per-lever confirmation.
+    -- Visit bits represent only evaluations this short-circuit actually makes:
+    -- Auto=1, permission=2, plan=4, not-advisor=8, discovery=16,
+    -- not-paused=32, spacing=64. An unvisited bit is unknown, not false.
+    local visited,passed,gate,allowed = 1,0,"auto",automationAllowed
+    if allowed then
+        passed=1;visited=visited+2;gate="permission";allowed=settings.autoDisable
+        if allowed then
+            passed=passed+2;visited=visited+4;gate="plan";allowed=plan
+            if allowed then
+                passed=passed+4;visited=visited+8;gate="advisor";allowed=not plan.advisorOnly
+                if allowed then
+                    passed=passed+8;visited=visited+16;gate="discovery";allowed=Adapter.DiscoverySynced()
+                    if allowed then
+                        passed=passed+16;visited=visited+32;gate="pause"
+                        allowed=not (Adapter.TomeMutationPaused and Adapter.TomeMutationPaused())
+                        if allowed then passed=passed+32;gate="eligible" end
                     end
                 end
             end
         end
     end
+    if allowed then
+        visited=visited+64
+        -- Strict < so a wake at exactly leverLastAt+interval still fires the
+        -- next burst instead of re-arming the same deadline forever.
+        if (GetTime() - arm.leverLastAt) < cadence.leverInterval then
+            if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,"spacing",#plan.leverPlan.keep,#plan.leverPlan.disable) end
+            if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
+            RequestStepAt(arm.leverLastAt + cadence.leverInterval)
+            MeasurePhase("overlayRender", RenderIdlePanel,
+                plan, owned, slots, static.catalog, static, locked)
+            return
+        end
+        passed=passed+64
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,#plan.leverPlan.keep,#plan.leverPlan.disable) end
+        -- Beat locals stay inside this do-block so they never join New()'s
+        -- 200-local pool. One ToggleLever accept per leverInterval beat
+        -- (leverBurst=1). Pending levers are skipped without a service call;
+        -- the scan continues for the next non-pending candidate. moreWork +
+        -- RequestStepAt wake the next beat so the queue drains sequentially.
+        do
+            local sent, moreWork, lastStatus, optOut = 0, false, nil, nil
+            local ok, reason, lever, index, pendingMap, state = nil, nil, nil, nil, nil, nil
+            local keepList, disableList = plan.leverPlan.keep, plan.leverPlan.disable
+            local burst = cadence.leverBurst
+            state = Store.State()
+            pendingMap = type(state) == "table"
+                and type(state.tomeTogglePending) == "table"
+                and state.tomeTogglePending or {}
+            for index = 1, #keepList do
+                lever = keepList[index]
+                if disabledLevers[lever] == "confirmed" then
+                    if pendingMap[lever] then
+                        -- In-flight re-enable: mirror may still read disabled.
+                        -- Never re-call ToggleLever; wake again after spacing.
+                        moreWork = true
+                    elseif sent >= burst then
+                        moreWork = true
+                        break
+                    else
+                        ok, reason = Adapter.ToggleLever(lever, false)
+                        if ok then
+                            -- Accepted re-enable invalidates an earlier disable
+                            -- attempt for this lever.
+                            leversDoneThisVisit[lever] = nil
+                            sent = sent + 1
+                            lastStatus = "re-enabling wishlist tome lever " .. lever
+                        elseif reason == "pending" or reason == "pause"
+                            or reason == "refused" then
+                            moreWork = true
+                        end
+                    end
+                elseif disabledLevers[lever] == "pending" then
+                    moreWork = true
+                end
+            end
+            -- (c) Disable off-wishlist conformant controls with leftover beat
+            -- budget (none once a keep already accepted this wake).
+            if sent < burst then
+                optOut = settings.leverOptOut or {}
+                for index = 1, #disableList do
+                    lever = disableList[index]
+                    if optOut[lever] then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"opt_out") end
+                    elseif pendingMap[lever] or disabledLevers[lever] == "pending" then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"pending") end
+                        moreWork = true
+                    elseif disabledLevers[lever] then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"disabled") end
+                    elseif leversDoneThisVisit[lever] then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"visit_done") end
+                    elseif Adapter.LeverHasKnownMember(lever) then
+                        if sent >= burst then
+                            moreWork = true
+                            break
+                        end
+                        -- Unknown discovery is not an attempted disable.
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"candidate") end
+                        ok, reason = Adapter.ToggleLever(lever, true)
+                        if ok then
+                            leversDoneThisVisit[lever] = true
+                            sent = sent + 1
+                            lastStatus = "disabling off-wishlist tome lever " .. lever
+                        elseif reason == "pending" or reason == "pause"
+                            or reason == "refused" then
+                            moreWork = true
+                        end
+                    else
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"no_known_member") end
+                    end
+                end
+            elseif type(disableList) == "table" and #disableList > 0 then
+                -- Keep traffic used this beat; still-needed disables wake next.
+                optOut = settings.leverOptOut or {}
+                for index = 1, #disableList do
+                    lever = disableList[index]
+                    if not optOut[lever] and not disabledLevers[lever]
+                        and not pendingMap[lever]
+                        and not leversDoneThisVisit[lever]
+                        and Adapter.LeverHasKnownMember(lever) then
+                        moreWork = true
+                        break
+                    end
+                end
+            end
+            if sent > 0 then
+                arm.leverLastAt = GetTime()
+                if lastStatus then SetStatus(lastStatus) end
+            end
+            -- Always re-arm the 0.15s beat while the plan still has work
+            -- (accepted this wake, or pending / later candidates remain).
+            if sent > 0 or moreWork then
+                RequestStepAt((sent > 0 and arm.leverLastAt or GetTime())
+                    + cadence.leverInterval)
+            end
+        end
+    else
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,0,0) end
+    end
+    if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
     MeasurePhase("overlayRender", RenderIdlePanel,
         plan, owned, slots, static.catalog, static, locked)
 end
@@ -1233,15 +1416,17 @@ local function SettingsKey(settings)
     }, "|")
 end
 
-local AUTO_LOCK_WAITING_STATES = {
-    submitted=true,["awaiting-confirmation"]=true,
-}
-local AUTO_LOCK_TERMINAL_STATES = {
-    confirmed=true,rejected=true,expired=true,superseded=true,
-}
-local AUTO_LOCK_RECORD_STATES = {
-    prepared=true,submitted=true,["awaiting-confirmation"]=true,
-    confirmed=true,rejected=true,expired=true,superseded=true,
+local autoLockStates = {
+    waiting={
+        submitted=true,["awaiting-confirmation"]=true,
+    },
+    terminal={
+        confirmed=true,rejected=true,expired=true,superseded=true,
+    },
+    record={
+        prepared=true,submitted=true,["awaiting-confirmation"]=true,
+        confirmed=true,rejected=true,expired=true,superseded=true,
+    },
 }
 
 local function AutoLockInteger(value, allowZero)
@@ -1287,14 +1472,14 @@ local function AutoLockBucket(create)
     local ok, bucket = UpdateStoreState(function(state)
         local existing = state.autoLockAttempts
         if existing == nil and create then
-            existing = {version=AUTO_LOCK_STATE_VERSION,records={}}
+            existing = {version=cadence.autoLockStateVersion,records={}}
             state.autoLockAttempts = existing
         end
         return existing
     end)
     if not ok then return nil, "state_unavailable" end
     if type(bucket) ~= "table"
-        or tonumber(bucket.version) ~= AUTO_LOCK_STATE_VERSION
+        or tonumber(bucket.version) ~= cadence.autoLockStateVersion
         or type(bucket.records) ~= "table" then
         return nil, "state_incompatible"
     end
@@ -1328,7 +1513,7 @@ local function AutoLockBucket(create)
             and AutoLockTime(record.nextAttemptAt) or nil
         if type(key) ~= "string" or type(record) ~= "table"
             or key ~= record.baseKey
-            or not AUTO_LOCK_RECORD_STATES[record.state]
+            or not autoLockStates.record[record.state]
             or type(record.identity) ~= "string"
             or type(record.baseKey) ~= "string"
             or type(record.wishlistKey) ~= "string"
@@ -1343,7 +1528,7 @@ local function AutoLockBucket(create)
             or record.identity ~= AutoLockIdentity(record.baseKey,
                 lockedRevision,record.lockedToken)
             or adapterAttempts == nil
-            or adapterAttempts > AUTO_LOCK_MAX_ADAPTER_ATTEMPTS
+            or adapterAttempts > cadence.autoLockMaxAdapterAttempts
             or preparedAt == nil or expiresAt == nil
             or expiresAt < preparedAt
             or submittedAt == nil or resolvedAt == nil
@@ -1395,7 +1580,7 @@ local function TransitionAutoLock(record, state, reason, now, err)
     record.reason = reason or "none"
     record.error = err
     if state == "submitted" then record.submittedAt = now end
-    if AUTO_LOCK_TERMINAL_STATES[state] then record.resolvedAt = now end
+    if autoLockStates.terminal[state] then record.resolvedAt = now end
     CaptureAutoLockLifecycle(record)
 end
 
@@ -1507,7 +1692,7 @@ local function NewAutoLockRecord(descriptor, wishlistKey, lockedRevision,
         lockedToken=lockedToken,
         state="idle",reason="none",adapterAttempts=0,
         preparedAt=now,submittedAt=0,
-        expiresAt=now + AUTO_LOCK_CONFIRM_TIMEOUT,resolvedAt=0,
+        expiresAt=now + cadence.autoLockConfirmTimeout,resolvedAt=0,
     }
     TransitionAutoLock(record, "prepared", "ready", now)
     return record
@@ -1552,7 +1737,7 @@ local function RefreshAutoLockRecord(record, lockedRevision, lockedToken,
         or record.state == "awaiting-confirmation" then
         local preparedAt = tonumber(record.preparedAt) or now
         local expiresAt = tonumber(record.expiresAt)
-            or (preparedAt + AUTO_LOCK_CONFIRM_TIMEOUT)
+            or (preparedAt + cadence.autoLockConfirmTimeout)
         record.expiresAt = expiresAt
         if now < preparedAt then
             TransitionAutoLock(record, "expired", "runtime_clock_reset", now,
@@ -1600,28 +1785,31 @@ local function CatalogRevision()
     return revisions.Get(revisions.CATALOG_CHANGED) or 0
 end
 
-local FALLBACK_SIGNATURE_FIELDS = {
-    "service", "level", "slots", "activeSlot", "granted", "locked",
-    "discovery", "tomeSafety",
-    "state", "settings", "associations", "association", "firstRun",
+local fallback = {
+    signatureFields={
+        "service", "level", "slots", "activeSlot", "granted", "locked",
+        "discovery", "tomeSafety",
+        "state", "settings", "associations", "association", "firstRun",
+    },
+    staticComponents={
+        signature=true,service=true,level=true,slots=true,activeSlot=true,
+        state=true,settings=true,associations=true,association=true,
+        firstRun=true,catalogRevision=true,
+    },
+    mismatchFields={
+        catalogRevision=0,signature=0,service=0,level=0,slots=0,
+        activeSlot=0,granted=0,locked=0,discovery=0,tomeSafety=0,
+        state=0,settings=0,associations=0,association=0,firstRun=0,
+    },
+    lastReason="",
 }
-local FALLBACK_STATIC_COMPONENTS = {
-    signature=true,service=true,level=true,slots=true,activeSlot=true,
-    state=true,settings=true,associations=true,association=true,
-    firstRun=true,catalogRevision=true,
-}
-local fallbackMismatchFields = {catalogRevision=0,signature=0}
-for _, field in ipairs(FALLBACK_SIGNATURE_FIELDS) do
-    fallbackMismatchFields[field] = 0
-end
-local lastFallbackReason = ""
 
 local function SameFallbackSignature(left, right)
     if type(left) ~= "table" or type(right) ~= "table" then
         return false, {"signature"}
     end
     local mismatches = {}
-    for _, key in ipairs(FALLBACK_SIGNATURE_FIELDS) do
+    for _, key in ipairs(fallback.signatureFields) do
         if left[key] ~= right[key] then mismatches[#mismatches + 1] = key end
     end
     if left.catalogRevision ~= right.catalogRevision then
@@ -1632,9 +1820,9 @@ end
 
 local function RecordFallbackMismatches(fields)
     for _, field in ipairs(fields or {"signature"}) do
-        if fallbackMismatchFields[field] ~= nil then
-            fallbackMismatchFields[field] = fallbackMismatchFields[field] + 1
-            lastFallbackReason = "fallback:" .. field
+        if fallback.mismatchFields[field] ~= nil then
+            fallback.mismatchFields[field] = fallback.mismatchFields[field] + 1
+            fallback.lastReason = "fallback:" .. field
         end
     end
 end
@@ -1648,10 +1836,10 @@ local function ReadFallbackSignature()
 end
 
 local function CaptureFallbackSignature()
-    lastFallbackCheckAt = GetTime()
+    sched.lastFallbackCheckAt = GetTime()
     local ok, signature = pcall(ReadFallbackSignature)
     if ok and type(signature) == "table" then
-        fallbackSignature = signature
+        sched.fallbackSignature = signature
         return true
     end
     return false
@@ -1659,11 +1847,11 @@ end
 
 local function FallbackNeedsRepair(now)
     recomputeStats.fallbackChecks = recomputeStats.fallbackChecks + 1
-    lastFallbackCheckAt = now
+    sched.lastFallbackCheckAt = now
     local ok, signature = pcall(ReadFallbackSignature)
     local same, mismatches
     if ok and type(signature) == "table" then
-        same, mismatches = SameFallbackSignature(fallbackSignature, signature)
+        same, mismatches = SameFallbackSignature(sched.fallbackSignature, signature)
     else
         same, mismatches = false, {"signature"}
     end
@@ -1675,7 +1863,7 @@ local function FallbackNeedsRepair(now)
         -- so retain this snapshot here rather than requiring StaticContext to
         -- run merely to prevent the same mismatch repairing every five seconds.
         if ok and type(signature) == "table" then
-            fallbackSignature = signature
+            sched.fallbackSignature = signature
         end
         -- The repair rebuilds the static context when ANY mismatched component
         -- is static, so the reported component is the first static one. Taking
@@ -1684,7 +1872,7 @@ local function FallbackNeedsRepair(now)
         -- (state, settings, associations, association, firstRun), and the new
         -- baseline above then absorbed that static change for good.
         for _, field in ipairs(mismatches or {}) do
-            if FALLBACK_STATIC_COMPONENTS[field] then
+            if fallback.staticComponents[field] then
                 return true, field, signature
             end
         end
@@ -1694,19 +1882,19 @@ local function FallbackNeedsRepair(now)
 end
 
 local function AdvanceFallbackGeneration(field, value)
-    if type(fallbackSignature) ~= "table" or type(value) ~= "number" then
+    if type(sched.fallbackSignature) ~= "table" or type(value) ~= "number" then
         return
     end
-    local current = tonumber(fallbackSignature[field])
+    local current = tonumber(sched.fallbackSignature[field])
     if current == nil or value >= current then
-        fallbackSignature[field] = value
+        sched.fallbackSignature[field] = value
     end
 end
 
 local function AdvanceFallbackDynamicBaseline(level)
-    if type(fallbackSignature) ~= "table" then return end
+    if type(sched.fallbackSignature) ~= "table" then return end
     level = tonumber(level)
-    if level then fallbackSignature.level = level end
+    if level then sched.fallbackSignature.level = level end
     if projectionRevisions.valid then
         -- Reconcile performed during StaticContext may already have captured
         -- a newer generation than ConsumeDirty returned at the start of this
@@ -1725,19 +1913,19 @@ local function AdvanceFallbackDynamicBaseline(level)
 end
 
 local function StaticContext(probe, forceCompile)
-    if staticCache and not probe and not staticInvalidated then
+    if sched.staticCache and not probe and not sched.staticInvalidated then
         recomputeStats.planReuses = recomputeStats.planReuses + 1
-        return staticCache
+        return sched.staticCache
     end
     recomputeStats.staticProbes = recomputeStats.staticProbes + 1
-    lastStaticProbeAt = GetTime()
-    staticProbeInProgress = true
+    sched.lastStaticProbeAt = GetTime()
+    sched.staticProbeInProgress = true
     local catalogOk, catalog = pcall(MeasurePhase,
         "catalog", Adapter.Catalog)
-    staticProbeInProgress = false
+    sched.staticProbeInProgress = false
     if not catalogOk then error(catalog) end
     if not catalog then
-        staticInvalidated = true
+        sched.staticInvalidated = true
         CaptureFallbackSignature()
         return {catalog=nil}
     end
@@ -1766,21 +1954,21 @@ local function StaticContext(probe, forceCompile)
         KeyPart(targetToken or "invalid"),SettingsKey(settings),
     }, "|")
     local plan
-    if forceCompile or not staticCache or staticCache.key ~= key then
+    if forceCompile or not sched.staticCache or sched.staticCache.key ~= key then
         plan = MeasurePhase("plan", Strategy.Compile,
             catalog, augmented, settings)
         recomputeStats.planCompiles = recomputeStats.planCompiles + 1
     else
-        plan = staticCache.plan
+        plan = sched.staticCache.plan
         recomputeStats.planReuses = recomputeStats.planReuses + 1
     end
-    staticCache = {
+    sched.staticCache = {
         key=key,catalog=catalog,wishlist=wishlistSnapshot,
         wishlistKey=wishlistKey,targets=targets,plan=plan,
     }
-    staticInvalidated = false
+    sched.staticInvalidated = false
     CaptureFallbackSignature()
-    return staticCache
+    return sched.staticCache
 end
 
 -- Auto-lock: the actual write side of the locked-slot feature. Confirmed
@@ -1803,24 +1991,18 @@ end
 -- Replacement unlocks retain their prior conservative cooldown. LockPerk has
 -- a stronger identity-bound confirmation lifecycle below and never uses a
 -- time-only cooldown as permission to resubmit.
-local autoUnlockCooldown = {}
--- Unlocking is destructive, so it is allowed only after the same real,
--- server-confirmed Saved Build + wishlist association has remained stable for
--- a short window. A death/reset temporarily reports activeSlot=0; the old
--- eager-shed code still ran in that transient first-run context and could
--- empty permanent lock slots against stale or incomplete design data.
-local autoUnlockContextKey, autoUnlockContextSince = nil, 0
--- Rebuilt every call (even when gated out early) so /nexus log -> AutoLock
--- shows exactly what the live check saw, instead of guessing from the
--- outside -- this is what answers "why isn't this firing" directly.
-local lastAutoLockTrace = { at = 0, lines = {} }
+-- Packed unlock/trace session state (one local).
+local autoUnlock = {
+    cooldown={}, contextKey=nil, contextSince=0,
+    lastTrace={ at = 0, lines = {} },
+}
 local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey,
     locked, lockedRevision)
     local trace = {}
     local now = GetTime()
-    lastAutoLockTrace = { at = now, lines = trace }
+    autoUnlock.lastTrace = { at = now, lines = trace }
 
-    -- Reuses the same master-switch gate as board automation (autoEnabled,
+    -- Reuses the same master-switch gate as board automation (sched.autoEnabled,
     -- not mid-manual-action, no rival addon, no client auto-accept
     -- conflict) -- if the player has paused Nexus, it shouldn't be taking
     -- ANY action on their behalf, locking included.
@@ -1926,7 +2108,15 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
     local ownedBySpell = {}
     for id, n in pairs((owned and owned.bySpell) or {}) do ownedBySpell[id] = n end
     local activeIdx = slots and tonumber(slots.activeSlot)
-    local activeRow = activeIdx and activeIdx > 0 and slots.bySlot and slots.bySlot[activeIdx]
+    -- Only a whole native active index in 1..the declared Saved Build range
+    -- (the bound the adapter's association writers use) names a Saved Build.
+    -- A higher index is a native Wishlist: its row lists desired Echoes, not
+    -- owned ones, so it is neither ownership evidence below nor a context for
+    -- the destructive unlock, also while Nexus keeps a Saved Build selected.
+    local declaredSavedBuilds = slots and (tonumber(slots.maxSlots) or 5) or 5
+    local activeRow = activeIdx and activeIdx >= 1 and activeIdx <= declaredSavedBuilds
+        and activeIdx == math.floor(activeIdx)
+        and slots.bySlot and slots.bySlot[activeIdx]
     trace[#trace + 1] = string.format("active loadout: slot=%s echoes=%s",
         tostring(activeIdx),
         tostring(activeRow and type(activeRow.echoes) == "table" and #activeRow.echoes or "n/a"))
@@ -1952,13 +2142,13 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
         unlockContextKey = tostring(activeIdx) .. "|"
             .. tostring(LockSlotKey(wishlist, wishlistKey))
     end
-    if unlockContextKey ~= autoUnlockContextKey then
-        autoUnlockContextKey = unlockContextKey
-        autoUnlockContextSince = now
+    if unlockContextKey ~= autoUnlock.contextKey then
+        autoUnlock.contextKey = unlockContextKey
+        autoUnlock.contextSince = now
     end
-    local canUnlock = unlockContextKey ~= nil and (now - autoUnlockContextSince) >= 2
+    local canUnlock = unlockContextKey ~= nil and (now - autoUnlock.contextSince) >= 2
     if unlockContextKey ~= nil and not canUnlock then
-        RequestAutoLockAt(autoUnlockContextSince + 2)
+        RequestAutoLockAt(autoUnlock.contextSince + 2)
     end
     trace[#trace + 1] = string.format("destructive unlock context: %s%s",
         tostring(canUnlock), unlockContextKey and (" (" .. unlockContextKey .. ")")
@@ -1996,9 +2186,9 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
                 .. tostring(actionWhy or "AutoLock disabled")
             return false
         end
-        local lastAttempt = autoUnlockCooldown[oldId] or -30
+        local lastAttempt = autoUnlock.cooldown[oldId] or -30
         if (now - lastAttempt) < 10 then return false end
-        autoUnlockCooldown[oldId] = now
+        autoUnlock.cooldown[oldId] = now
         local ok, err = Adapter.UnlockPerk(oldId)
         trace[#trace + 1] = string.format(
             "  -> UnlockPerk(%s) for ready replacement %s: ok=%s err=%s",
@@ -2044,7 +2234,7 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
             bucket.records[descriptor.baseKey] = record
         end
         currentRecords[descriptor.baseKey] = record
-        if record and AUTO_LOCK_WAITING_STATES[record.state] then
+        if record and autoLockStates.waiting[record.state] then
             outstanding = true
         elseif record and record.state == "expired" then
             uncertainTerminal = true
@@ -2125,7 +2315,7 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
                         trace[#trace + 1] = string.format(
                             "  -> LockPerk(%s): ok=%s err=%s attempt=%d/%d",
                             tostring(id),tostring(ok),tostring(err),
-                            record.adapterAttempts,AUTO_LOCK_MAX_ADAPTER_ATTEMPTS)
+                            record.adapterAttempts,cadence.autoLockMaxAdapterAttempts)
                         if err ~= "spacing" then
                             AppendAutoLockEvent({ action = "lock", spellId = id,
                                 name = EchoName(id),ok = ok and true or false,
@@ -2145,7 +2335,7 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
                                 EchoName(id)))
                         elseif err == "spacing"
                             and record.adapterAttempts
-                                < AUTO_LOCK_MAX_ADAPTER_ATTEMPTS
+                                < cadence.autoLockMaxAdapterAttempts
                             and (now + 3) < record.expiresAt then
                             record.reason, record.error = "spacing", "spacing"
                             record.nextAttemptAt = now + 3
@@ -2208,7 +2398,7 @@ local function RecordActionLifecycle(intent, state, reason)
     end
     intent.state, intent.lifecycleReason = state, reason
     lastActionLifecycle.state = state
-    lastActionLifecycle.actionType = SAFE_ACTION_TYPES[intent.action.type]
+    lastActionLifecycle.actionType = safeTokens.actionTypes[intent.action.type]
         and intent.action.type or "other"
     lastActionLifecycle.reason = tostring(reason or "none")
     lastActionLifecycle.decisionRevision = intent.decisionRevision
@@ -2322,7 +2512,7 @@ local function PrepareActionIntent(board, action)
         decisionRevision=actionDecisionRevision,
         decisionId=(actionHold.rolling.sig == board.signature)
             and actionHold.rolling.decisionId or nil,
-        preparedAt=now,readyAt=now + ACTION_INTENT_BEAT,
+        preparedAt=now,readyAt=now + cadence.actionIntentBeat,
         mutationAttempted=false,state="idle",
     }
     RecordActionLifecycle(actionIntent, "prepared", "intent_beat")
@@ -2346,7 +2536,7 @@ local function PreauthorizeActionIntent(intent, settings)
         return false, reason or "authorization_changed"
     end
     if MeasurePhase("preauthorize", Adapter.InFlight) then
-        RequestStepAt(GetTime() + POLL)
+        RequestStepAt(GetTime() + cadence.poll)
         return false, "adapter_in_flight"
     end
     local fresh = MeasurePhase("preauthorize", Adapter.Board)
@@ -2354,7 +2544,7 @@ local function PreauthorizeActionIntent(intent, settings)
         actionLifecycleStats.preauthFailed =
             actionLifecycleStats.preauthFailed + 1
         FinishActionIntent("superseded", "board_changed_before_submit", false)
-        RequestStepAt(GetTime() + POLL)
+        RequestStepAt(GetTime() + cadence.poll)
         return false, "board_changed_before_submit"
     end
     local action = intent.action
@@ -2390,7 +2580,7 @@ end
 local function MarkIntentSubmitted(intent)
     intent.mutationAttempted = true
     intent.submittedAt = GetTime()
-    intent.expiresAt = intent.submittedAt + ACTION_CONFIRM_TIMEOUT
+    intent.expiresAt = intent.submittedAt + cadence.actionConfirmTimeout
     RecordActionLifecycle(intent, "submitted", "adapter_accepted")
     RequestStepAt(intent.expiresAt)
 end
@@ -2413,12 +2603,12 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         end
         -- A loading-screen hold keeps its reason visible without a board.
         local heldOk, heldWhy = true, nil
-        if autoEnabled and actionHold.worldPending then
+        if sched.autoEnabled and actionHold.worldPending then
             heldOk, heldWhy = AutoAllowed()
         end
         -- An overdue own Select holds between boards too (memory only).
         local selectWait, _, _, selectOverdue = actionHold.SelectWait()
-        if not (autoEnabled and selectOverdue) then selectWait = nil end
+        if not (sched.autoEnabled and selectOverdue) then selectWait = nil end
         SetStatus(not heldOk and ("auto paused: " .. tostring(heldWhy))
             or selectWait and ("waiting: " .. selectWait)
             or "waiting for board")
@@ -2428,13 +2618,13 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
                 nil, nil, static, locked),
             -- The selection, as on the board path: a hold is shown in the
             -- status line, never as a button that reads OFF.
-            auto = autoEnabled,
+            auto = sched.autoEnabled,
             paused = nil,
             version = Nexus.VERSION }
         model.effective = {}
         model.effective.state, model.effective.reason, model.effective.hold =
             actionHold.Effective()
-        if autoEnabled then
+        if sched.autoEnabled then
             -- Between boards the same pause stays visible (read-only gate),
             -- and so does a wait that is not a normal short answer.
             local gateOk, gateWhy = true, nil
@@ -2463,12 +2653,12 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         refusedRerollSig = nil
     end
 
-    if armTargetSlot and not armedConfirmed then
-        boardsSinceArm = boardsSinceArm + 1
+    if arm.targetSlot and not arm.confirmed then
+        arm.boardsSinceArm = arm.boardsSinceArm + 1
         if board.guaranteedIndex then
-            armedConfirmed = true
+            arm.confirmed = true
             SetStatus("armed (guaranteed queue live)")
-        elseif boardsSinceArm >= 3 then
+        elseif arm.boardsSinceArm >= 3 then
             SetStatus("Activate did not guarantee -- treating as unarmed")
         end
     end
@@ -2627,7 +2817,7 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
                     if total > 12 then out[#out + 1] = "...+" .. tostring(total - 12) end
                     return table.concat(out, ",")
                 end)(),
-                run = auditRunId,
+                run = save.auditRunId,
                 activeSlot = slots and slots.activeSlot or 0,
                 queueN = #(queue.entries or {}),
                 queueHead = (function()
@@ -2674,8 +2864,8 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
                 logs.Append("decision", entry)
             end
 
-            if auditRunStarted ~= auditRunId then
-                auditRunStarted = auditRunId
+            if save.auditRunStarted ~= save.auditRunId then
+                save.auditRunStarted = save.auditRunId
                 local slotCounts = activeRow and FamilyCountsFromEchoes(activeRow.echoes, catalog) or {}
                 local exact = {}
                 for _, ae in ipairs((activeRow and activeRow.echoes) or {}) do
@@ -2738,9 +2928,9 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
             locked),
         level = level,
         recommendation = recommendation,
-        auto = autoEnabled,
+        auto = sched.autoEnabled,
         -- Auto stays ON; this only says it is not acting now, and why.
-        paused = autoEnabled and (not okAuto and tostring(autoWhy)
+        paused = sched.autoEnabled and (not okAuto and tostring(autoWhy)
             or selectWait) or nil,
         version = Nexus.VERSION,
     }
@@ -2751,7 +2941,7 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
     -- refused action on this board, a pending flag Nexus does not track, an
     -- overdue own Select) is named as that wait, never shown as acting. The
     -- normal answer window of a sent action keeps the active heading.
-    if autoEnabled and not panelModel.paused and panelModel.effective.hold then
+    if sched.autoEnabled and not panelModel.paused and panelModel.effective.hold then
         panelModel.paused = panelModel.effective.reason
     end
     if Nexus.OrbGuidance then
@@ -2906,17 +3096,17 @@ local function StepSave(level, plan, slots, owned, static, locked)
         plan, owned, slots, static.catalog, static, locked)
     local settings = Store.Settings()
     local automationAllowed, heldWhy = AutoAllowed()
-    if not automationAllowed and autoEnabled and actionHold.worldPending then
+    if not automationAllowed and sched.autoEnabled and actionHold.worldPending then
         -- The save gate is held too; show why, as the board path does.
         SetStatus("auto paused: " .. tostring(heldWhy))
     end
-    if not automationAllowed or not settings.autoSave or savedThisVisit then
+    if not automationAllowed or not settings.autoSave or save.savedThisVisit then
         return
     end
     -- A level-80 character can load with owned data that looks like a
     -- completed run. Never evaluate or send a save unless this session
     -- actually observed at least one offering for the current run.
-    if auditRunStarted ~= auditRunId then
+    if save.auditRunStarted ~= save.auditRunId then
         SetStatus("saved loadout unchanged — no current run observed")
         return
     end
@@ -2935,7 +3125,7 @@ local function StepSave(level, plan, slots, owned, static, locked)
         local candidateCounts = CopyCounts(owned.byFamily)
         local ok, detail, saveDiag = Ratchet.Dominates(
             owned, incumbent.echoes, plan, catalog, forcedTakesBySpell)
-        if not saveGateAuditedVisit then
+        if not save.gateAuditedVisit then
             AppendAudit("SAVE_GATE", {
                 level = level, activeSlot = slots.activeSlot, targetSlot = incumbent.slot,
                 result = ok and "APPROVED" or "BLOCKED", reason = tostring(detail or ""),
@@ -2955,7 +3145,7 @@ local function StepSave(level, plan, slots, owned, static, locked)
                 pollutionScore = saveDiag and saveDiag.pollutionScore
                     and string.format("%.2f", saveDiag.pollutionScore) or nil,
             })
-            saveGateAuditedVisit = true
+            save.gateAuditedVisit = true
         end
         if ok then
             -- Writes must always target the server-confirmed active loadout.
@@ -2973,33 +3163,33 @@ local function StepSave(level, plan, slots, owned, static, locked)
                 -- send != success: SS-541 FAIL (combat/dead) is consumed
                 -- invisibly. Block re-save, but only CONFIRM after a fresh
                 -- SS-540 shows the slot now holds the improved build.
-                savedThisVisit = true
+                save.savedThisVisit = true
                 -- Snapshot the exact post-save state at send time. Saved Build
                 -- readback merges permanent locks into the rolled loadout, so
                 -- verification must expect that same server-normalized union.
                 local lockedNow = Adapter.LockedOwned and Adapter.LockedOwned() or nil
                 local snap = CopyOwnedSnapshot(owned, lockedNow, catalog)
-                saveVerifySlot, saveVerifyAt, seedVerify, saveVerifySnap =
+                save.verifySlot, save.verifyAt, save.seedVerify, save.verifySnap =
                     incumbent.slot, GetTime(), false, snap
-                saveVerifyExpectedActive = tonumber(slots.activeSlot)
-                saveVerifySummary = SaveChangeSummary(owned, incumbent.echoes, plan, catalog, saveDiag)
-                saveVerifyName = saveName
-                noChangeReportedVisit = false
-                saveObserveIndex, saveObserveReadyAt = 1, nil
-                slotsRefreshAt = nil
+                save.verifyExpectedActive = tonumber(slots.activeSlot)
+                save.verifySummary = SaveChangeSummary(owned, incumbent.echoes, plan, catalog, saveDiag)
+                save.verifyName = saveName
+                save.noChangeReportedVisit = false
+                save.observeIndex, save.observeReadyAt = 1, nil
+                save.slotsRefreshAt = nil
                 AppendAudit("SAVE_SENT", {
                     level = level, activeSlot = slots.activeSlot,
                     targetSlot = incumbent.slot, expectedActive = slots.activeSlot,
-                    candidate = WishedCounts(snap.byFamily, plan), summary = saveVerifySummary or "",
+                    candidate = WishedCounts(snap.byFamily, plan), summary = save.verifySummary or "",
                 })
                 local stillNeeded = MissingEchoSummary(plan, owned, catalog)
                 SetStatus("Save sent — checking server")
                 Print(string.format("Save sent — %s. Checking the Saved Build now. Still needed: %s.",
-                    saveVerifySummary or "loadout improved", stillNeeded))
+                    save.verifySummary or "loadout improved", stillNeeded))
                 RunRoot().lastSaveStatus = {
                     state = "sent", slot = incumbent.slot, name = saveName,
                     t = date and date("%H:%M:%S") or "",
-                    summary = saveVerifySummary or "", stillNeeded = stillNeeded,
+                    summary = save.verifySummary or "", stillNeeded = stillNeeded,
                 }
             end
         else
@@ -3045,11 +3235,11 @@ local function StepSave(level, plan, slots, owned, static, locked)
                 level = level, detail = tostring(detail),
                 incumbentSlot = incumbent.slot,
             }
-            if not noChangeReportedVisit then
+            if not save.noChangeReportedVisit then
                 local incumbentOwned = { byFamily = FamilyCountsFromEchoes(incumbent.echoes, catalog) }
                 Print(string.format("No improvement run — not saving. Still needed: %s.",
                     MissingEchoSummary(plan, owned, catalog)))
-                noChangeReportedVisit = true
+                save.noChangeReportedVisit = true
             end
         end
     else
@@ -3066,10 +3256,10 @@ local function StepSave(level, plan, slots, owned, static, locked)
         end
         if hasAnyData then
             SetStatus("First run complete — save/activate it in My Builds before resetting")
-            if not noChangeReportedVisit then
+            if not save.noChangeReportedVisit then
                 Print("|cffff9040Nexus:|r Nexus cannot safely choose or overwrite a Saved Build while none is active. "
                     .. "Open Echo Journal > My Builds, save this finished run into a slot, and activate that slot before resetting.")
-                noChangeReportedVisit = true
+                save.noChangeReportedVisit = true
             end
         else
             -- Truly fresh install: seed into the first unlocked empty slot
@@ -3081,16 +3271,16 @@ local function StepSave(level, plan, slots, owned, static, locked)
             if target then
                 local saved, saveErr = Adapter.Save(target, "Nexus")
                 if saved then
-                    savedThisVisit = true
+                    save.savedThisVisit = true
                     local lockedNow = Adapter.LockedOwned and Adapter.LockedOwned() or nil
                     local snap = CopyOwnedSnapshot(owned, lockedNow, catalog)
-                    saveVerifySlot, saveVerifyAt, seedVerify, saveVerifySnap =
+                    save.verifySlot, save.verifyAt, save.seedVerify, save.verifySnap =
                         target, GetTime(), true, snap
-                    saveVerifyExpectedActive = nil
-                    saveVerifySummary = "first completed run"
-                    saveVerifyName = "Nexus"
-                    saveObserveIndex, saveObserveReadyAt = 1, nil
-                    slotsRefreshAt = nil
+                    save.verifyExpectedActive = nil
+                    save.verifySummary = "first completed run"
+                    save.verifyName = "Nexus"
+                    save.observeIndex, save.observeReadyAt = 1, nil
+                    save.slotsRefreshAt = nil
                     AppendAudit("SAVE_SENT", {
                         level = level, activeSlot = slots.activeSlot or 0,
                         targetSlot = target, candidate = WishedCounts(snap.byFamily, plan),
@@ -3101,17 +3291,17 @@ local function StepSave(level, plan, slots, owned, static, locked)
                         .. tostring(target) .. ". Wait for the confirmation message before resetting; "
                         .. "if it does not confirm, save this finished loadout manually in Echo Journal > My Builds.")
                 elseif saveErr ~= "spacing" then
-                    savedThisVisit = true
+                    save.savedThisVisit = true
                     SetStatus("First run complete — save it manually in My Builds before resetting")
                     Print("|cffff9040Nexus:|r I couldn't create the first Saved Build automatically. "
                         .. "Open Echo Journal > My Builds and save this finished run into a Saved Build slot before resetting.")
                 end
             else
                 SetStatus("First run complete — no free Saved Build slot; save manually before resetting")
-                if not noChangeReportedVisit then
+                if not save.noChangeReportedVisit then
                     Print("|cffff9040Nexus:|r your first run is finished, but Nexus found no free Saved Build slot. "
                         .. "Save this loadout manually in Echo Journal > My Builds before resetting.")
-                    noChangeReportedVisit = true
+                    save.noChangeReportedVisit = true
                 end
             end
         end
@@ -3123,13 +3313,13 @@ local function BeginStepContext(work)
     local compileBefore = recomputeStats.planCompiles
     local reuseBefore = recomputeStats.planReuses
     lastStepContext.trigger = ControlledToken(
-        work.trigger, SAFE_TRIGGERS, "other")
+        work.trigger, safeTokens.triggers, "other")
     lastStepContext.dirtyMask = tonumber(work.dirtyMask) or 0
     lastStepContext.staticProbe = work.staticProbe and true or false
     lastStepContext.forceCompile = work.forceCompile and true or false
     lastStepContext.autoLockDue = work.autoLockDue and true or false
     lastStepContext.fallbackComponent = ControlledToken(
-        work.fallbackComponent, SAFE_FALLBACK_COMPONENTS, "none")
+        work.fallbackComponent, safeTokens.fallbackComponents, "none")
     lastStepContext.staticRevisionBefore = CatalogRevision()
     lastStepContext.staticRevisionAfter = lastStepContext.staticRevisionBefore
     lastStepContext.planCompiled = false
@@ -3156,22 +3346,22 @@ local function FinishStepContext(compileBefore, reuseBefore)
 end
 
 local function ResetRunBoundary()
-    if seedVerify and saveVerifySlot then
+    if save.seedVerify and save.verifySlot then
         Print("|cffff9040Nexus:|r the first-run Saved Build write was not confirmed before the reset. "
             .. "Open Echo Journal > My Builds and verify/save the loadout manually before relying on automated convergence.")
     end
     local runRoot = RunRoot()
     runRoot.auditRunCounter = (tonumber(runRoot.auditRunCounter) or 0) + 1
-    auditRunId = runRoot.auditRunCounter
-    auditRunStarted = nil
+    save.auditRunId = runRoot.auditRunCounter
+    save.auditRunStarted = nil
     leversDoneThisVisit = {}
-    armAttempts, armTargetSlot = 0, nil
-    armedConfirmed, boardsSinceArm = false, 0
-    saveVerifySlot, seedVerify, saveVerifySnap = nil, nil, nil
-    saveVerifyExpectedActive, saveVerifySummary = nil, nil
-    saveObserveIndex, saveObserveReadyAt = 1, nil
-    noChangeReportedVisit = false
-    saveGateAuditedVisit = false
+    arm.attempts, arm.targetSlot = 0, nil
+    arm.confirmed, arm.boardsSinceArm = false, 0
+    save.verifySlot, save.seedVerify, save.verifySnap = nil, nil, nil
+    save.verifyExpectedActive, save.verifySummary = nil, nil
+    save.observeIndex, save.observeReadyAt = 1, nil
+    save.noChangeReportedVisit = false
+    save.gateAuditedVisit = false
     fillerFishState.guaranteedId = nil
     fillerFishState.consecutive = 0
     fillerFishState.bracket = nil
@@ -3198,21 +3388,21 @@ local function HandleLevelTransition(level, boundaryGeneration)
     boundaryGeneration = tonumber(boundaryGeneration)
     if boundaryGeneration
         and boundaryGeneration == math.floor(boundaryGeneration)
-        and boundaryGeneration > lastRunBoundaryGeneration then
+        and boundaryGeneration > save.lastRunBoundaryGeneration then
         ResetRunBoundary()
         -- A sticky generation can be observed again after a later Step phase
         -- fails. Acknowledge it immediately after the authoritative reset so
         -- the bounded retry cannot reset the same run twice.
-        lastRunBoundaryGeneration = boundaryGeneration
+        save.lastRunBoundaryGeneration = boundaryGeneration
     end
-    local levelChanged = lastLevelSeen ~= level
+    local levelChanged = save.lastLevelSeen ~= level
     if levelChanged then
         -- A short user-action pause belongs to the board/level where it was
         -- observed. Never let it suppress the first actionable board after a
         -- genuine progression transition.
         actionHold.externalUntil = 0
-        if level ~= 80 then savedThisVisit = false end
-        lastLevelSeen = level
+        if level ~= 80 then save.savedThisVisit = false end
+        save.lastLevelSeen = level
     end
     if Adapter.ExternalActionSeen() and not levelChanged then
         actionHold.externalUntil = GetTime() + 3
@@ -3220,8 +3410,8 @@ local function HandleLevelTransition(level, boundaryGeneration)
 end
 
 local function ShowQuickStartOnce(wishlist)
-    if quickStartChecked then return end
-    quickStartChecked = true
+    if sched.quickStartChecked then return end
+    sched.quickStartChecked = true
     if Nexus.QuickStart then
         Nexus.QuickStart.ShowIfFirstTime(wishlist ~= nil)
     end
@@ -3243,9 +3433,9 @@ local function RunAutoLockStep(work, owned, catalog, slots, wishlist,
 end
 
 local function ClearStaleDemotions()
-    if not demotionsClearedThisSession and Adapter.Ready() then
+    if not save.demotionsClearedThisSession and Adapter.Ready() then
         UpdateStoreState(function(st) st.flagDemotions = {} end)
-        demotionsClearedThisSession = true
+        save.demotionsClearedThisSession = true
     end
 end
 
@@ -3254,86 +3444,86 @@ local function ObservePendingSave(catalog)
     -- It never resubmits automatically. This distinguishes a real server write
     -- failure from stale or differently normalized slot data without risking
     -- repeated overwrites.
-    if not saveVerifySlot then return end
-    local elapsed = GetTime() - (saveVerifyAt or GetTime())
-    local due = saveObserveSchedule[saveObserveIndex]
-    if due and elapsed >= due and not saveObserveReadyAt then
+    if not save.verifySlot then return end
+    local elapsed = GetTime() - (save.verifyAt or GetTime())
+    local due = save.observeSchedule[save.observeIndex]
+    if due and elapsed >= due and not save.observeReadyAt then
         if Adapter.RequestSlots() then
-            saveObserveReadyAt = GetTime() + 0.4
-            RequestStepAt(saveObserveReadyAt)
+            save.observeReadyAt = GetTime() + 0.4
+            RequestStepAt(save.observeReadyAt)
         else
-            RequestStepAt(GetTime() + POLL)
+            RequestStepAt(GetTime() + cadence.poll)
         end
-    elseif saveObserveReadyAt and GetTime() >= saveObserveReadyAt then
+    elseif save.observeReadyAt and GetTime() >= save.observeReadyAt then
         local freshSlots = Adapter.Slots()
-        local confirmed = ObserveAllSlots(freshSlots, saveVerifySnap, catalog,
+        local confirmed = ObserveAllSlots(freshSlots, save.verifySnap, catalog,
             due or elapsed)
-        saveObserveReadyAt = nil
-        saveObserveIndex = saveObserveIndex + 1
+        save.observeReadyAt = nil
+        save.observeIndex = save.observeIndex + 1
         if confirmed then
-            if saveVerifyExpectedActive
+            if save.verifyExpectedActive
                 and tonumber(freshSlots and freshSlots.activeSlot)
-                    ~= tonumber(saveVerifyExpectedActive) then
+                    ~= tonumber(save.verifyExpectedActive) then
                 SetStatus("save data matched, but active loadout changed — not claiming overwrite")
             else
                 AppendAudit("SAVE_CONFIRMED", {
-                    targetSlot = saveVerifySlot,
+                    targetSlot = save.verifySlot,
                     activeSlot = freshSlots and freshSlots.activeSlot or 0,
-                    candidate = CopyCounts(saveVerifySnap and saveVerifySnap.byFamily),
-                    summary = saveVerifySummary or "",
+                    candidate = CopyCounts(save.verifySnap and save.verifySnap.byFamily),
+                    summary = save.verifySummary or "",
                 })
-                if seedVerify then
-                    SetStatus("First run saved to Saved Build " .. saveVerifySlot
+                if save.seedVerify then
+                    SetStatus("First run saved to Saved Build " .. save.verifySlot
                         .. " — activate it in My Builds before resetting")
                     Print("|cff4dff80Nexus:|r first run saved to Saved Build "
-                        .. tostring(saveVerifySlot)
+                        .. tostring(save.verifySlot)
                         .. ". Activate that slot in My Builds before starting the next run.")
                 else
                     SetStatus("Save complete — server confirmed Active Loadout "
-                        .. saveVerifySlot)
+                        .. save.verifySlot)
                 end
                 RunRoot().lastSaveStatus = {
-                    state = "confirmed", slot = saveVerifySlot,
+                    state = "confirmed", slot = save.verifySlot,
                     t = date and date("%H:%M:%S") or "",
-                    summary = saveVerifySummary or "",
+                    summary = save.verifySummary or "",
                 }
-                saveVerifySlot, seedVerify, saveVerifySnap = nil, nil, nil
-                saveVerifyExpectedActive, saveVerifySummary, saveVerifyName =
+                save.verifySlot, save.seedVerify, save.verifySnap = nil, nil, nil
+                save.verifyExpectedActive, save.verifySummary, save.verifyName =
                     nil, nil, nil
-                saveObserveIndex, saveObserveReadyAt = 1, nil
+                save.observeIndex, save.observeReadyAt = 1, nil
             end
-        elseif not saveObserveSchedule[saveObserveIndex] then
+        elseif not save.observeSchedule[save.observeIndex] then
             AppendAudit("SAVE_UNCONFIRMED", {
-                targetSlot = saveVerifySlot,
+                targetSlot = save.verifySlot,
                 activeSlot = freshSlots and freshSlots.activeSlot or 0,
-                candidate = CopyCounts(saveVerifySnap and saveVerifySnap.byFamily),
-                summary = saveVerifySummary or "",
+                candidate = CopyCounts(save.verifySnap and save.verifySnap.byFamily),
+                summary = save.verifySummary or "",
                 reason = "no exact spell/stack match after 30 seconds; no retry sent",
             })
-            if seedVerify then
+            if save.seedVerify then
                 SetStatus("First run not confirmed — save it manually in My Builds before resetting")
                 Print("|cffff9040Nexus:|r I couldn't confirm that your first completed run was stored in Saved Build "
-                    .. tostring(saveVerifySlot)
+                    .. tostring(save.verifySlot)
                     .. ". Open Echo Journal > My Builds and save this finished loadout into a slot before resetting.")
             else
                 SetStatus("Save request sent; server confirmation not received. Check My Builds before resetting.")
             end
             RunRoot().lastSaveStatus = {
-                state = seedVerify and "first_run_unconfirmed" or "saved_unverified",
-                slot = saveVerifySlot,
-                name = saveVerifyName or "",
+                state = save.seedVerify and "first_run_unconfirmed" or "saved_unverified",
+                slot = save.verifySlot,
+                name = save.verifyName or "",
                 t = date and date("%H:%M:%S") or "",
-                summary = saveVerifySummary or "",
+                summary = save.verifySummary or "",
             }
             -- Timeout uncertainty never authorizes a second write.
-            saveVerifySlot, seedVerify, saveVerifySnap = nil, nil, nil
-            saveVerifyExpectedActive, saveVerifySummary, saveVerifyName =
+            save.verifySlot, save.seedVerify, save.verifySnap = nil, nil, nil
+            save.verifyExpectedActive, save.verifySummary, save.verifyName =
                 nil, nil, nil
-            saveObserveIndex, saveObserveReadyAt = 1, nil
+            save.observeIndex, save.observeReadyAt = 1, nil
         else
             SetStatus(string.format(
                 "Save sent to Active Loadout %d — checking server (+%.0fs)",
-                saveVerifySlot, due or elapsed))
+                save.verifySlot, due or elapsed))
         end
     end
 end
@@ -3490,11 +3680,11 @@ end
 local function JournalData()
     local catalog = Adapter.Catalog()
     local wishlist = Adapter.Wishlist()
-    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), Store.Settings())
+    local settings = Store.Settings()
+    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), settings)
     local owned = Adapter.Owned()
     local slots = Adapter.Slots()
     local flags = EffectiveFlags()
-    local disabledLevers = Adapter.DisabledLevers()
     local sections = {}
 
     if not wishlist then
@@ -3538,15 +3728,82 @@ local function JournalData()
         sections[#sections + 1] = { title = "Extra copies compared with the plan", lines = fillerLines }
     end
 
-    local leverLines = {}
-    for _, lever in ipairs(plan.leverPlan.disable) do
-        leverLines[#leverLines + 1] = string.format("lever %d: disable%s", lever,
-            disabledLevers[lever] and " (done)" or "")
+    local tomeHold = actionHold.worldLeaving and "world transition in progress"
+        or (actionHold.worldSettleUntil and GetTime() < actionHold.worldSettleUntil
+            and "character data is settling after a world transition") or nil
+    local tomes = Adapter.TomeStateObservation(tomeHold)
+    local coverage = {
+        string.format("Known client catalog: %d tomes; coverage of the whole game is unverified.", #tomes.rows),
+        "Client mirror observed when this page was refreshed; server freshness and current server state are unverified.",
+        "Missing Tomes means undiscovered Wishlist requirements; disabled tomes and pending requests are separate below.",
+    }
+    if not tomes.catalogAvailable then coverage[#coverage + 1] = "Catalog unavailable; no complete tome list can be shown." end
+    if tomes.stale then
+        coverage[#coverage + 1] = "State may be stale: " .. table.concat(tomes.reasons, "; ") .. "."
+    end
+    sections[#sections + 1] = { title="Tome state coverage", lines=coverage }
+    -- Each state section has readable lines and the same entries as
+    -- structured tomeRows for the Journal's icon rows. The request title must
+    -- not begin with "Pending": the Journal reads every such title as the
+    -- Wishlist's missing-family list, and a second one makes progress unknown.
+    -- Enabled tomes, usually the longest list, come last.
+    local disabled = { title="Disabled tomes (client mirror)", lines={}, tomeRows={} }
+    local requests = { title="Tome requests awaiting confirmation", lines={}, tomeRows={} }
+    local unknown = { title="Unknown or mixed tome state", lines={}, tomeRows={} }
+    local enabled = { title="Enabled tomes (client mirror)", lines={}, tomeRows={} }
+    local plans = {}
+    if wishlist then
+        -- Keep also holds the player's opt-outs, not only Wishlist families.
+        local optOut = type(settings) == "table" and type(settings.leverOptOut) == "table"
+            and settings.leverOptOut or {}
+        for _, lever in ipairs(plan.leverPlan.disable) do plans[lever] = "plan: disable" end
+        for _, lever in ipairs(plan.leverPlan.keep) do
+            plans[lever] = optOut[lever] and "plan: keep enabled (opted out of automatic disabling)"
+                or "plan: keep enabled (a Wishlist family uses it)"
+        end
     end
     for _, lever in ipairs(plan.leverPlan.skippedNonConformant) do
-        leverLines[#leverLines + 1] = string.format("lever %d: skipped (non-conformant data)", lever)
+        plans[lever] = "automatic toggle skipped: unsupported availability data"
     end
-    sections[#sections + 1] = { title = "Tome levers", lines = leverLines }
+    for _, row in ipairs(tomes.rows) do
+        local status, target
+        if row.observed == "disabled" then status, target = "Disabled", disabled
+        elseif row.observed == "enabled" and row.known == true then status, target = "Enabled", enabled
+        elseif row.observed == "mixed" then status, target = "Mixed", unknown
+        elseif row.known == false and row.observed == "enabled" then status, target = "Undiscovered", unknown
+        else status, target = "Unknown", unknown end
+        local reason = row.reason
+        if row.known == false then
+            reason = (reason and (reason .. "; ") or "") .. "undiscovered in the client mirror"
+        elseif row.known == nil then
+            reason = (reason and (reason .. "; ") or "") .. "discovery state unavailable"
+        end
+        if tomes.stale then status = status .. " (stale)" end
+        -- One entry per tome. Its status is always the observation; a
+        -- pending request lists the same entry again, direction in pending.
+        local detail = {
+            name=row.name, icon=row.icon, iconSource=row.iconSource, leverId=row.lever,
+            observed=row.observed, pending=row.pending, known=row.known,
+            reason=reason, echoNames=row.echoNames, status=status,
+            plan=plans[row.lever], stale=tomes.stale,
+        }
+        local tail = (reason and ("; " .. reason) or "") .. (detail.plan and ("; " .. detail.plan) or "")
+        target.tomeRows[#target.tomeRows + 1] = detail
+        target.lines[#target.lines + 1] = row.name .. ": " .. status .. tail
+        if row.pending then
+            requests.tomeRows[#requests.tomeRows + 1] = detail
+            requests.lines[#requests.lines + 1] = row.name .. ": "
+                .. (row.pending == "unknown" and "request direction unknown" or (row.pending .. " requested"))
+                .. "; awaiting confirmation; last observed: " .. status .. tail
+        end
+    end
+    for _, section in ipairs({disabled, requests, unknown, enabled}) do
+        if #section.lines == 0 then
+            section.lines[1] = section == requests and "No pending requests recorded for tomes in the known catalog."
+                or (tomes.stale and "None observed; state may be stale." or "None observed in this client catalog.")
+        end
+        sections[#sections + 1] = section
+    end
     local est = "no estimate (advisor mode)"
     if wishlist then
         -- The estimate counts known deficits only; no future offer is assumed.
@@ -3582,20 +3839,20 @@ local function ScheduleKnownDeadlines()
             RequestStepAt(actionIntent.expiresAt)
         end
     end
-    if saveVerifySlot then
-        if saveObserveReadyAt and saveObserveReadyAt > now then
-            RequestStepAt(saveObserveReadyAt)
+    if save.verifySlot then
+        if save.observeReadyAt and save.observeReadyAt > now then
+            RequestStepAt(save.observeReadyAt)
         else
-            local due = saveObserveSchedule[saveObserveIndex]
-            local when = due and ((saveVerifyAt or now) + due) or nil
+            local due = save.observeSchedule[save.observeIndex]
+            local when = due and ((save.verifyAt or now) + due) or nil
             if when then
-                RequestStepAt(when > now and when or (now + POLL))
+                RequestStepAt(when > now and when or (now + cadence.poll))
             end
         end
     end
-    if autoUnlockContextKey and autoUnlockContextSince
-        and (autoUnlockContextSince + 2) > now then
-        RequestAutoLockAt(autoUnlockContextSince + 2)
+    if autoUnlock.contextKey and autoUnlock.contextSince
+        and (autoUnlock.contextSince + 2) > now then
+        RequestAutoLockAt(autoUnlock.contextSince + 2)
     end
 end
 
@@ -3605,7 +3862,7 @@ local function RunFullStep(trigger, errorSource, work)
     end
     trigger = trigger or "other"
     work.trigger = work.trigger or trigger
-    forceStep = false
+    sched.forceStep = false
     lastStepContext.outcome = "running"
     recomputeStats.stepAttempts = recomputeStats.stepAttempts + 1
     local ok, err
@@ -3625,7 +3882,7 @@ local function RunFullStep(trigger, errorSource, work)
         RecordError(errorSource or "Main.Step", err)
         return false
     end
-    lastFullStepAt = GetTime()
+    sched.lastFullStepAt = GetTime()
     recomputeStats.fullSteps = recomputeStats.fullSteps + 1
     recomputeStats[trigger] = (recomputeStats[trigger] or 0) + 1
     local triggerKey = fullStepTriggers[trigger] ~= nil and trigger or "other"
@@ -3755,7 +4012,7 @@ actionHold.SelectPoll = function()
             end
             if recovered and outcome == "proven" and actionIntent
                 and actionIntent.state == "prepared" then
-                actionIntent.readyAt = GetTime() + ACTION_INTENT_BEAT
+                actionIntent.readyAt = GetTime() + cadence.actionIntentBeat
                 RequestStepAt(actionIntent.readyAt)
             end
             local recorder = Nexus.RollRecorder
@@ -3783,7 +4040,7 @@ actionHold.SelectPoll = function()
         end
     end
     sel.blocked = nil
-    if not autoEnabled or actionHold.worldLeaving then return end
+    if not sched.autoEnabled or actionHold.worldLeaving then return end
     local settle = actionHold.worldSettleUntil
     if settle and sel.now < settle then return end
     local gate = recomputeStats.ordinaryGateKey
@@ -3821,7 +4078,7 @@ actionHold.ShowWorldNotice = function(now)
             actionHold.worldNoticePending = nil
             return
         end
-        if not autoEnabled or actionHold.worldLeaving
+        if not sched.autoEnabled or actionHold.worldLeaving
             or (actionHold.worldSettleUntil
                 and now < actionHold.worldSettleUntil)
             or not Adapter.Ready() then return end
@@ -3835,7 +4092,7 @@ actionHold.ShowWorldNotice = function(now)
 end
 
 -- Effective: memory only, for the HUD, M.EffectiveState and the support
--- report. The Auto selection is autoEnabled; this says what it is doing now
+-- report. The Auto selection is sched.autoEnabled; this says what it is doing now
 -- and why. It reads no client data, no clock, requests nothing and calls no
 -- gate (AutoAllowed reads the game and ends the settle): runtime state, the
 -- last poll's clock, in-flight fact and actionable pause (SelectPoll) and the
@@ -3854,7 +4111,7 @@ actionHold.Effective = function()
     local now = sel.now or 0
     local wait, kind, rechecks, overdue = actionHold.SelectWait()
     local intent = actionIntent and actionIntent.state
-    if not autoEnabled then
+    if not sched.autoEnabled then
         return "off", "Auto is OFF: no rechecks and no automatic actions"
             .. (wait and ("; " .. wait) or ""), false
     elseif actionHold.worldLeaving then
@@ -3901,13 +4158,13 @@ end
     local M = {}
 
     function M.Initialize()
-        auditRunId = tonumber(RunRoot() and RunRoot().auditRunCounter) or 0
+        save.auditRunId = tonumber(RunRoot() and RunRoot().auditRunCounter) or 0
         local revisions = Nexus and Nexus.Revisions
-        if not catalogRevisionUnsubscribe and revisions
+        if not sched.catalogRevisionUnsubscribe and revisions
             and type(revisions.Subscribe) == "function" then
-            catalogRevisionUnsubscribe = revisions.Subscribe(
+            sched.catalogRevisionUnsubscribe = revisions.Subscribe(
                 revisions.CATALOG_CHANGED, function()
-                    if not staticProbeInProgress then RequestRecompute() end
+                    if not sched.staticProbeInProgress then RequestRecompute() end
                 end)
         end
         return true
@@ -3931,23 +4188,23 @@ end
     function M.EffectiveState()
         local state, reason, hold = actionHold.Effective()
         local sel = actionHold.select
-        return { selected = autoEnabled == true, state = state, reason = reason,
+        return { selected = sched.autoEnabled == true, state = state, reason = reason,
             hold = hold == true, rechecks = sel.requests, lastRecheckAt = sel.lastAt }
     end
     -- Read-only: true between a loading screen's start and its world entry.
     function M.WorldLeaving() return actionHold.worldLeaving == true end
-    function M.AutoEnabled() return autoEnabled end
+    function M.AutoEnabled() return sched.autoEnabled end
     function M.AutoAllowed() return AutoAllowed() end
     function M.ToggleAuto()
         local function CommitToggle()
-            autoEnabled = not autoEnabled
+            sched.autoEnabled = not sched.autoEnabled
             if Nexus.RollRecorder then
-                Nexus.RollRecorder.Boundary("auto", autoEnabled and "on" or "off")
+                Nexus.RollRecorder.Boundary("auto", sched.autoEnabled and "on" or "off")
             end
-            if autoEnabled then
+            if sched.autoEnabled then
                 -- Authorization changed, represented data did not. Coalesce one
                 -- bounded decision evaluation without invalidating static state.
-                authorizationStepPending = true
+                sched.authorizationStepPending = true
                 -- New player input ends the hold of an action that a loading
                 -- screen left unresolved. Its result stays unknown: it is
                 -- recorded as uncertain, never as confirmed.
@@ -3956,22 +4213,28 @@ end
                 if actionIntent and actionIntent.crossedWorld then
                     FinishActionIntent("uncertain", "player_resumed", false)
                 end
+                -- Latch was only for the OFF→prompt path; Auto ON clears it so
+                -- a later OFF + mismatch can ask again.
+                arm.promptedForAuto = false
+                if type(StaticPopup_Hide) == "function" then
+                    StaticPopup_Hide("NEXUS_LEVEL1_AUTO_TOMES")
+                end
             else
-                authorizationStepPending = false
+                sched.authorizationStepPending = false
                 actionHold.worldNoticePending = nil
                 if actionIntent and actionIntent.state == "prepared" then
                     local revokedDeadline = actionIntent.readyAt
                     FinishActionIntent("superseded", "authorization_changed", false)
-                    if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
-                        nextStepAt = nil
+                    if revokedDeadline ~= nil and sched.nextStepAt == revokedDeadline then
+                        sched.nextStepAt = nil
                         ScheduleKnownDeadlines()
                     end
                 end
             end
-            return autoEnabled
+            return sched.autoEnabled
         end
         local warning = Nexus.OverwriteWarning
-        if autoEnabled then
+        if sched.autoEnabled then
             if warning and warning.CancelAuto then warning.CancelAuto(M) end
             return CommitToggle()
         end
@@ -3986,11 +4249,15 @@ end
         return warning.RequestAuto(M, function()
             -- Approval belongs to this still-OFF request. Recheck interruption
             -- and Orb exclusion rather than authorizing a stale UI callback.
-            if autoEnabled or (Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary()) then return false end
+            if sched.autoEnabled or (Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary()) then return false end
             local enabled = CommitToggle()
             if Nexus.Panel and Nexus.Panel.SetAuto then Nexus.Panel.SetAuto(enabled) end
             return enabled
         end)
+    end
+    -- File-scope StaticPopup OnAccept routes here (no New-local upvalue needed).
+    level1AutoPromptEnable = function()
+        if not sched.autoEnabled then M.ToggleAuto() end
     end
     -- Called by Main before the lifecycle sees the event. Returns "held",
     -- "resuming", "revoked" or "off" (Auto was not selected).
@@ -4026,8 +4293,8 @@ end
             if actionIntent and actionIntent.state == "prepared" then
                 local revokedDeadline = actionIntent.readyAt
                 FinishActionIntent("superseded", "world_transition", false)
-                if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
-                    nextStepAt = nil
+                if revokedDeadline ~= nil and sched.nextStepAt == revokedDeadline then
+                    sched.nextStepAt = nil
                     ScheduleKnownDeadlines()
                 end
             elseif sent and not actionIntent.crossedWorld
@@ -4131,7 +4398,7 @@ end
                 Nexus.RollRecorder.Boundary("world_leave", "")
                 actionHold.rolling.decisionId, actionHold.rolling.sig = nil, nil
             end
-            return autoEnabled and "held" or "off"
+            return sched.autoEnabled and "held" or "off"
         end
         if event == "PLAYER_ENTERING_WORLD" and Nexus.RollRecorder then
             Nexus.RollRecorder.Boundary("world_enter", "")
@@ -4142,14 +4409,14 @@ end
         actionHold.worldSettleUntil = nil
         if closesTransition then
             actionHold.worldSettleUntil = GetTime() + actionHold.worldSettle
-            if not autoEnabled then return "off" end
+            if not sched.autoEnabled then return "off" end
             actionHold.worldNoticePending = actionHold.worldPending ~= nil or nil
             RequestStepAt(actionHold.worldSettleUntil)
             return "resuming"
         end
         actionHold.worldNoticePending = nil
         -- Logout, or an entry this session cannot classify (no leave seen).
-        if not autoEnabled then return "off" end
+        if not sched.autoEnabled then return "off" end
         M.ToggleAuto()
         return "revoked"
     end
@@ -4157,7 +4424,7 @@ end
         local out = {}
         for key, value in pairs(recomputeStats) do out[key] = value end
         out.fallbackMismatchFields = {}
-        for key, value in pairs(fallbackMismatchFields) do
+        for key, value in pairs(fallback.mismatchFields) do
             out.fallbackMismatchFields[key] = value
         end
         out.fullStepTriggers = {}
@@ -4192,8 +4459,8 @@ end
         for key, value in pairs(lastAutoLockCapacity) do
             out.autoLockCapacity[key] = value
         end
-        out.autoEnabled = autoEnabled
-        out.lastFallbackReason = lastFallbackReason
+        out.autoEnabled = sched.autoEnabled
+        out.lastFallbackReason = fallback.lastReason
         if type(Adapter.EchoReconcileStats) == "function" then
             local ok, stats = pcall(Adapter.EchoReconcileStats)
             if ok and type(stats) == "table" then out.echoReconcile = stats end
@@ -4207,13 +4474,13 @@ end
                 out.levelEventsCoalesced = tonumber(stats.coalesced) or 0
             end
         end
-        out.nextStepAt = nextStepAt
-        out.nextAutoLockAt = nextAutoLockAt
+        out.nextStepAt = sched.nextStepAt
+        out.nextAutoLockAt = sched.nextAutoLockAt
         out.stepRetryPending = stepRetry.pending
-        out.lastFullStepAt = lastFullStepAt
-        out.lastStaticProbeAt = lastStaticProbeAt
-        out.lastFallbackCheckAt = lastFallbackCheckAt
-        out.fallbackSeconds = FALLBACK_RECOMPUTE
+        out.lastFullStepAt = sched.lastFullStepAt
+        out.lastStaticProbeAt = sched.lastStaticProbeAt
+        out.lastFallbackCheckAt = sched.lastFallbackCheckAt
+        out.fallbackSeconds = cadence.fallbackRecompute
         return out
     end
     -- The rolling-policy selection: what the saved setting asks for, what is
@@ -4239,21 +4506,21 @@ end
     function M.WishlistProgress(plan, owned, catalog, lockOnlyFamilies, wishlist)
         return WishlistProgress(plan, owned, catalog, lockOnlyFamilies, wishlist)
     end
-    function M.LastAutoLockTrace() return lastAutoLockTrace end
+    function M.LastAutoLockTrace() return autoUnlock.lastTrace end
     function M.RetryAutoLock() return RequestAutoLockRetry() end
-    function M.AuditRunId() return auditRunId end
+    function M.AuditRunId() return save.auditRunId end
     function M.ResetAuditState()
         lastLoggedSig = nil
-        auditRunStarted = nil
-        auditRunId = 0
+        save.auditRunStarted = nil
+        save.auditRunId = 0
     end
     function M.JournalData() return JournalData() end
     function M.RunFullStep(trigger, errorSource)
         return RunFullStep(trigger, errorSource)
     end
     local function RunUpdate(elapsed)
-        pollAccum = pollAccum + (elapsed or 0)
-        if pollAccum < POLL then
+        sched.pollAccum = sched.pollAccum + (elapsed or 0)
+        if sched.pollAccum < cadence.poll then
             -- Early poll (docs/ROLLING_LATENCY.md). The loop normally waits for the
             -- next 0.2 s tick, which adds up to 0.2 s after every server reply and
             -- after every scheduled deadline. While Auto is ON, and at most once per
@@ -4263,18 +4530,18 @@ end
             -- in-flight and grant holds, the 0.4 s intent beat and the authorization
             -- checks run exactly as before, only earlier. Two scalar reads per frame
             -- while Auto is ON, none while it is OFF.
-            if not autoEnabled or pollAccum < 0.05 or Nexus.EarlyPollDisabled
+            if not sched.autoEnabled or sched.pollAccum < 0.05 or Nexus.EarlyPollDisabled
                 or recomputeStats.earlyBlocked or stepRetry.pending then
                 return
             end
-            local due = nextStepAt ~= nil and GetTime() >= nextStepAt
+            local due = sched.nextStepAt ~= nil and GetTime() >= sched.nextStepAt
             if not due and not (Adapter.NotificationPending
                 and Adapter.NotificationPending()) then
                 return
             end
             recomputeStats.earlyPolls = (recomputeStats.earlyPolls or 0) + 1
         end
-        pollAccum = 0
+        sched.pollAccum = 0
         recomputeStats.polls = recomputeStats.polls + 1
         local performance = Nexus and Nexus.Performance
         local startedAt
@@ -4332,14 +4599,14 @@ end
                         and type(slotsRevision) ~= "number" and dataDirty)
             else
                 UpdateProjectionRevisions()
-                forceStep = true
-                staticInvalidated = true
+                sched.forceStep = true
+                sched.staticInvalidated = true
                 RecordError("GameAdapter.ConsumeDirty", board)
             end
         end
         -- The ordinary-board gate (Orb state known/pending, Orb ownership)
         -- can change with no board, slot or ownership change, and the game
-        -- sends no event for it. One scalar comparison per poll (POLL cadence,
+        -- sends no event for it. One scalar comparison per poll (poll cadence,
         -- not per frame) turns such a change into one coalesced decision
         -- evaluation, the same bounded trigger that an authorization change
         -- uses. It reads the gate only, invalidates no static state and
@@ -4353,7 +4620,7 @@ end
                 if recomputeStats.ordinaryGateKey ~= nil then
                     recomputeStats.ordinaryGateChanges =
                         (recomputeStats.ordinaryGateChanges or 0) + 1
-                    authorizationStepPending = true
+                    sched.authorizationStepPending = true
                 end
                 recomputeStats.ordinaryGateKey = gateKey
             end
@@ -4366,13 +4633,13 @@ end
         if not okSelect then RecordError("AutomationRuntime.SelectPoll", errSelect) end
         local now = GetTime()
         local boundaryDirty = type(runBoundaryGeneration) == "number"
-            and runBoundaryGeneration > lastRunBoundaryGeneration
+            and runBoundaryGeneration > save.lastRunBoundaryGeneration
         local retrying = stepRetry.pending
         local isDirty = boardDirty or slotsDirty or dataDirty or boundaryDirty
-        local deadlineDue = nextStepAt ~= nil and now >= nextStepAt
-        local autoLockDeadlineDue = nextAutoLockAt ~= nil
-            and now >= nextAutoLockAt
-        local fallbackDue = (now - lastFallbackCheckAt) >= FALLBACK_RECOMPUTE
+        local deadlineDue = sched.nextStepAt ~= nil and now >= sched.nextStepAt
+        local autoLockDeadlineDue = sched.nextAutoLockAt ~= nil
+            and now >= sched.nextAutoLockAt
+        local fallbackDue = (now - sched.lastFallbackCheckAt) >= cadence.fallbackRecompute
         local fallbackRepair = false
         local fallbackMismatch = nil
         local fallbackSnapshot = nil
@@ -4394,30 +4661,30 @@ end
                     fallbackSnapshot.locked, projectionRevisions.lockedLocal,
                     fallbackSnapshot.discovery, projectionRevisions.levers)
             end
-            if not fallbackRepair and not (forceStep
-                or authorizationStepPending or isDirty or autoLockDirty
+            if not fallbackRepair and not (sched.forceStep
+                or sched.authorizationStepPending or isDirty or autoLockDirty
                 or deadlineDue or autoLockDeadlineDue or retrying) then
                 recomputeStats.skipped = recomputeStats.skipped + 1
                 actionHold.ShowWorldNotice(now)
                 return
             end
             fallbackStatic = fallbackRepair
-                and FALLBACK_STATIC_COMPONENTS[fallbackMismatch] == true
-            if fallbackStatic then staticInvalidated = true end
+                and fallback.staticComponents[fallbackMismatch] == true
+            if fallbackStatic then sched.staticInvalidated = true end
         end
-        if not (forceStep or authorizationStepPending
+        if not (sched.forceStep or sched.authorizationStepPending
             or isDirty or autoLockDirty or deadlineDue
             or autoLockDeadlineDue or fallbackRepair or retrying) then
             recomputeStats.skipped = recomputeStats.skipped + 1
             actionHold.ShowWorldNotice(now)
             return
         end
-        if deadlineDue then nextStepAt = nil end
-        if autoLockDeadlineDue then nextAutoLockAt = nil end
-        local forced = forceStep
-        local authorizationRequested = authorizationStepPending
-        authorizationStepPending = false
-        local freshTrigger = forceStep and "forced"
+        if deadlineDue then sched.nextStepAt = nil end
+        if autoLockDeadlineDue then sched.nextAutoLockAt = nil end
+        local forced = sched.forceStep
+        local authorizationRequested = sched.authorizationStepPending
+        sched.authorizationStepPending = false
+        local freshTrigger = sched.forceStep and "forced"
             or fallbackRepair and "fallbacks"
             or (isDirty or autoLockDirty) and "dirty"
             or (deadlineDue or autoLockDeadlineDue) and "deadlines"
@@ -4445,7 +4712,7 @@ end
                 + (autoLockDirty and 8 or 0)
                 + (boundaryDirty and 16 or 0),
             fallbackComponent=fallbackMismatch,
-            staticProbe=staticInvalidated or forced or slotsDirty
+            staticProbe=sched.staticInvalidated or forced or slotsDirty
                 or staticDependencyDirty or fallbackStatic,
             forceCompile=forced,
             autoLockDue=forced or slotsDirty or dataDirty

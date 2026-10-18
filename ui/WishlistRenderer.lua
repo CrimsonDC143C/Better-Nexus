@@ -86,6 +86,15 @@ function Renderer.New(options)
         GetLoadoutWishlist = function(slot)
             return Controller.LoadoutWishlistProjection(slot)
         end,
+        -- The Saved Build Nexus selects (never a native Wishlist index). A
+        -- controller without that projection gives the native active slot only
+        -- when it is in the declared range.
+        SelectedSavedBuild = function(slots)
+            if Controller.SelectedSavedBuild then return Controller.SelectedSavedBuild(slots) end
+            local active = slots and tonumber(slots.activeSlot)
+            local maxSlots = slots and tonumber(slots.maxSlots) or 5
+            return active and active >= 1 and active <= maxSlots and active or nil
+        end,
     }
 
     local function PendingRows() return Controller.PendingRows() end
@@ -673,7 +682,9 @@ local function ShowLoadoutSwitchMenu(anchor)
     -- limit, not a statement about the server). Build this selector directly
     -- from those slots instead of relying on inferred candidates.
     local slots = View and View.Slots and View.Slots()
-    local active = slots and tonumber(slots.activeSlot) or 0
+    -- The highlighted row is the Saved Build Nexus selects: the native active
+    -- slot when it is one, never a native Wishlist index.
+    local active = View.SelectedSavedBuild(slots) or 0
     local MAX_SELECTOR_SLOTS = 10
     local declared = slots and tonumber(slots.maxSlots)
     local count = 5
@@ -2138,9 +2149,11 @@ local function RefreshView(catalogRevision)
         local slots = View and View.Slots and View.Slots()
         local active = slots and tonumber(slots.activeSlot)
         -- The Saved Build of the Wishlist being edited, else the one a new
-        -- Wishlist is created for; the active one only with neither. An
-        -- edited Wishlist that no Saved Build has selects none.
-        local selected = active
+        -- Wishlist is created for; the selected one only with neither (never a
+        -- native Wishlist index; `active` stays the native fact for the
+        -- "(active)" state below). An edited Wishlist that no Saved Build has
+        -- selects none.
+        local selected = View.SelectedSavedBuild(slots)
         if editingContext then
             selected = tonumber(editingContext.loadoutSlot)
         elseif createTargetContext then
