@@ -11,8 +11,11 @@
 -- A11 long and unnamed Saved Builds; A13 Auto ON wording, nothing changed by
 -- open/cancel; A14 empty Saved Build, unknown slot data and a reused server
 -- slot keep their refusals with no slot/name/default fallback.
--- EXPECT: the M1 behaviour (fails on the 1704 baseline). GUARD: existing
--- behaviour that already holds and must keep holding. SETUP: fixture state.
+-- Since M2 the categories are relative to the accepted M1 cut: EXPECT is
+-- behaviour added in M2 (F2/C5 captured-draft wording, F3 scoped unbound
+-- Save line, F5 game-change wording, the chooser opened by Assign now);
+-- GUARD is accepted M1 behaviour that must keep holding (absence checks are
+-- paired with the presence they qualify). SETUP: fixture state.
 -- Real TOC boot, adapter, controller, editor and Journal controls; synthetic
 -- host services only. Nothing is set on the editor's state directly.
 local V=dofile('tests/prototype/view_regression_support.lua')
@@ -82,6 +85,16 @@ local function VisibleButton(text)
  return nil
 end
 local function button(text) return VisibleButton(text) or error('visible button absent: '..text) end
+-- The editor's own control with this label. The HUD's no-build setup row has
+-- a "Create Wishlist" button too (it only opens the editor); it stays shown
+-- beside an editor opened through OpenForCandidate while no Wishlist is
+-- assigned, so a lookup by label alone can press that one instead.
+local function EditorButton(text)
+ for _,f in ipairs(H.frames)do
+  if f.kind=='Button' and f:IsVisible() and f:GetParent()==NexusEditorFrame and f:GetText()==text then return f end
+ end
+ return nil
+end
 local function selected(id)
  for _,f in ipairs(H.frames)do if f:IsVisible() and f.plus and f.data and f.data.spellId==id then return f end end
  error('visible selected row absent: '..id)
@@ -145,6 +158,19 @@ local function ResultRow()
   if r.kind=='FontString' and r:IsVisible() then
    local t=V.Plain(r:GetText() or '')
    if t:find('^Saved') or t:find('^Uploaded') or t:find('^Not saved') then return t,r end
+  end
+ end
+ return nil
+end
+-- Every hover line of the result line, joined.
+local function ResultHover()
+ local _,r=ResultRow()
+ if not r then return nil end
+ for _,f in ipairs(NexusEditorFrame.children) do
+  local p=f.points and f.points[1]
+  if f.kind=='Frame' and p and p[2]==r and f:GetScript('OnEnter') then
+   local lines=V.TooltipLines(function() f:GetScript('OnEnter')(f) end)
+   return V.Plain(table.concat(lines,'\n'))
   end
  end
  return nil
@@ -229,13 +255,14 @@ C.scenario('A09 the active Saved Build switches while a new plan is edited',func
  local asked=Asked()
  print('OBSERVED','A09 confirmation='..tostring(asked))
  C.setup(asked~=nil,'A09: fixture: Create asks for confirmation')
- C.expect(asked and V.Names(asked,'Fire PvE') and asked:find('slot 2',1,true) and asked:find('captured',1,true),
+ C.guard(asked and V.Names(asked,'Fire PvE') and asked:find('slot 2',1,true) and asked:find('captured',1,true),
   'A09: the confirmation names the captured Saved Build Fire PvE (slot 2)',asked)
- C.expect(asked and not V.Names(asked,'Arena'),'A09: it never names the Saved Build that became active',asked)
+ C.guard(asked and V.Names(asked,'Fire PvE') and not V.Names(asked,'Arena'),
+  'A09: it names the captured Saved Build and never the one that became active',asked)
  H.AcceptPopup()
  C.guard(Stored(2) and Stored(2).name=='Captured' and Stored(3)==nil,'A09: the existing guards assign the captured Saved Build only',Facts())
  local row=ResultRow()
- C.expect(row and V.Names(row,'Fire PvE') and not V.Names(row,'Arena'),'A09: the result names Fire PvE, not Arena',row)
+ C.guard(row and V.Names(row,'Fire PvE') and not V.Names(row,'Arena'),'A09: the result names Fire PvE, not Arena',row)
  Quiet('A09',others,auto)
  Close()
 end)
@@ -250,15 +277,44 @@ C.scenario('A09 a draft begun with no Saved Build stays unassigned when one beco
  NewPlan('Late',201174)
  local asked=Asked()
  print('OBSERVED','A09b confirmation='..tostring(asked))
- C.expect(asked and asked:find('No Saved Build was open when this draft began',1,true)
+ -- M2 F2: what the editor captured, not a claim about what was open.
+ C.expect(asked and asked:find('The editor did not capture a Saved Build for this draft',1,true)
+  and not asked:find('No Saved Build was open',1,true)
   and not asked:lower():find('first-run',1,true) and not V.Names(asked,'One'),
-  'A09b: the confirmation says no destination was captured; no first-run, no newly active Saved Build',asked)
+  'A09b: the confirmation says the editor captured no destination; no first-run, no newly active Saved Build',asked)
  if not asked then return end
  H.AcceptPopup()
  C.guard(Writes()==0 and Facts()==facts,'A09b: the save assigns nothing (unchanged)',Facts())
  local row=ResultRow()
- C.expect(row and row:find('Not assigned',1,true) and row:find('no Saved Build was open',1,true),
-  'A09b: the result says it was saved without an assignment',row)
+ C.guard(row and row:find('Not assigned',1,true),'A09b: the result says it was saved without an assignment',row)
+ C.expect(row and row:find('captured no Saved Build for this draft',1,true) and not row:find('no Saved Build was open',1,true),
+  'A09b: the result names what the editor captured',row)
+ Close()
+end)
+
+C.scenario('C5 a copied draft while a populated Saved Build is selected',function()
+ Boot({active=1,slots=World()})
+ local opened=Nexus.WishlistEditor.OpenForCandidate({title='Copied plan',echoes={{spellId=201174,quality=0,stacks=1}}})
+ C.setup(opened and Ctrl().CreateTargetContext()==nil and not Ctrl().IsEditing() and A.Slots().activeSlot==1,
+  'C5: fixture: a copied draft with no captured Saved Build while Saved Build One is selected')
+ local facts,others,auto=Facts(),Others(),Auto()
+ local create=EditorButton('Create Wishlist')
+ C.setup(create~=nil,'C5: fixture: the editor\'s own Create Wishlist button is shown')
+ if not create then return end
+ H.popup=nil
+ create:Click()
+ local asked=Asked()
+ print('OBSERVED','C5 confirmation='..tostring(asked))
+ C.setup(asked~=nil,'C5: fixture: Create asks for confirmation')
+ if not asked then return end
+ C.expect(asked:find('did not capture a Saved Build',1,true)~=nil and not asked:find('No Saved Build was open',1,true),
+  'C5: the confirmation does not claim no Saved Build was open',asked)
+ H.AcceptPopup()
+ C.guard(Uploads()==1 and Writes()==0 and Facts()==facts,'C5: saved once, assigned nowhere (unchanged)',Facts())
+ local row=ResultRow()
+ C.expect(row and row:find('captured no Saved Build',1,true)~=nil and not row:find('no Saved Build was open',1,true),
+  'C5: the result does not claim no Saved Build was open',row)
+ C.guard(Others()==others and Auto()==auto and spends==0,'C5: no other game action, Auto unchanged')
  Close()
 end)
 
@@ -271,10 +327,11 @@ C.scenario('A02 first-run Create, label and Save',function()
  local asked=Asked()
  print('OBSERVED','A02 confirmation='..tostring(asked))
  C.setup(asked~=nil,'A02: fixture: Create asks for confirmation')
- C.expect(asked and asked:find('first-run target for '..CHARACTER,1,true),
+ C.guard(asked and asked:find('first-run target for '..CHARACTER,1,true),
   'A02: the confirmation names the first-run target of the character',asked)
- C.expect(asked and not asked:find('slot',1,true) and not asked:find('Saved Build 1',1,true),
-  'A02: no Saved Build slot is invented',asked)
+ C.guard(asked and asked:find('first-run target for '..CHARACTER,1,true)
+  and not asked:find('slot',1,true) and not asked:find('Saved Build 1',1,true),
+  'A02: it names the first-run target and invents no Saved Build slot',asked)
  local said=Heard(function() H.AcceptPopup() end)
  local n,last=Uploads()
  C.guard(n==1 and Stored('first') and Stored('first').name=='Starter' and writes.SetFirstLoadoutWishlistIdentity==1,
@@ -282,8 +339,13 @@ C.scenario('A02 first-run Create, label and Save',function()
  C.guard(said:find('first-run Wishlist target',1,true)~=nil,'A02: the existing chat line is kept',said)
  local row=ResultRow()
  print('OBSERVED','A02 row='..tostring(row))
- C.expect(row and row:find('^Saved') and row:find('First-run target for '..CHARACTER,1,true) and not row:find('slot',1,true),
+ C.guard(row and row:find('^Saved') and row:find('First-run target for '..CHARACTER,1,true) and not row:find('slot',1,true),
   'A02: the result names the first-run target of the character',row)
+ -- M2 F5: the slot-1 hand-off is a Nexus record, not a game change.
+ local hover=ResultHover() or ''
+ C.expect(hover:find('No Saved Build was activated or changed in the game',1,true)~=nil
+  and not hover:find('No Saved Build was changed.',1,true),
+  'F5: the first-run result says no Saved Build was activated or changed in the game',hover)
  MirrorAt(108,last)
  Close()
  SlashCmdList.NEXUS('editor')
@@ -292,10 +354,10 @@ C.scenario('A02 first-run Create, label and Save',function()
  print('OBSERVED','A02 context='..line)
  C.guard(line:find('Saved Build: ',1,true)~=nil and not line:find('Assigned to:',1,true),
   'A02: the header keeps its Saved Build wording and claims no assignment',line)
- C.expect(line:find('first-run target',1,true)~=nil,'A02: the opened first-run plan is labelled as the first-run target',line)
+ C.guard(line:find('first-run target',1,true)~=nil,'A02: the opened first-run plan is labelled as the first-run target',line)
  SaveClick(201174)
  asked=Asked()
- C.expect(asked and asked:find('first-run target for '..CHARACTER,1,true),'A02: the Save confirmation names the first-run target',asked)
+ C.guard(asked and asked:find('first-run target for '..CHARACTER,1,true),'A02: the Save confirmation names the first-run target',asked)
  Cancel()
  C.guard(Uploads()==n,'A02: cancelling uploads nothing')
  Quiet('A02',others,auto)
@@ -314,7 +376,7 @@ C.scenario('A14 an empty captured Saved Build is refused, never first-run or slo
   'A14: no confirmation, upload or assignment; no first-run or slot-1 fallback',Facts())
  local row=ResultRow()
  print('OBSERVED','A14 empty row='..tostring(row))
- C.expect(row and row:find('^Not saved') and V.Names(row,'Fire PvE') and row:find('empty or not loaded',1,true)
+ C.guard(row and row:find('^Not saved') and V.Names(row,'Fire PvE') and row:find('empty or not loaded',1,true)
   and not row:lower():find('first-run',1,true),'A14: a not-saved result names the empty captured Saved Build',row)
  Quiet('A14',others,auto)
  Close()
@@ -329,41 +391,50 @@ C.scenario('A14 unknown slot data: no guessed destination; Assign now waits for 
  NewPlan('Unknown',201175)
  local asked=Asked()
  print('OBSERVED','A14u confirmation='..tostring(asked))
- C.expect(asked and asked:find('not loaded yet',1,true) and not asked:lower():find('first-run',1,true)
+ C.guard(asked and asked:find('not loaded yet',1,true) and not asked:lower():find('first-run',1,true)
   and not asked:find('slot',1,true),'A14u: the confirmation says the destination is unknown; nothing guessed',asked)
  if not asked then return end
  H.AcceptPopup()
  C.guard(Uploads()==1 and Writes()==0 and Facts()==facts,'A14u: saved once, assigned nowhere (unchanged)',Facts())
  local row=ResultRow()
- C.expect(row and row:find('Not assigned',1,true) and row:find('not loaded',1,true),'A14u: the result says why it is not assigned',row)
+ C.guard(row and row:find('Not assigned',1,true) and row:find('not loaded',1,true),'A14u: the result says why it is not assigned',row)
  local journal=JournalHost()
  local btn=AssignNowButton()
- C.expect(btn~=nil,'A14u: Assign now is offered for the saved, unassigned plan')
+ C.guard(btn~=nil,'A14u: Assign now is offered for the saved, unassigned plan')
  if not btn then return end
+ local sent=#H.sent
  local said=Heard(function() btn:Click() end)
- C.expect(said:find('not loaded yet',1,true)~=nil and NexusEditorFrame:IsShown() and not journal:IsShown(),
+ C.guard(said:find('not loaded yet',1,true)~=nil and NexusEditorFrame:IsShown() and not journal:IsShown(),
   'A14u: while slot data is unknown, Assign now opens nothing',said)
- C.guard(Uploads()==1 and Writes()==0,'A14u: and uploads or assigns nothing')
+ C.guard(Uploads()==1 and Writes()==0 and #H.sent==sent,'A14u: and uploads, assigns or sends nothing')
  H.perks.serverActiveSlot=1;H.Notify();A.Poll();H.Advance(1)
  btn=AssignNowButton()
  C.setup(btn~=nil,'A14u: fixture: Assign now still offered')
  if not btn then return end
+ sent=#H.sent
  btn:Click()
- C.expect(not NexusEditorFrame:IsShown() and journal:IsShown(),'A14u: once loaded, Assign now opens the Echo Journal')
- C.guard(Uploads()==1 and Writes()==0,'A14u: opening it uploads or assigns nothing')
+ C.guard(not NexusEditorFrame:IsShown() and journal:IsShown(),'A14u: once loaded, Assign now opens the Echo Journal')
+ -- M2 UX-06: the Journal's chooser itself is open, titled with its target.
+ local picker=_G.NexusWishlistOnlyPicker
+ local title=picker and picker.title and V.Plain(picker.title:GetText() or '') or ''
+ C.expect(picker~=nil and picker:IsShown() and title:find('Assign to',1,true)~=nil and V.Names(title,'One'),
+  'A14u: the chooser opens titled with the Saved Build it assigns to',title)
+ C.guard(Uploads()==1 and Writes()==0 and #H.sent==sent,'A14u: opening it uploads, assigns or sends nothing')
 end)
 
 C.scenario('A03 bound Save of an inactive Saved Build names it',function()
  BoundWorld(1)
  local others,auto=Others(),Auto()
+ local sent=#H.sent
  SaveClick(201173)
  local asked=Asked()
  print('OBSERVED','A03 confirmation='..tostring(asked))
- C.expect(asked and V.Names(asked,'Six') and asked:find('slot 6',1,true) and asked:find('updates its assignment',1,true),
+ C.guard(asked and V.Names(asked,'Six') and asked:find('slot 6',1,true) and asked:find('updates its assignment',1,true),
   'A03: the Save confirmation names Saved Build Six (slot 6) and that its assignment is updated',asked)
- C.expect(asked and not V.Names(asked,'One'),'A03: it never names the active Saved Build One',asked)
+ C.guard(asked and V.Names(asked,'Six') and not V.Names(asked,'One'),
+  'A03: it names Saved Build Six and never the active Saved Build One',asked)
  Cancel()
- C.guard(Uploads()==0 and Writes()==0,'A03: cancelling uploads and assigns nothing')
+ C.guard(Uploads()==0 and Writes()==0 and #H.sent==sent,'A03: opening and cancelling upload, assign and send nothing')
  Quiet('A03',others,auto)
  Close()
 end)
@@ -377,7 +448,11 @@ C.scenario('unbound Save names no Saved Build and promises no assignment',functi
  print('OBSERVED','U confirmation='..asked)
  C.guard(V.Names(asked,'W-Free') and not asked:lower():find('assign',1,true) and not V.Names(asked,'Six'),
   'U: the confirmation updates W-Free and promises no assignment',asked)
- C.expect(asked:find('no Saved Build',1,true)~=nil,'U: it says W-Free has no Saved Build here',asked)
+ C.guard(asked:find('no Saved Build',1,true)~=nil,'U: it says there is no Saved Build here',asked)
+ -- M2 F3: scoped to this editor and this save, not a global claim.
+ C.expect(asked:find('This editor has no Saved Build destination',1,true)~=nil
+  and not asked:find("saving changes no Saved Build's Wishlist",1,true),
+  'F3: the unbound Save line is scoped to this editor and this save',asked)
  Cancel()
  C.guard(Uploads()==0,'U: cancelling uploads nothing')
  Close()
@@ -391,23 +466,25 @@ C.scenario('A13 Auto ON consequence wording; open and cancel change nothing',fun
  SlashCmdList.NEXUS('editor')
  C.setup(Ctx().name=='W-One' and Ctx().loadoutSlot==1,'A13: fixture: W-One is open for Saved Build One')
  local others,uploads=Others(),Uploads()
+ local sent=#H.sent
  SaveClick(201172)
  local asked=Asked() or ''
  print('OBSERVED','A13 bound confirmation='..asked)
- C.expect(asked:find('Auto is ON',1,true)~=nil and asked:find('may replace',1,true)~=nil and asked:find('level 80',1,true)~=nil
+ C.guard(asked:find('Auto is ON',1,true)~=nil and asked:find('may replace',1,true)~=nil and asked:find('level 80',1,true)~=nil
   and V.Names(asked,'One'),'A13: the bound Save names the conditional Auto consequence for Saved Build One',asked)
  local ok,word=Conditional(asked)
- C.expect(ok,'A13: no unconditional replacement or unmeasured latency',word)
+ C.guard(asked:find('Auto is ON',1,true)~=nil and ok,'A13: the Auto line is present and promises no unconditional replacement or latency',word)
  Cancel()
- C.guard(Auto() and Others()==others and Uploads()==uploads,'A13: opening and cancelling keep Auto ON and change nothing')
+ C.guard(Auto() and Others()==others and Uploads()==uploads and #H.sent==sent,
+  'A13: opening and cancelling keep Auto ON and change or send nothing')
  button('+ New Wishlist'):Click()
  C.setup(Ctrl().CreateTargetContext() and Ctrl().CreateTargetContext().loadoutSlot==1,'A13: fixture: a new draft for Saved Build One')
  NewPlan('Planned',201176)
  asked=Asked() or ''
  print('OBSERVED','A13 create confirmation='..asked)
- C.expect(asked:find('Auto is ON',1,true)~=nil and V.Names(asked,'One'),'A13: Create names the conditional Auto consequence',asked)
+ C.guard(asked:find('Auto is ON',1,true)~=nil and V.Names(asked,'One'),'A13: Create names the conditional Auto consequence',asked)
  ok,word=Conditional(asked)
- C.expect(ok,'A13: Create promises no immediate replacement',word)
+ C.guard(asked:find('Auto is ON',1,true)~=nil and ok,'A13: Create\'s Auto line promises no immediate replacement',word)
  Cancel()
  C.guard(Auto() and Others()==others and Uploads()==uploads and spends==0,'A13: the Create confirmation and its cancel change nothing')
  Close()
@@ -425,7 +502,7 @@ C.scenario('A13 Auto ON consequence wording; open and cancel change nothing',fun
  button('+ New Wishlist'):Click()
  NewPlan('Quiet',201176)
  asked=Asked() or ''
- C.expect(V.Names(asked,'One') and not asked:find('Auto is ON',1,true),'A13: with Auto OFF the destination is named and no Auto line is added',asked)
+ C.guard(V.Names(asked,'One') and not asked:find('Auto is ON',1,true),'A13: with Auto OFF the destination is named and no Auto line is added',asked)
  Cancel()
  C.guard(Uploads()==uploads and spends==0,'A13: nothing was uploaded or spent')
  Close()
@@ -437,11 +514,11 @@ C.scenario('A11 long and unnamed Saved Build names',function()
  C.setup(Ctrl().CreateTargetContext() and Ctrl().CreateTargetContext().loadoutSlot==2,'A11: fixture: draft captured the long-named Saved Build 2')
  NewPlan('Long',201175)
  local asked=Asked() or ''
- C.expect(asked:find(LONG,1,true)~=nil and asked:find('slot 2',1,true)~=nil,'A11: the confirmation carries the complete captured name',asked)
+ C.guard(asked:find(LONG,1,true)~=nil and asked:find('slot 2',1,true)~=nil,'A11: the confirmation carries the complete captured name',asked)
  H.AcceptPopup()
  local row=ResultRow()
- C.expect(row and row:find(LONG,1,true),'A11: the result carries the complete name (the client shortens the line)',row)
- C.expect(row and ResultHoverFirstLine()==row,'A11: hovering the result shows its complete text',ResultHoverFirstLine())
+ C.guard(row and row:find(LONG,1,true),'A11: the result carries the complete name (the client shortens the line)',row)
+ C.guard(row and ResultHoverFirstLine()==row,'A11: hovering the result shows its complete text',ResultHoverFirstLine())
  H.Advance(4)
  H.perks.serverActiveSlot=4;H.Notify();A.Poll();H.Advance(1)
  button('+ New Wishlist'):Click()
@@ -449,7 +526,7 @@ C.scenario('A11 long and unnamed Saved Build names',function()
  NewPlan('Unnamed',201177)
  asked=Asked() or ''
  print('OBSERVED','A11 unnamed confirmation='..asked)
- C.expect(asked:find('Saved Build 4',1,true)~=nil and not asked:find("'Saved Build 4'",1,true) and not V.Names(asked,'Fire'),
+ C.guard(asked:find('Saved Build 4',1,true)~=nil and not asked:find("'Saved Build 4'",1,true) and not V.Names(asked,'Fire'),
   'A11: an unnamed Saved Build is named by its slot only, never by another name',asked)
  Cancel()
  Close()
@@ -464,7 +541,7 @@ C.scenario('A10/A14 a recycled server slot keeps its refusal and shows it',funct
  C.guard(H.popup==nil and Uploads()==0 and Facts()==facts,'A10: the reused slot is not overwritten; nothing is assigned',Facts())
  local row=ResultRow()
  print('OBSERVED','A10 reused row='..tostring(row))
- C.expect(row and row:find('^Not saved') and row:find('no longer holds the Wishlist this editor opened',1,true)
+ C.guard(row and row:find('^Not saved') and row:find('no longer holds the Wishlist this editor opened',1,true)
   and not row:find('Assigned',1,true),'A10: a not-saved result explains the reused server slot',row)
  Close()
 end)
@@ -473,7 +550,7 @@ C.scenario('A10 a replaced editor context retires the result',function()
  BoundWorld(6)
  selected(201173).plus:Click();button('Save Wishlist'):Click();H.AcceptPopup()
  local row=ResultRow()
- C.expect(row and row:find('Assigned to',1,true),'A10: fixture result: the bound save is assigned',row)
+ C.guard(row and row:find('Assigned to',1,true),'A10: the bound save is assigned',row)
  local others=Others()
  -- Choose Saved Build 1 with the editor's real Saved Build selector.
  local selector
@@ -491,7 +568,7 @@ C.scenario('A10 a replaced editor context retires the result',function()
  H.Advance(2)
  C.setup(Ctx().loadoutSlot==nil and Ctrl().CreateTargetContext() and Ctrl().CreateTargetContext().loadoutSlot==1,
   'A10: fixture: the editor now edits Saved Build 1')
- C.expect(row~=nil and ResultRow()==nil,'A10: the earlier result is gone in the new context',ResultRow())
+ C.guard(row~=nil and ResultRow()==nil,'A10: the earlier result is gone in the new context',ResultRow())
  C.guard(Others()==others and H.perks.serverActiveSlot==6,'A10: choosing a Saved Build activates nothing')
  Close()
 end)

@@ -201,4 +201,9 @@ function M.CancelAuto(owner)
     return false
 end
 
+-- Read-only: whether a warning is open and waiting for its answer now. The
+-- informational setup replay waits for that answer instead of opening over
+-- it; asking changes nothing.
+function M.IsOpen() return active ~= nil end
+
 return M

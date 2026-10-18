@@ -2556,7 +2556,10 @@ end
                 parts[#parts + 1] = "Saving also updates " .. label
                     .. " (used until a Saved Build with Echoes is active)."
             else
-                parts[#parts + 1] = "This Wishlist has no Saved Build here, and saving changes no Saved Build's Wishlist."
+                -- Scoped to this editor and this save: no claim about what
+                -- other Saved Builds use, and no promise about assignments.
+                parts[#parts + 1] = "This editor has no Saved Build destination for it, so this save leaves "
+                    .. "every Saved Build's Wishlist choice as it is."
             end
         else
             if kind == "savedBuild" then
@@ -2568,8 +2571,10 @@ end
             elseif kind == "unknown" then
                 parts[#parts + 1] = "Saved Build data is not loaded yet, so it will be saved without an assignment."
             else
-                parts[#parts + 1] = "No Saved Build was open when this draft began, so it will be saved without "
-                    .. "an assignment. You can assign it afterwards in the Echo Journal."
+                -- What the editor captured, not what was open in the game: a
+                -- copied draft can begin while a Saved Build is selected.
+                parts[#parts + 1] = "The editor did not capture a Saved Build for this draft, so it will be saved "
+                    .. "without an assignment. You can assign it afterwards in the Echo Journal."
             end
             parts[#parts + 1] = "Existing Wishlists are not overwritten. Nothing is rolled, spent or activated."
         end
@@ -2596,7 +2601,9 @@ end
             }
             if reason == "draftChanged" then return "the editor changed during the upload" end
             if reason == "localTargets" then return "its locked targets could not be saved on this character" end
-            local plain = refused[tostring(detail or "unavailable")]
+            -- A writer that gave no reason is shown neutrally, not as a guess.
+            if detail == nil then return "the assignment was refused" end
+            local plain = refused[tostring(detail)]
             if plain then return plain end
             return "the assignment was refused", detail
         end
@@ -2634,8 +2641,8 @@ end
         local copies = tonumber(result.copies)
         local planned = copies and string.format("%d of 79 rolled copies planned (a plan, not owned Echoes); "
             .. "planned locked targets are separate.", copies) or nil
-        local journal = "Assign now... opens the Echo Journal's Wishlist selector; nothing is assigned until "
-            .. "you choose a Wishlist there, and nothing is uploaded again."
+        local journal = "Assign now... opens the Echo Journal with its Wishlist chooser; nothing is assigned "
+            .. "until you choose a Wishlist there, and nothing is uploaded again."
         local kind, reason = result.kind, result.reason
         if kind == "assigned" then
             return "|cff4dff80Saved|r " .. plan .. " \226\128\162 Assigned to " .. (label or "its Saved Build"),
@@ -2644,13 +2651,17 @@ end
         elseif kind == "firstRun" then
             local who = DisplayUntrusted(destination.character, 1024, false) or "this character"
             return "|cff4dff80Saved|r " .. plan .. " \226\128\162 First-run target for " .. who,
-                {"Used until a Saved Build with Echoes is active. No Saved Build was changed.", planned}
+                {"Used until a Saved Build with Echoes is active. No Saved Build was activated or changed "
+                    .. "in the game.", planned}
         elseif kind == "unassigned" then
+            -- What this editor captured for this save, not a claim about what
+            -- other Saved Builds use.
             local why = reason == "notLoaded" and "Saved Build data was not loaded"
-                or reason == "unboundPlan" and "this Wishlist has no Saved Build here"
-                or "no Saved Build was open when this draft began"
+                or reason == "unboundPlan" and "this editor has no Saved Build destination for it"
+                or "the editor captured no Saved Build for this draft"
             return "|cffffd200Saved \226\128\162 Not assigned|r " .. plan .. ": " .. why,
-                {"The plan is saved but no Saved Build or first-run target uses it yet.", journal, planned}
+                {"The plan is saved. This save assigned it to nothing: the editor had no Saved Build or "
+                    .. "first-run destination for it.", journal, planned}
         elseif kind == "kept" then
             return "|cffffd200Saved \226\128\162 Not assigned|r " .. plan .. ": "
                 .. (label or "its destination") .. " changed meanwhile; that choice is kept",
@@ -2714,8 +2725,8 @@ end
         button:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
             GameTooltip:AddLine("Assign now", 1, 0.8, 0.3)
-            GameTooltip:AddLine("Closes the editor and opens the Echo Journal's Wishlist selector, the same "
-                .. "route as Assign Wishlist. The Journal names the Saved Build it assigns to; nothing is "
+            GameTooltip:AddLine("Closes the editor and opens the Echo Journal with its Wishlist chooser, the "
+                .. "same route as Assign Wishlist. The chooser names the Saved Build it assigns to; nothing is "
                 .. "assigned until you choose a Wishlist there.", 0.8, 0.8, 0.8, true)
             GameTooltip:AddLine("Nothing is uploaded again, no Saved Build is activated, and Auto is not changed.",
                 0.8, 0.8, 0.8, true)
@@ -2762,9 +2773,18 @@ end
                     .. "was saved for, so the selector was not opened and nothing was assigned. Close and "
                     .. "reopen the editor to continue."
             end
+            -- No advice to switch Saved Builds: that is a game action with
+            -- its own consequences, and Nexus never does it for the player.
             return "The Echo Journal now assigns to a different Saved Build than " .. (label or "the one")
                 .. " this plan was saved for, so the selector was not opened and nothing was assigned. "
-                .. "Select that Saved Build in the game first, or close and reopen the editor."
+                .. "Close and reopen the editor to work with the Saved Build the Journal targets now."
+        elseif why == "empty_target" then
+            return "The Echo Journal targets " .. (label or "a Saved Build") .. ", which is empty or not "
+                .. "loaded, so it refuses any assignment to it. The selector was not opened and nothing was assigned."
+        elseif why == "route_unavailable" then
+            return "Could not find the game's Character Progression button, so nothing was opened or "
+                .. "assigned. The editor stays open; open Character Progression → Echoes yourself and use "
+                .. "the Nexus Wishlist selector at its top."
         end
         return "Assign now no longer applies to this plan, so nothing was opened or assigned."
     end
@@ -2781,10 +2801,18 @@ end
             print("|cffff6060Nexus:|r The Echo Journal's Wishlist selector is unavailable. Nothing was assigned.")
             return false
         end
+        -- The route must be able to open before the editor (and its result)
+        -- is closed for it.
+        if type(journal.CanOpenBuilds) == "function" and not journal.CanOpenBuilds() then
+            print("|cffff6060Nexus:|r " .. M.AssignNowRefusal("route_unavailable"))
+            M.RenderSaveResult()
+            return false
+        end
         -- As the main panel's Assign Wishlist: the editor closes first, since
-        -- the Echo Journal is kept hidden while the editor is shown.
+        -- the Echo Journal is kept hidden while the editor is shown; the
+        -- Journal then opens its Wishlist chooser for the target it shows.
         M.Hide()
-        journal.OpenBuilds()
+        journal.OpenBuilds(true)
         return true
     end
 

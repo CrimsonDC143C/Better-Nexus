@@ -75,6 +75,67 @@ function M.CardLine(card, annotation, delta)
     return table.concat(parts, " ")
 end
 
+-- The card the current recommendation takes: exactly one card that the
+-- runtime marked as the Take target (card.highlight). None, or several (the
+-- same Echo offered twice), gives nil, so no card is guessed.
+function M.MarkedCard(cards)
+    if type(cards) ~= "table" then return nil end
+    local found
+    for i = 1, math.min(#cards, 3) do
+        local c = cards[i]
+        if type(c) == "table" and c.highlight == true then
+            if found then return nil end
+            found = i
+        end
+    end
+    return found
+end
+
+-- "Name (Quality)" from a CardLine text; nil when the line carries no known
+-- quality, since the name then cannot be told from its annotation.
+function M.CardTarget(text)
+    text = tostring(text or ""):gsub("^%[Guaranteed offer%] ", "")
+    local first, last
+    for _, q in pairs(QUALITY_NAMES) do
+        local s, e = text:find(" (" .. q .. ")", 1, true)
+        if s and (not first or s < first) then first, last = s, e end
+    end
+    if not first or first <= 1 then return nil end
+    return text:sub(1, last)
+end
+
+-- An unstepped recommendation with its definite target named:
+-- "<reason>: <Name (Quality)>". A stepped plan (numbered lines) already
+-- names each step and is returned unchanged, as is a line with no target.
+function M.RecommendationWithTarget(recommendation, cardText)
+    local text = tostring(recommendation or "")
+    if text:find("^%d+%. ") or text:find("\n%d+%. ") then return text end
+    local target = M.CardTarget(cardText)
+    if not target then return text end
+    if text == "" then return "Take: " .. target end
+    return text .. ": " .. target
+end
+
+-- Compact charges for the roll heading, "B:2 R:1 F:0". A count the game has
+-- not reported (charges.arrived == false, or no number) is "?", never 0;
+-- counts the adapter does not trust are marked "~" (estimated). Without a
+-- charges table there is nothing to show (""). Formatting only: it reads no
+-- service and changes no count.
+function M.ChargesLine(charges)
+    if type(charges) ~= "table" then return "" end
+    local arrived = charges.arrived ~= false
+    local function Count(value)
+        value = tonumber(value)
+        if not arrived or value == nil or value ~= value or value < 0
+            or value >= math.huge then return "?" end
+        return tostring(Round(value))
+    end
+    local line = "B:" .. Count(charges.banish) .. " R:" .. Count(charges.reroll)
+        .. " F:" .. Count(charges.freeze)
+    if arrived and charges.trustworthy == false then line = line .. " ~" end
+    return line
+end
+
 -- Next n predicted guaranteed arrivals, "(predicted)" suffixed --
 -- injection order is measured but not version-stable, never state it
 -- as fact. queue = Ratchet.PredictQueue output (entries pre-bridged).

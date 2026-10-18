@@ -5,7 +5,9 @@ local frame,index= nil,1
 -- Keep the complete Help window above the Orb dialog's 30-33 layer band.
 local HELP_LEVEL=40
 local pages={
- {id="start",title="Getting started",text=[[This is an experimental build. Back up your Nexus folder and WTF with WoW closed before testing. Reading this guide never spends, assigns, activates, or sends a Sync request.
+ {id="start",title="Getting started",text=[[Start here: the page buttons above open any page directly. Setup / Welcome reopens the first-launch guide; it is information only, saves nothing and never turns Auto ON. Assign Wishlist... opens the Echo Journal with its Wishlist chooser for the Saved Build the Journal shows; nothing is assigned until you choose a Wishlist there.
+
+This is an experimental build. Back up your Nexus folder and WTF with WoW closed before testing. Reading this guide never spends, assigns, activates, or sends a Sync request.
 
 Before you turn Auto ON: With Auto ON, Nexus may replace that active Saved Build with a better finished run; at level 80 after a finished run, that can happen right after you turn Auto ON or change the assignment. Saving edits to the assigned Wishlist can also lead to a replacement without a new run. It treats the slot as a working copy, not a protected archive. Keep Auto OFF if you want it left unchanged. Auto starts OFF each session.
 
@@ -140,9 +142,16 @@ Advanced commands are troubleshooting tools, not generic fixes. Do not experimen
 Known legacy compatibility and incomplete native validation remain disclosed. Offline tests are not native verification. Back up saved data and test voluntarily.]]},
 }
 H.Pages=pages
+-- Short labels of the direct page buttons, by page id.
+local TAB_LABELS={start="Start",wishlists="Wishlists",rolling="Auto",sharing="Sharing",orbs="Orbs",
+ troubleshooting="Problems",about="About"}
 local function refresh()
     local p=pages[index];frame.title:SetText("Nexus Help - "..p.title);frame.body:SetText(p.text)
     frame.page:SetText("Page "..index.." / "..#pages)
+    -- The current page's button is the disabled one; a page change clears an
+    -- earlier route note.
+    for i,t in ipairs(frame.tabs or {}) do if i==index then t:Disable() else t:Enable() end end
+    if frame.note and frame.noteIndex~=index then frame.note:SetText("");frame.noteIndex=nil end
     if frame.content then
         frame.body:SetHeight(0)
         local measured=frame.body:GetStringHeight()
@@ -163,7 +172,8 @@ local function ensure()
     frame:SetBackdropColor(.035,.04,.05,1)
     frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge");frame.title:SetPoint("TOPLEFT",20,-20)
     local scroll=CreateFrame("ScrollFrame","NexusHelpScroll",frame,"UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT",20,-56);scroll:SetSize(595,414)
+    -- Below the page buttons, the setup row and its one-line route note.
+    scroll:SetPoint("TOPLEFT",20,-108);scroll:SetSize(595,362)
     scroll:SetFrameLevel(HELP_LEVEL+1)
     local child=CreateFrame("Frame",nil,scroll);child:SetSize(590,650);scroll:SetScrollChild(child);frame.content=child
     child:SetPoint("TOPLEFT",scroll,"TOPLEFT",0,0);child:SetFrameLevel(HELP_LEVEL+2)
@@ -179,6 +189,27 @@ local function ensure()
     b(430,95,"Start page",function()index=1;refresh()end)
     b(533,100,"Close",function()frame:Hide()end)
     frame.page=frame:CreateFontString(nil,"OVERLAY","GameFontDisableSmall");frame.page:SetPoint("BOTTOM",0,26)
+    -- Direct page buttons: any page in one click (deep links use H.Show(id)).
+    frame.tabs={}
+    for i,p in ipairs(pages) do
+        local t=CreateFrame("Button",nil,frame,"UIPanelButtonTemplate")
+        t:SetPoint("TOPLEFT",20+(i-1)*83,-44);t:SetSize(79,20);t:SetText(TAB_LABELS[p.id] or p.title)
+        t:SetFrameLevel(HELP_LEVEL+2)
+        t:SetScript("OnClick",function()index=i;refresh();scroll:SetVerticalScroll(0)end)
+        frame.tabs[i]=t
+    end
+    -- The primary setup path. Each button only navigates (H.OpenSetup,
+    -- H.OpenAssignment, H.OpenEditor); none assigns, spends, sends or turns
+    -- Auto ON, and a route that cannot open says why in the note below.
+    local function action(x,w,label,fn)
+        local f=CreateFrame("Button",nil,frame,"UIPanelButtonTemplate");f:SetPoint("TOPLEFT",x,-68);f:SetSize(w,22)
+        f:SetText(label);f:SetFrameLevel(HELP_LEVEL+2);f:SetScript("OnClick",fn);return f
+    end
+    action(20,150,"Setup / Welcome",function()H.OpenSetup()end)
+    action(176,160,"Assign Wishlist...",function()H.OpenAssignment()end)
+    action(342,140,"Wishlist Editor",function()H.OpenEditor()end)
+    frame.note=frame:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall");frame.note:SetPoint("TOPLEFT",20,-93)
+    frame.note:SetSize(615,13);frame.note:SetJustifyH("LEFT");frame.note:SetText("")
     -- Register the completed window once, including its owned navigation
     -- controls. Palette changes then repaint the same frame through Theme.
     if Nexus.Theme and Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(frame,0.94) end
@@ -190,3 +221,65 @@ function H.Show(id)
     frame:Show();refresh();return frame
 end
 function H.Hide()if frame then frame:Hide()end end
+
+-- Setup routes of the Help window. While local start-up is not ready, the
+-- routes that need it say so and open nothing; Help itself stays available
+-- during loading. No route assigns, spends, sends or turns Auto ON.
+local function LocalToolsReady()
+    if type(Nexus.StartupStatus)~="function" then return false end
+    local ok,s=pcall(Nexus.StartupStatus)
+    return ok and type(s)=="table" and s.coreReady==true
+end
+local function Refuse(text)
+    if frame and frame.note then frame.note:SetText("|cffffd200"..text.."|r");frame.noteIndex=index end
+    print("|cffffd200Nexus:|r "..text)
+    return false
+end
+-- Setup / Welcome: the informational replay (QuickStart.ShowSetup).
+function H.OpenSetup()
+    local quick=Nexus.QuickStart
+    if not (quick and type(quick.ShowSetup)=="function") then
+        return Refuse("Setup / Welcome is not available yet.")
+    end
+    local shown,why=quick.ShowSetup()
+    if not shown then
+        return Refuse(why=="warning-open"
+            and "Answer the open Auto warning first (Yes or No); Setup / Welcome opens after it."
+            or "Setup / Welcome is not available right now.")
+    end
+    if frame then frame:Hide() end
+    return true
+end
+-- Assign Wishlist...: the Echo Journal with its Wishlist chooser
+-- (JournalTab.OpenBuilds(true)). Help closes first; the Wishlist editor too,
+-- since the Journal is kept hidden while it is shown.
+function H.OpenAssignment()
+    if not LocalToolsReady() then
+        return Refuse("Assign Wishlist opens after start-up finishes (see the loading panel). Nothing was opened or assigned.")
+    end
+    local journal=Nexus.JournalTab
+    if not (journal and type(journal.OpenBuilds)=="function") then
+        return Refuse("The Echo Journal route is not available. Nothing was assigned.")
+    end
+    if type(journal.CanOpenBuilds)=="function" and not journal.CanOpenBuilds() then
+        return Refuse("The game's Character Progression button was not found. Nothing was opened or assigned.")
+    end
+    if frame then frame:Hide() end
+    local editor=_G.NexusEditorFrame
+    if editor and editor.IsShown and editor:IsShown() then editor:Hide() end
+    journal.OpenBuilds(true)
+    return true
+end
+-- Wishlist Editor: the editor as /nexus editor opens it.
+function H.OpenEditor()
+    if not LocalToolsReady() then
+        return Refuse("The Wishlist Editor opens after start-up finishes (see the loading panel). Nothing was opened.")
+    end
+    local editor=Nexus.WishlistEditor
+    if not (editor and type(editor.Show)=="function") then
+        return Refuse("The Wishlist Editor is not available.")
+    end
+    if frame then frame:Hide() end
+    editor.Show()
+    return true
+end

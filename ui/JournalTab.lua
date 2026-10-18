@@ -1157,6 +1157,11 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
         wishlistPicker.title:SetPoint("TOPLEFT", 10, -8)
         wishlistPicker.title:SetText("Wishlists")
     end
+    -- The title names the target this picker's clicks act on (the context
+    -- captured with it), not only that these are Wishlists.
+    wishlistPicker.title:SetText(emptySlot and "Empty Saved Build: assigning is refused"
+        or ((tonumber(active) or 0) < 1 and "Assign to: first-run target")
+        or ("Assign to: " .. ShortName(tostring(loadoutName or ""), 24)))
     for i=1,#wishlistPickerRows do wishlistPickerRows[i]:Hide() end
     if wishlistPicker.emptyRow then wishlistPicker.emptyRow:Hide() end
     if wishlistPicker.clearRow then wishlistPicker.clearRow:Hide() end
@@ -1683,6 +1688,39 @@ local function EnsureLifecycleHooks()
     hooked = any
 end
 
+-- The live menu-bar button that opens Character Progression -> Echoes, or nil.
+-- Read-only: it finds the button and clicks nothing.
+local function FindEchoesMicroButton()
+    local button = _G["EchoJournalMicroButton"]
+    if button and type(button.Click) == "function" then return button end
+    local function walk(frame, depth)
+        if not frame or depth > 6 then return nil end
+        local name = frame.GetName and frame:GetName() or nil
+        if type(name) == "string" then
+            local lower = string.lower(name)
+            if string.find(lower, "echojournalmicrobutton", 1, true)
+                and type(frame.Click) == "function" then
+                return frame
+            end
+        end
+        local children = { frame.GetChildren and frame:GetChildren() }
+        for i = 1, #children do
+            local found = walk(children[i], depth + 1)
+            if found then return found end
+        end
+        return nil
+    end
+    return walk(_G["UIParent"], 0)
+end
+
+-- Whether the Echoes page can be opened now (read-only). Callers check this
+-- before closing their own window for the route, so a missing button loses
+-- nothing.
+function M.CanOpenBuilds()
+    local ok, button = pcall(FindEchoesMicroButton)
+    return ok and button ~= nil
+end
+
 local function ClickCurrentEchoesMicroButton()
     -- The server update moved Echoes into Character Progression. Calling the
     -- legacy ProjectEbonhold.EchoJournal.Show() still opens the retired
@@ -1721,18 +1759,50 @@ local function ClickCurrentEchoesMicroButton()
     return false
 end
 
-function M.OpenBuilds()
+-- The Wishlist chooser of the attached strip, opened through the selector's
+-- own click handler (the same candidates, target and checks as a player's
+-- click). Opening it assigns nothing; only a row click does. True when the
+-- chooser is open.
+local function OpenChooserNow()
+    local host = associationPanel
+    if not (host and host:IsVisible() and host.selector and host.selector:IsVisible()) then
+        return false
+    end
+    if wishlistPicker and wishlistPicker:IsShown() then return true end
+    local click = host.selector:GetScript("OnClick")
+    if type(click) ~= "function" then return false end
+    click(host.selector)
+    return wishlistPicker ~= nil and wishlistPicker:IsShown()
+end
+
+local CHOOSER_COACH = "The Echoes page is open. Click the Nexus Wishlist selector at its top to choose a "
+    .. "Wishlist; nothing is assigned until you choose one."
+
+-- `openChooser`: also open the Wishlist chooser once the strip is attached
+-- (Assign Wishlist, Set up current build, Help and the editor's Assign now);
+-- when the strip cannot be shown, say what to click instead. Without it the
+-- existing behaviour is unchanged. Returns true when the Echoes page opened.
+-- `beforeOpen` (optional): the caller's own step before the page opens (the
+-- HUD's Assign Wishlist closes its other windows). It runs only when the
+-- game's Character Progression entry is there; otherwise nothing runs and
+-- false, "unavailable" is returned, so the caller says why and loses nothing.
+function M.OpenBuilds(openChooser, beforeOpen)
+    if type(beforeOpen) == "function" then
+        if not M.CanOpenBuilds() then return false, "unavailable" end
+        beforeOpen()
+    end
     EnsureAssociationScanner()
 
     local opened = ClickCurrentEchoesMicroButton()
     if not opened then
         print("|cffff6060Nexus:|r Could not find the server Character Progression button. Open Character Progression → Echoes manually.")
-        return
+        return false
     end
 
+    local chooserPending = openChooser == true
     -- Let the server finish constructing/selecting its new Echoes page before
     -- attaching Nexus beside the live loadout dropdown.
-    local function finish()
+    local function finish(last)
         pcall(function()
             if not installed and pcall(Install) then installed = true end
             if installed then
@@ -1740,13 +1810,23 @@ function M.OpenBuilds()
                 DeselectOurTab(false)
             end
             RefreshAssociationRows()
+            if chooserPending then
+                if OpenChooserNow() then
+                    chooserPending = false
+                elseif last then
+                    chooserPending = false
+                    print("|cffffd200Nexus:|r " .. CHOOSER_COACH)
+                end
+            end
         end)
     end
-    finish()
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0.10, finish)
-        C_Timer.After(0.35, finish)
+    local timers = C_Timer and C_Timer.After
+    finish(not timers)
+    if timers then
+        C_Timer.After(0.10, function() finish(false) end)
+        C_Timer.After(0.35, function() finish(true) end)
     end
+    return true
 end
 
 function M.DebugSnapshot()

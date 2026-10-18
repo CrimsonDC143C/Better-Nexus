@@ -156,6 +156,12 @@ local function ModelSignatures(model)
                 and (model.effective.state == "waiting"
                     or model.effective.state == "rechecking")
                 and model.effective.state or nil,
+            -- With roll content shown, the Auto OFF heading and the card
+            -- marker follow the selection; between boards it changes nothing.
+            autoOff=model.auto == false and ((type(model.cards) == "table" and #model.cards > 0)
+                or SafeText(model.recommendation) ~= "") or nil,
+            -- The compact charges line follows the charge facts the model carries.
+            charges=model.charges,
         }),
         performance = Signature({
             performance=type(model.progress) == "table" and model.progress.performance or nil,
@@ -806,6 +812,13 @@ local function EnsureFrame()
     statusText:SetSize(276, 14)
     statusText:SetJustifyH("LEFT")
     frame._rollStatus = statusText
+    -- Compact charges (Readout.ChargesLine), right-aligned in the heading
+    -- row; shown only while the model itself carries charge facts.
+    frame._chargesText = rollArea:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    frame._chargesText:SetPoint("TOPRIGHT", -2, -1)
+    frame._chargesText:SetSize(72, 14)
+    frame._chargesText:SetJustifyH("RIGHT")
+    frame._chargesText:Hide()
 
     for i = 1, 3 do
         local fs = rollArea:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -1055,10 +1068,21 @@ local function EnsureFrame()
     setupGetStartedBtn:SetSize(126, 24)
     setupGetStartedBtn:SetText("Assign Wishlist")
     setupGetStartedBtn:SetScript("OnClick", function()
-        CloseOtherNexusWindows()
-        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then
-            Nexus.JournalTab.OpenBuilds()
+        local journal = Nexus.JournalTab
+        if journal and journal.OpenBuilds then
+            -- The present helper is the route: the Echo Journal with the
+            -- Wishlist chooser opened for the Saved Build the Journal targets
+            -- (nothing is assigned until one is chosen). It closes the other
+            -- Nexus windows only once the game's Character Progression entry
+            -- is there, so a refusal loses nothing and is said here.
+            local opened, why = journal.OpenBuilds(true, CloseOtherNexusWindows)
+            if opened == false and why == "unavailable" then
+                print("|cffff6060Nexus:|r Could not find the game's Character Progression button, so nothing "
+                    .. "was opened or assigned. Open Character Progression → Echoes yourself and use the Nexus "
+                    .. "Wishlist selector at its top.")
+            end
         else
+            CloseOtherNexusWindows()
             -- Show(tab) is a dot-call taking a tab index; no tab is passed
             -- (the journal opens its current tab).
             local pe = _G["ProjectEbonhold"]
@@ -1070,7 +1094,7 @@ local function EnsureFrame()
     setupGetStartedBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Assign Wishlist", 1, 1, 1)
-        GameTooltip:AddLine("Choose an existing server wishlist and associate it with this loadout.", 0.9, 0.9, 0.9, true)
+        GameTooltip:AddLine("Opens the Echo Journal with its Wishlist chooser for this loadout. Nothing is assigned until you choose a Wishlist there.", 0.9, 0.9, 0.9, true)
         GameTooltip:Show()
     end)
     setupGetStartedBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1186,7 +1210,20 @@ local function EnsureFrame()
         end
         local items = {
             { text = "Help / Getting Started", notCheckable = true,
-              func = MenuAction(function() if Nexus.Help then Nexus.Help.Show() end end) },
+              func = MenuAction(function() if Nexus.Help then Nexus.Help.Show("start") end end) },
+            -- Information only: reopens the first-launch guide (QuickStart
+            -- ShowSetup); it records nothing and never turns Auto ON.
+            { text = "Setup / Welcome", notCheckable = true,
+              func = MenuAction(function()
+                  local quick = Nexus.QuickStart
+                  local shown, why
+                  if quick and quick.ShowSetup then shown, why = quick.ShowSetup() end
+                  if not shown then
+                      print("|cffffd200Nexus:|r " .. (why == "warning-open"
+                          and "Answer the open Auto warning first (Yes or No); Setup / Welcome opens after it."
+                          or "Setup / Welcome is not available right now."))
+                  end
+              end) },
             { text = "Orbs / Lost Memories", notCheckable = true,
               func = MenuAction(function() if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end) },
             {
@@ -1709,6 +1746,14 @@ local function ApplyPanelLayout(layout, completed)
         statusText:ClearAllPoints()
         statusText:SetPoint("TOPLEFT", rollArea, "TOPLEFT", inset, -y)
         statusText:SetSize(boxes.roll.w-inset*2, layout.small)
+        local charges = frame._chargesText
+        if charges then
+            charges:ClearAllPoints()
+            charges:SetPoint("TOPRIGHT", rollArea, "TOPRIGHT", -inset, -y)
+            charges:SetSize(72, layout.small)
+            -- The heading keeps the rest of its row while charges are shown.
+            if charges:IsShown() then statusText:SetWidth(boxes.roll.w-inset*2-76) end
+        end
         y = y + layout.small + math.max(3,math.floor(layout.gap/2))
         for index = 1, 3 do
             local text = cardTexts[index]
@@ -1955,18 +2000,46 @@ local function ApplyModel(model, signatures, roll)
             -- With the Orb guidance and its button: the short form, which
             -- stays one line at every font scale.
             statusText:SetText(activeSlot > 0 and ("|cff4dff80Active:|r Slot " .. activeSlot) or "|cff888888Preview|r")
+        elseif model.auto == false then
+            -- The Auto selection is OFF (not merely held): Nexus only
+            -- recommends, and the player chooses in the game's window.
+            statusText:SetText("|cff7fd5ffAuto OFF — you choose|r"
+                .. (activeSlot > 0 and (" · Slot " .. activeSlot) or " · Preview"))
         else
             statusText:SetText(activeSlot > 0 and ("|cff4dff80Active:|r Roll recommendations active — Slot " .. activeSlot) or "|cff888888Preview: Roll recommendation preview|r")
         end
+        -- With Auto OFF, the one card the runtime marked as its Take target
+        -- (Readout.MarkedCard: exactly one, else none) carries a marker, and
+        -- an unstepped recommendation names it. Only the current model is
+        -- read, so no older marker survives a new board.
+        local marked = model.auto == false and Nexus.Readout and Nexus.Readout.MarkedCard
+            and Nexus.Readout.MarkedCard(cards) or nil
         for i = 1, 3 do
             local c = cards[i]
-            cardTexts[i]:SetText(type(c) == "table" and SafeText(c.text) or "")
+            local line = type(c) == "table" and SafeText(c.text) or ""
+            if marked == i and line ~= "" then line = "|cff4dff80>>|r " .. line end
+            cardTexts[i]:SetText(line)
         end
         -- An unresolved Orb action's own reason is more specific than the
         -- general pause text; otherwise the recommendation stays first. A
         -- reserved block has no current choice: it says so, and no more.
-        recText:SetText(activeRoll and bodyText
-            or "|cff888888No Echo choice is showing.|r")
+        local body = activeRoll and bodyText or "|cff888888No Echo choice is showing.|r"
+        if marked and activeRoll and bodyText == recommendation
+            and not (guide and guide.openOrbs) and type(cards[marked]) == "table" then
+            body = Nexus.Readout.RecommendationWithTarget(recommendation, SafeText(cards[marked].text))
+        end
+        recText:SetText(body)
+        -- Compact charges, only from charge facts the model itself carries
+        -- (Readout.ChargesLine; unknown is "?", never 0).
+        local chargesText = frame._chargesText
+        if chargesText then
+            local line = type(model.charges) == "table" and Nexus.Readout
+                and Nexus.Readout.ChargesLine and Nexus.Readout.ChargesLine(model.charges) or ""
+            chargesText:SetText(line)
+            if line ~= "" then chargesText:Show() else chargesText:Hide() end
+        end
+    elseif frame._chargesText then
+        frame._chargesText:Hide()
     end
     if frame._orbsBtn then
         frame._orbsBtn.blockers = guide and guide.blockers or nil

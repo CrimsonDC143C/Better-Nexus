@@ -1914,7 +1914,10 @@ function Controller.New(options)
             result.kind = "partial"
             if reason == "association_incomplete" then
                 result.reason = "association"
-                result.detail = tostring(trace.associationReason or "unavailable")
+                -- A writer that refused without a reason keeps none (shown
+                -- neutrally), never a guessed one.
+                result.detail = trace.associationReason ~= nil
+                    and tostring(trace.associationReason) or nil
             elseif reason == "uploaded_draft_changed" then
                 result.reason = "draftChanged"
             else
@@ -1997,6 +2000,14 @@ function Controller.New(options)
         if destination and destination.kind == "firstRun" and populated
             and selected >= 1 and selected <= (tonumber(slots.maxSlots) or 5) then
             return false, "elsewhere", destination
+        end
+        -- The Journal's target is a numbered Saved Build with no Echoes (or
+        -- not loaded): the Journal refuses any assignment to it, so the route
+        -- would end in that refusal. It is said here instead; nothing opens.
+        if selected >= 1 and selected <= (tonumber(slots.maxSlots) or 5) and not populated then
+            local name = type(row) == "table" and tostring(row.name or "") or ""
+            return false, "empty_target",
+                {kind = "savedBuild", slot = selected, name = name ~= "" and name or nil}
         end
         return true
     end

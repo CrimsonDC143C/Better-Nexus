@@ -18,6 +18,14 @@ local frame
 -- session that can record it.
 local dismissedThisSession, recordAttempts = false, 0
 local MAX_RECORD_ATTEMPTS = 10
+-- Said once per session when a dismissal could not be saved at once.
+local unsavedNoticeShown = false
+-- The informational replay (M.ShowSetup) states what it is in place of the
+-- first-time title and hint; normal opens restore these exact texts.
+local NORMAL_TITLE = "Welcome to Nexus"
+local NORMAL_HINT = "Reopen Help any time with /nexus help. Automation and Orb spending require separate explicit controls."
+local SETUP_TITLE = "Nexus setup (information only)"
+local SETUP_HINT = "Information only: this guide saves nothing and never turns Auto ON."
 
 -- Unlike the release note in ui/Changelog.lua, this acknowledgement does not
 -- require the shared catalog. A start-up that refused an oversized catalog
@@ -88,9 +96,34 @@ local function StartRecordRetry()
 end
 
 local function Finish()
+    -- The informational replay is not the first-time window: closing it or
+    -- following one of its buttons records nothing and dismisses nothing.
+    if frame and frame._informational then
+        frame._informational = nil
+        frame:Hide()
+        return
+    end
     dismissedThisSession = true
-    if not RecordSeen() then StartRecordRetry() end
+    if not RecordSeen() then
+        StartRecordRetry()
+        -- Truthful about a dismissal that is not saved (yet): nothing is
+        -- claimed complete, and the window may be offered again later.
+        if not unsavedNoticeShown then
+            unsavedNoticeShown = true
+            print("|cffffd200Nexus:|r The Welcome is closed, but this cannot be saved right now "
+                .. "(saved data is still loading or is read-only). If it cannot be saved this session, "
+                .. "the Welcome is offered again next time. Setup / Welcome in the ... menu reopens it.")
+        end
+    end
     if frame then frame:Hide() end
+end
+
+-- Normal (first-time or deliberate) presentation: the exact first-time texts.
+local function NormalTexts(f)
+    f._informational = nil
+    if f.title then f.title:SetText(NORMAL_TITLE) end
+    if f.hint then f.hint:SetText(NORMAL_HINT) end
+    return f
 end
 
 local function EnsureFrame()
@@ -151,7 +184,9 @@ local function EnsureFrame()
     current:SetScript("OnClick", function()
         Finish()
         CloseOtherSetupWindows()
-        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then Nexus.JournalTab.OpenBuilds() end
+        -- The Echo Journal with its Wishlist chooser opened for the Saved
+        -- Build it targets; nothing is assigned until a Wishlist is chosen.
+        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then Nexus.JournalTab.OpenBuilds(true) end
     end)
 
     local import = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
@@ -220,7 +255,27 @@ end
 
 function M.Show()
     if Nexus.OverwriteWarning and Nexus.OverwriteWarning.EnsureOnboarding() ~= "accepted" then return false end
-    EnsureFrame():Show()
+    NormalTexts(EnsureFrame()):Show()
+end
+
+-- Setup / Welcome replay (the ... menu and Help). Information only, and not
+-- the warning's consent: it opens after the warning was answered Yes or No,
+-- after the first-time window was seen, and while saved data is read-only or
+-- loading. It records no acknowledgement, writes no saved data, enables
+-- nothing and asks the warning nothing; its buttons only open their views.
+-- While a warning is open and waiting for its answer it does not open over
+-- it. Returns true when shown, else false and why.
+function M.ShowSetup()
+    local warning = Nexus.OverwriteWarning
+    if warning and type(warning.IsOpen) == "function" and warning.IsOpen() then
+        return false, "warning-open"
+    end
+    local f = EnsureFrame()
+    f._informational = true
+    if f.title then f.title:SetText(SETUP_TITLE) end
+    if f.hint then f.hint:SetText(SETUP_HINT) end
+    f:Show()
+    return true
 end
 
 -- Returns true when this window needs no further attention in this session.
@@ -242,7 +297,7 @@ function M.ShowIfFirstTime()
     end
     local db = NexusDB
     if type(db) == "table" and rawget(db, "hasSeenQuickStart") then return true end
-    EnsureFrame():Show()
+    NormalTexts(EnsureFrame()):Show()
     return false
 end
 

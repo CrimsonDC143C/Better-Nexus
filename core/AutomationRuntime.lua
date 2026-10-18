@@ -2790,6 +2790,16 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         paused = autoEnabled and (not okAuto and tostring(autoWhy)
             or selectWait) or nil,
         version = Nexus.VERSION,
+        -- The compact charges row of the manual (Auto OFF) recommendation:
+        -- a display copy of the charges this decision already read above
+        -- (no second read; Adapter.Charges reconciles a ledger). Unreported
+        -- counts stay unknown (arrived=false) and untrusted ones estimated
+        -- (trustworthy=false). With Auto ON Nexus spends them itself and the
+        -- panel is unchanged; renders without a board carry none.
+        charges = (not autoEnabled and type(charges) == "table") and {
+            banish = charges.banish, reroll = charges.reroll, freeze = charges.freeze,
+            trustworthy = charges.trustworthy, arrived = charges.arrived,
+        } or nil,
     }
     panelModel.effective = {}
     panelModel.effective.state, panelModel.effective.reason, panelModel.effective.hold =

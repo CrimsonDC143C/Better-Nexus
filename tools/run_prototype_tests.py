@@ -291,6 +291,8 @@ NAMES += ['saved_build_wishlist_evidence_picker']
 NAMES += ['journal_pending_summary_dedup']
 # UX M1: persistent truthful save/assignment result and captured-destination confirmations (EXPECT fails at 84de977 by design).
 NAMES += ['ux_save_assignment_result','ux_captured_destination_labels']
+# UX M2: replayable setup, manual recommendation marker/charges consumer, direct Help pages and chooser routes (EXPECT fails on accepted M1 by design).
+NAMES += ['ux_setup_replay','ux_manual_recommendation','ux_help_navigation']
 
 # Wall-clock limit for one test process. It is a runner limit only: no test, timer or budget reads it.
 DEFAULT_TIMEOUT_SECONDS=45
