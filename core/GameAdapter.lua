@@ -14,11 +14,10 @@ local A = Nexus.GameAdapter
 A.DIAGNOSTIC_PASSIVE = false
 
 -- Hot-path WoW API locals (Poll and its callees run ~5 Hz). Captured once so
--- each beat avoids global table lookups. Lua 5.1 has no GetTime localization
--- elsewhere in this chunk.
+-- each beat avoids global table lookups. IsAddOnLoaded stays on _G so the
+-- rival_picker_detection fixture can mock it without fighting a chunk local.
 local GetTime = GetTime
 local UnitLevel = UnitLevel
-local IsAddOnLoaded = IsAddOnLoaded
 
 -- Tome observations are session-only. No Store/history owner is used here.
 -- The working arm summary and 16 ring rows are allocated once, not per beat.
@@ -29,7 +28,8 @@ do
     local eventFields = {"seq","kind","code","lever","want","member","rawKind","cur","age","visited","passed"}
     local codes = {not_observed=true,auto=true,permission=true,plan=true,advisor=true,
         discovery=true,pause=true,spacing=true,eligible=true,opt_out=true,disabled=true,
-        visit_done=true,candidate=true,no_known_member=true,accepted=true,refused=true,
+        visit_done=true,expired_retry=true,candidate=true,no_known_member=true,
+        accepted=true,refused=true,
         passive=true,["no api"]=true,["unknown lever"]=true,["non-conformant lever"]=true,
         ["not level 1"]=true,pending=true,already=true,mirror_match=true,
         catalog_missing=true,expired=true,first=true,loadout=true,unknown=true}
@@ -4171,12 +4171,21 @@ function A.ToggleLever(leverId, wantDisabled)
     return false, "refused"
 end
 
--- called from the poll: clear pending entries the server has confirmed
--- (mirror matches the requested direction) or that expired (30s) with no
--- reply. Expiry only counts once the session's mirror is authoritative
--- (first SS-530 arrived) and clamps timestamps from a previous boot
--- (GetTime() restarts at reboot -- a persisted future timestamp would
+-- called from the poll: clear pending entries the client mirror has confirmed
+-- or that expired with no match. Confirmation is NOT an aura or spell buff
+-- check: it re-reads ProjectEbonholdOptionsService:IsTomeEchoDisabled for
+-- each lever member (the same client catalog mirror DisabledLevers uses). If
+-- the service accepts ToggleTomeEcho locally but never flips that mirror, the
+-- entry expires and StepArm must be allowed to retry (pending clear alone is
+-- the unlock; AutomationRuntime drops its visit latch when pending is gone
+-- and the lever still needs work).
+-- Short expiry (2.5s): successful mirrors usually match on the next poll
+-- (age≈0); a dropped service call must not sit for tens of seconds before
+-- retry. Expiry only counts once the session's discovery mirror is
+-- authoritative (first SS-530 arrived) and clamps timestamps from a previous
+-- boot (GetTime() restarts at reboot -- a persisted future timestamp would
 -- otherwise never expire).
+local TOME_PENDING_EXPIRE = 2.5
 local function ReconcileTomePending()
     local st = Store and Store.State()
     -- Every shaped row has this map, usually empty. With nothing pending the
@@ -4202,23 +4211,30 @@ local function ReconcileTomePending()
             sentAt = now
         end
         local lv = cat.levers[lever]
-        local cur, rawKind = false, "not_evaluated"
+        local cur, rawKind, readable = false, "not_evaluated", false
         if lv then
             for i = 1, #lv.members do
                 local value = SafeCall(svc.IsTomeEchoDisabled, lv.members[i])
-                if type(value) ~= "boolean" then rawKind = "mixed"
-                elseif rawKind == "not_evaluated" then rawKind = "boolean" end
-                if value then cur = true; break end
+                if type(value) == "boolean" then
+                    readable = true
+                    if rawKind == "not_evaluated" then rawKind = "boolean" end
+                    if value then cur = true; break end
+                else
+                    rawKind = "mixed"
+                end
             end
         end
-        local confirmed = lv and (cur == want)
-        local expired = mirrorLive and (now - sentAt) > 30
+        -- Only confirm from a readable boolean mirror. An unreadable member
+        -- answer must not count as "already enabled" (cur stays false). Age
+        -- still expires the pending entry so StepArm can retry.
+        local confirmed = lv and readable and (cur == want)
+        local expired = mirrorLive and (now - sentAt) > TOME_PENDING_EXPIRE
         if confirmed or not lv or expired then
             A.TomeObservationResolve(lever,want,confirmed and "mirror_match"
                 or (not lv and "catalog_missing" or "expired"),cur,rawKind,now-sentAt)
-            -- clear silently: a genuine failure just leaves the echo in the
-            -- pool (mild), and we no longer disable unknown tomes (the cause
-            -- of the old per-lever "no confirmation" chat spam)
+            -- clear pending so StepArm may retry after expiry; a genuine
+            -- failure just leaves the echo in the pool (mild), and we no
+            -- longer disable unknown tomes (the old "no confirmation" spam)
             map[lever] = nil
             leverProjectionRevision = leverProjectionRevision + 1
         end
@@ -5052,8 +5068,10 @@ function A.RivalDetected()
     -- automation pauses while one is loaded. The addon name and slash-command
     -- key below belong to a separately distributed picker: they are exact
     -- compatibility detection keys, not Nexus names (THIRD_PARTY.md).
+    -- Read IsAddOnLoaded from _G each call so tests can replace the global.
+    local isAddOnLoaded = _G.IsAddOnLoaded
     return _G.EchoOptimizer ~= nil
-        or (IsAddOnLoaded and IsAddOnLoaded("LoadoutPilot"))
+        or (type(isAddOnLoaded) == "function" and isAddOnLoaded("LoadoutPilot"))
         or (type(SlashCmdList) == "table" and type(SlashCmdList.LOADOUTPILOT) == "function")
 end
 
@@ -5818,7 +5836,13 @@ end
 -- lever arming uses ProjectEbonholdOptionsService:ToggleTomeEcho (a service
 -- call), so an inventory "Tome of Echo" would otherwise block level-1 wishlist
 -- enable/disable forever whenever one sits in bags.
+--
+-- Transaction boundary: the 0.2s Poll sample of StaticPopup visibility alone
+-- can miss a fast bind confirm (open+accept between polls). Native bind
+-- events and a StaticPopup_Show hook start the settle window immediately so
+-- a skipped sample cannot leave ToggleTomeEcho running through the confirm.
 local BIND_SETTLE_SECONDS = 20
+local bindBoundaryInstalled = false
 
 local function IsBindConfirmation(which, popupText)
     local key = tostring(which or ""):upper()
@@ -5830,6 +5854,36 @@ end
 local function HoldTomeMutations()
     tomeMutationPausedUntil = math.max(tomeMutationPausedUntil,
         (GetTime() or 0) + BIND_SETTLE_SECONDS)
+end
+
+local function InstallBindTransactionBoundary()
+    if bindBoundaryInstalled then return end
+    bindBoundaryInstalled = true
+    -- Instant edge when the client requests bind confirmation. Cover the
+    -- common 3.3.5 names; pcall so a missing USE_BIND_CONFIRM does not fault.
+    local frame = CreateFrame("Frame")
+    frame:SetScript("OnEvent", function()
+        HoldTomeMutations()
+    end)
+    local events = {
+        "EQUIP_BIND_CONFIRM",
+        "AUTOEQUIP_BIND_CONFIRM",
+        "LOOT_BIND_CONFIRM",
+        "USE_BIND_CONFIRM",
+    }
+    for i = 1, #events do
+        pcall(frame.RegisterEvent, frame, events[i])
+    end
+    -- USE_BIND (Tome of Echo bag use) is often StaticPopup-only with no
+    -- dedicated event on 3.3.5. Hook Show so the settle window starts the
+    -- instant the dialog appears, before the next Poll sample.
+    if type(hooksecurefunc) == "function" then
+        hooksecurefunc("StaticPopup_Show", function(which)
+            if IsBindConfirmation(which, nil) then
+                HoldTomeMutations()
+            end
+        end)
+    end
 end
 
 local function VisibleBindConfirmation()
@@ -5849,6 +5903,7 @@ local function VisibleBindConfirmation()
 end
 
 function A.TomeMutationPaused()
+    InstallBindTransactionBoundary()
     local source
     if VisibleBindConfirmation() then
         source = "popup"
@@ -5862,6 +5917,9 @@ function A.TomeMutationPaused()
 end
 
 local function InstallHooks()
+    -- Bind settle must arm before the first 0.2s Poll sample; PE hooks below
+    -- may still be absent on early PEW, but StaticPopup/events are client-local.
+    InstallBindTransactionBoundary()
     local pe = PE()
     if not pe then return end
     if pe.PerkUI and type(pe.PerkUI.Show) == "function"

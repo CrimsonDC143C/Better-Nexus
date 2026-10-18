@@ -1432,7 +1432,7 @@ function M.TomeObservationLines()
     if not view then out[#out+1]="Tome observations: unavailable (no observational owner)";return out end
     local codes={not_observed=true,auto=true,permission=true,plan=true,advisor=true,
         discovery=true,pause=true,spacing=true,eligible=true,opt_out=true,disabled=true,
-        visit_done=true,candidate=true,no_known_member=true,accepted=true,refused=true,
+        visit_done=true,expired_retry=true,candidate=true,no_known_member=true,accepted=true,refused=true,
         passive=true,["no api"]=true,["unknown lever"]=true,["non-conformant lever"]=true,
         ["not level 1"]=true,pending=true,already=true,mirror_match=true,
         catalog_missing=true,expired=true,first=true,loadout=true,unknown=true}

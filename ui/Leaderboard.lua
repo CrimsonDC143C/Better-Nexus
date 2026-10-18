@@ -1245,29 +1245,65 @@ local function EnsureFrame()
     frame:SetScript("OnMouseDown",function(self) if classMenu:IsShown() then classMenu:Hide() end end)
     local pumpTicker = 0
     local PUMP_INTERVAL = 0.1
+    -- Failure backoff: projection/bind errors must not retry at the 0.1s cap.
+    local FAIL_BACKOFF_BASE, FAIL_BACKOFF_MAX = 0.5, 8
+    local failBackoffUntil = 0
+    local lastReceiving = false
     local function OnFrameUpdate(self,elapsed)
         if not self:IsShown() then return end
         local receiving = Nexus.Sync and Nexus.Sync.IsReceiving
             and Nexus.Sync.IsReceiving() or false
         local projections = Nexus and Nexus.ViewProjections
         local coldStart = not dataReady
+        local now = type(GetTime) == "function" and GetTime() or 0
+        -- Receive-window coalescing: publish once when the burst ends; do not
+        -- rebuild on every dirty mark while Sync is still receiving.
+        local receiveEnded = lastReceiving and not receiving
+        lastReceiving = receiving
+        if receiveEnded and refreshDirty then
+            virtualStats.deferredRefreshes =
+                (tonumber(virtualStats.deferredRefreshes) or 0) + 1
+            failBackoffUntil = 0
+            M.RefreshData()
+            self._tick=(self._tick or 0)+elapsed
+            if self._tick>1 then self._tick=0; M.RefreshStatus() end
+            return
+        end
         -- Dirty-flag gate: only request/pump while new data, a pending job,
         -- an interactive filter change, or a cold open needs work. Cap 10 Hz.
-        local needPump = refreshDirty or interactivePending
-            or viewDiagnostic.projectionPending or coldStart
+        local backingOff = now < failBackoffUntil
+            and viewDiagnostic.projectionError
+            and not interactivePending and not coldStart
+        local needPump = (not backingOff) and (refreshDirty or interactivePending
+            or viewDiagnostic.projectionPending or coldStart)
         if not needPump then
             pumpTicker = 0
         else
             pumpTicker = pumpTicker + elapsed
             if pumpTicker >= PUMP_INTERVAL then
                 pumpTicker = 0
+                local function NoteRefreshOutcome()
+                    if viewDiagnostic.projectionError then
+                        local failures = math.max(1,
+                            tonumber(virtualStats.dataFailures) or 1)
+                        local delay = FAIL_BACKOFF_BASE
+                            * (2 ^ math.min(failures - 1, 4))
+                        if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
+                        failBackoffUntil = now + delay
+                    else
+                        failBackoffUntil = 0
+                    end
+                end
                 if interactivePending or viewDiagnostic.projectionPending
-                    or refreshDirty then
+                    or (refreshDirty and not receiving) then
                     -- Requesting again is O(1) while the job is current and
                     -- recreates it after a represented-data revision canceled
-                    -- the prior cursor. refreshDirty alone must also request:
-                    -- MarkDataDirty clears projectionPending.
+                    -- the prior cursor. refreshDirty alone must also request
+                    -- outside a receive window: MarkDataDirty clears
+                    -- projectionPending. While receiving, dirty marks coalesce
+                    -- until receiveEnded above (or interactive/cold work).
                     M.RefreshData()
+                    NoteRefreshOutcome()
                 end
                 if projections and (not receiving or coldStart or interactivePending)
                     and type(projections.PumpLeaderboard) == "function" then
@@ -1275,10 +1311,13 @@ local function EnsureFrame()
                     -- already receiving. Once a last-good board exists,
                     -- receive bursts remain coalesced and publish through the
                     -- established quiet path.
-                    if receiving and coldStart then M.RefreshData() end
+                    if receiving and coldStart then
+                        M.RefreshData()
+                        NoteRefreshOutcome()
+                    end
                     local ok, published, pumpError = pcall(projections.PumpLeaderboard)
-                    if ok and published then M.RefreshData() end
-                    if ok and pumpError then M.RefreshData() end
+                    if ok and published then M.RefreshData(); NoteRefreshOutcome() end
+                    if ok and pumpError then M.RefreshData(); NoteRefreshOutcome() end
                 end
             end
         end
@@ -1288,6 +1327,7 @@ local function EnsureFrame()
     local function PauseFrameUpdates()
         frame:SetScript("OnUpdate", nil)
         pumpTicker = 0
+        failBackoffUntil = 0
         if classMenu then classMenu:Hide() end
         if detail then detail:SetScript("OnUpdate", nil) end
     end

@@ -2232,6 +2232,9 @@ local function EnsureFrame()
 
     local retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
     local PUMP_INTERVAL = 0.1
+    -- Failure backoff: projection errors must not retry at the 0.1s pump cap.
+    local FAIL_BACKOFF_BASE, FAIL_BACKOFF_MAX = 0.5, 8
+    local failBackoffUntil = 0
     local lastReceiving = false
     -- Named so Hide can detach it. Hidden frames already skip OnUpdate in
     -- 3.3.5a; clearing the script makes dormancy explicit and prevents any
@@ -2241,6 +2244,7 @@ local function EnsureFrame()
         local controller = ControllerInstance()
         local receivingNow = Nexus.Sync and Nexus.Sync.IsReceiving
             and Nexus.Sync.IsReceiving() or false
+        local now = type(GetTime) == "function" and GetTime() or 0
         retryTicker = retryTicker + elapsed
         if retryTicker >= 0.5 then
             retryTicker = 0
@@ -2273,29 +2277,48 @@ local function EnsureFrame()
         if receiveEnded and refreshDirty then
             virtualStats.deferredRefreshes =
                 virtualStats.deferredRefreshes + 1
+            failBackoffUntil = 0
             M.Refresh()
             return
         end
 
         -- Dirty-flag gate: PumpBuilds only while new data, a pending job, a
         -- cold open, or a saved-loadout import needs work. Cap at 10 Hz.
+        -- Receive-window coalescing: while Sync is receiving, hold dirty
+        -- republish (except cold open / import) until the window ends above.
         local coldStart = virtualStats.dataBinds == 0
-        local needPump = refreshDirty or viewDiagnostic.projectionPending
-            or coldStart or importPending
+        local backingOff = now < failBackoffUntil
+            and viewDiagnostic.projectionError
+            and not importPending and not coldStart
+        local needPump = (not backingOff) and (refreshDirty
+            or viewDiagnostic.projectionPending or coldStart or importPending)
         if not needPump then
             pumpTicker = 0
         else
             pumpTicker = pumpTicker + elapsed
             if pumpTicker >= PUMP_INTERVAL then
                 pumpTicker = 0
+                local function NoteRefreshOutcome()
+                    if viewDiagnostic.projectionError then
+                        local failures = math.max(1,
+                            tonumber(virtualStats.dataFailures) or 1)
+                        local delay = FAIL_BACKOFF_BASE
+                            * (2 ^ math.min(failures - 1, 4))
+                        if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
+                        failBackoffUntil = now + delay
+                    else
+                        failBackoffUntil = 0
+                    end
+                end
                 if importPending then
                     local _, pending = PrepareData(false)
-                    if not pending then M.Refresh() end
+                    if not pending then M.Refresh(); NoteRefreshOutcome() end
                 elseif refreshDirty and not viewDiagnostic.projectionPending
                     and not receivingNow then
                     -- MarkDataDirty clears projectionPending; request a job
                     -- before PumpBuilds can advance one.
                     M.Refresh()
+                    NoteRefreshOutcome()
                 end
                 local projections = Nexus and Nexus.ViewProjections
                 if projections and (not receivingNow or coldStart)
@@ -2304,10 +2327,13 @@ local function EnsureFrame()
                     -- first opens. Keep that cold persisted projection moving,
                     -- but retain an existing last-good publication until the
                     -- burst becomes quiet.
-                    if receivingNow and coldStart then M.Refresh() end
+                    if receivingNow and coldStart then
+                        M.Refresh()
+                        NoteRefreshOutcome()
+                    end
                     local ok, published, pumpError = pcall(projections.PumpBuilds)
-                    if ok and published then M.Refresh() end
-                    if ok and pumpError then M.Refresh() end
+                    if ok and published then M.Refresh(); NoteRefreshOutcome() end
+                    if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
                 end
             end
         end
@@ -2353,6 +2379,7 @@ local function EnsureFrame()
     local function PauseFrameUpdates()
         frame:SetScript("OnUpdate", nil)
         retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
+        failBackoffUntil = 0
         if dropPanel then dropPanel:Hide() end
         if sortPanel then sortPanel:Hide() end
         if dropdownShield then dropdownShield:Hide() end

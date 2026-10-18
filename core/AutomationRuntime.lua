@@ -21,18 +21,54 @@ Nexus.MainInternals.AutomationRuntime = AutomationRuntime
 -- so it cannot close over the constructor-local `Store` directly.
 local boundStore
 
--- Level-1 Auto prompt: file-scope dialog + enable callback so AutomationRuntime.New
--- stays under Lua 5.1's 200-local ceiling. New assigns the enable callback once
--- M.ToggleAuto exists; StepArm only StaticPopup_Show's with that latch.
+-- Level-1 Auto prompt + live tome progress: file-scope dialog/helpers so
+-- AutomationRuntime.New stays under Lua 5.1's 200-local ceiling. New assigns
+-- level1Arm / enable / dismiss callbacks once; StepArm only drives them.
 local level1AutoPromptEnable
+local level1ProgressDismiss
+local level1Arm
+local LEVEL1_PROMPT_TEXT = "Your wishlist requires Echo Tome changes, but Auto is OFF. Enable Auto to configure them before you level past 1?"
+
+local function Level1TomeProgressFind()
+    local i, frame, which
+    for i = 1, 4 do
+        frame = _G["StaticPopup" .. i]
+        if frame and frame.IsShown and frame:IsShown() then
+            which = frame.which
+            if which == "NEXUS_LEVEL1_AUTO_TOMES"
+                or which == "NEXUS_LEVEL1_TOME_PROGRESS" then
+                return frame
+            end
+        end
+    end
+    return nil
+end
+
 StaticPopupDialogs = StaticPopupDialogs or {}
 StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"] = {
-    text = "Your wishlist requires Echo Tome changes, but Auto is OFF. Enable Auto to configure them before you level past 1?",
+    text = LEVEL1_PROMPT_TEXT,
     button1 = "Yes",
     button2 = "No",
-    OnAccept = function()
+    noCancelOnReuse = 1,
+    OnAccept = function(dialog)
+        local a = level1Arm
+        if a and (a.lastPopupMode == "progress" or a.lastPopupMode == "done") then
+            if type(level1ProgressDismiss) == "function" then
+                level1ProgressDismiss()
+            end
+            return false
+        end
         if type(level1AutoPromptEnable) == "function" then
-            level1AutoPromptEnable()
+            return level1AutoPromptEnable(dialog) == true
+        end
+    end,
+    OnCancel = function(_, _, reason)
+        if reason == "override" then return end
+        local a = level1Arm
+        if a and (a.lastPopupMode == "progress" or a.lastPopupMode == "done") then
+            if type(level1ProgressDismiss) == "function" then
+                level1ProgressDismiss()
+            end
         end
     end,
     timeout = 0,
@@ -40,6 +76,180 @@ StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"] = {
     hideOnEscape = true,
     preferredIndex = 3,
 }
+StaticPopupDialogs["NEXUS_LEVEL1_TOME_PROGRESS"] =
+    StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"]
+
+local function Level1TomeProgressHide()
+    if type(StaticPopup_Hide) == "function" then
+        StaticPopup_Hide("NEXUS_LEVEL1_AUTO_TOMES")
+        StaticPopup_Hide("NEXUS_LEVEL1_TOME_PROGRESS")
+    end
+    -- Clear last-* so a later Auto ON / level-1 return with the same
+    -- done/total does not skip StaticPopup_Show on the churn guard.
+    local a = level1Arm
+    if a then
+        a.lastPopupMode = nil
+        a.lastProgressDone = nil
+        a.lastProgressTotal = nil
+    end
+end
+
+local function Level1TomePromptShow()
+    local a = level1Arm
+    if a then
+        a.lastPopupMode = "prompt"
+        a.lastProgressDone = nil
+        a.lastProgressTotal = nil
+    end
+    local info = StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"]
+    if info then
+        info.text = LEVEL1_PROMPT_TEXT
+        info.button1 = "Yes"
+        info.button2 = "No"
+    end
+    if type(StaticPopup_Show) == "function" then
+        StaticPopup_Show("NEXUS_LEVEL1_AUTO_TOMES")
+    end
+end
+
+-- done/total: actionable leverPlan levers whose target state is met without a
+-- pending ToggleTomeEcho. Pending mirrors never count as done.
+local function Level1TomeProgressCounts(plan, disabledLevers, settings, pendingMap, Adapter)
+    local total, done, index, lever, keepList, disableList, optOut = 0, 0
+    keepList = plan and plan.leverPlan and plan.leverPlan.keep
+    disableList = plan and plan.leverPlan and plan.leverPlan.disable
+    pendingMap = type(pendingMap) == "table" and pendingMap or {}
+    disabledLevers = type(disabledLevers) == "table" and disabledLevers or {}
+    if type(keepList) == "table" then
+        for index = 1, #keepList do
+            lever = keepList[index]
+            total = total + 1
+            if not pendingMap[lever] and not disabledLevers[lever] then
+                done = done + 1
+            end
+        end
+    end
+    if type(disableList) == "table" then
+        optOut = settings and settings.leverOptOut or {}
+        for index = 1, #disableList do
+            lever = disableList[index]
+            if not optOut[lever]
+                and (not Adapter or not Adapter.LeverHasKnownMember
+                    or Adapter.LeverHasKnownMember(lever)) then
+                total = total + 1
+                if not pendingMap[lever] and disabledLevers[lever]
+                    and disabledLevers[lever] ~= "pending" then
+                    done = done + 1
+                end
+            end
+        end
+    end
+    return done, total
+end
+
+local function Level1TomeProgressUpdate(mode, done, total)
+    local a = level1Arm
+    if not a or a.progressDismissed then return end
+    local dialog = Level1TomeProgressFind()
+    if dialog and a.lastPopupMode == mode and a.lastProgressDone == done
+        and a.lastProgressTotal == total then
+        return
+    end
+    a.lastPopupMode = mode
+    a.lastProgressDone = done
+    a.lastProgressTotal = total
+    local text, info, buttonLabel
+    if mode == "done" then
+        text = string.format(
+            "Echo Tomes configured (%d / %d)! You may now level up.",
+            done, total)
+        buttonLabel = "OK"
+    else
+        text = string.format(
+            "Configuring Echo Tomes: %d / %d (%d%%) — Please wait before leveling up...",
+            done, total,
+            total > 0 and math.floor((done * 100) / total + 0.5) or 100)
+        buttonLabel = "Hide"
+    end
+    info = StaticPopupDialogs["NEXUS_LEVEL1_AUTO_TOMES"]
+    if info then
+        -- Escape '%' for StaticPopup_Show's internal text:SetFormattedText(info.text).
+        -- Without doubling '%', "(16%)" throws "invalid option '%)' to 'format'".
+        info.text = text:gsub("%%", "%%%%")
+        info.button1 = buttonLabel
+        info.button2 = nil
+    end
+    if not dialog and type(StaticPopup_Show) == "function" then
+        dialog = StaticPopup_Show("NEXUS_LEVEL1_AUTO_TOMES")
+            or Level1TomeProgressFind()
+    end
+    if dialog then
+        dialog.numButtons = 1
+        if dialog.button2 and dialog.button2.Hide then
+            dialog.button2:Hide()
+        end
+        if dialog.text and dialog.text.SetText then
+            dialog.text:SetText(text)
+        end
+        if dialog.button1 then
+            if dialog.button1.ClearAllPoints and dialog.button1.SetPoint then
+                dialog.button1:ClearAllPoints()
+                dialog.button1:SetPoint("BOTTOM", dialog, "BOTTOM", 0, 16)
+            end
+            if dialog.button1.SetText then
+                dialog.button1:SetText(buttonLabel)
+            end
+            if dialog.button1.Show then
+                dialog.button1:Show()
+            end
+        end
+        if type(StaticPopup_Resize) == "function" then
+            StaticPopup_Resize(dialog, dialog.which or "NEXUS_LEVEL1_AUTO_TOMES")
+        end
+    end
+end
+
+-- Refresh or hide the Level-1 prompt/progress dialog from StepArm.
+local function Level1TomeProgressSync(level, plan, disabledLevers, settings,
+    schedAuto, Adapter, Store)
+    local a = level1Arm
+    if level ~= 1 or not settings or not settings.autoDisable
+        or not plan or plan.advisorOnly
+        or type(plan.leverPlan) ~= "table" then
+        Level1TomeProgressHide()
+        return
+    end
+    if not a then return end
+    local state = Store and Store.State and Store.State() or nil
+    local pendingMap = type(state) == "table"
+        and type(state.tomeTogglePending) == "table"
+        and state.tomeTogglePending or nil
+    local done, total = Level1TomeProgressCounts(plan, disabledLevers,
+        settings, pendingMap, Adapter)
+    a.promptDone = done
+    a.promptTotal = total
+    if not schedAuto then
+        if a.lastPopupMode == "progress" or a.lastPopupMode == "done" then
+            Level1TomeProgressHide()
+        elseif not a.promptedForAuto and total > 0 and done < total
+            and type(disabledLevers) == "table" then
+            a.promptedForAuto = true
+            Level1TomePromptShow()
+        end
+        return
+    end
+    if a.progressDismissed then return end
+    if total <= 0 then
+        Level1TomeProgressHide()
+        return
+    end
+    if done < total then
+        Level1TomeProgressUpdate("progress", done, total)
+    elseif a.lastPopupMode == "progress" or a.lastPopupMode == "prompt"
+        or Level1TomeProgressFind() then
+        Level1TomeProgressUpdate("done", done, total)
+    end
+end
 
 -- Run status (last save status/refusal, audit run counter) and the retired
 -- flat lockDesignTargets key live in the saved root, or for a read-only saved
@@ -136,11 +346,14 @@ function AutomationRuntime.New(options)
 local cadence = {
     poll=0.2,
     fallbackRecompute=5,
-    -- Sequential tome toggles: 1 accept per beat. The Ebonhold service drops
-    -- simultaneous ToggleTomeEcho calls; a short spacing still clears a full
-    -- leverPlan at ~6/s without bloating tomeTogglePending.
-    leverInterval=0.15,
+    -- Strictly 1 ToggleLever attempt per beat (accepted or refused both
+    -- count). Same-tick micro-bursts are dropped by Ebonhold's anti-flood
+    -- filter (2nd/3rd calls expire at ~2.5s); one call per 0.10s resolves on
+    -- the first try. Wake slack keeps RequestStepAt slightly after the
+    -- spacing gate so early polls do not burn a beat on code=spacing.
+    leverInterval=0.10,
     leverBurst=1,
+    leverWakeSlack=0.02,
     actionIntentBeat=0.4,
     actionConfirmTimeout=10,
     autoLockStateVersion=1,
@@ -343,11 +556,17 @@ end
 -- confirmation between different levers (pending remains per-lever).
 -- promptedForAuto latches the level-1 "enable Auto for tomes" StaticPopup once
 -- per wishlist; cleared when Auto turns on or the wishlist fingerprint changes.
+-- progressDismissed latches a manual Hide/OK on the live progress dialog for
+-- the same wishlist fingerprint (does not turn Master Auto off).
 local arm = {
     attempts=0,confirmed=false,pendingSince=nil,targetSlot=nil,
     boardsSinceArm=0,leverLastAt=0,
     promptedForAuto=false,promptWishlistKey=nil,
+    progressDismissed=false,lastPopupMode=nil,
+    lastProgressDone=nil,lastProgressTotal=nil,
 }
+-- File-scope progress helpers read/write through this binding (not a New local).
+level1Arm = arm
 local leversDoneThisVisit = {}
 
 -- RUN state
@@ -992,57 +1211,31 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
             SetStatus("Choose or create a wishlist to begin your first run")
         end
     end
-    -- Level-1 smart prompt: Auto is OFF but the wishlist's leverPlan does not
-    -- match live tome state. One StaticPopup per wishlist fingerprint; Yes
-    -- routes through ToggleAuto (overwrite warning / Orb gates intact).
-    -- Locals stay inside this do-block so they never join New()'s 200-local pool.
+    -- Level-1 smart prompt + live progress dialog. Prompt: Auto OFF + mismatch.
+    -- Progress: Auto ON while actionable leverPlan work remains (or completion
+    -- after a progress pass). Locals stay inside this do-block so they never
+    -- join New()'s 200-local pool.
     do
         local wishlistKey = static and static.wishlistKey or nil
         if arm.promptWishlistKey ~= wishlistKey then
             arm.promptWishlistKey = wishlistKey
             arm.promptedForAuto = false
+            arm.progressDismissed = false
+            arm.lastPopupMode = nil
+            arm.lastProgressDone = nil
+            arm.lastProgressTotal = nil
+            arm.promptDone = nil
+            arm.promptTotal = nil
         end
-        if level == 1 and not sched.autoEnabled and not arm.promptedForAuto
-            and plan and not plan.advisorOnly and type(plan.leverPlan) == "table"
-            and type(disabledLevers) == "table" then
-            local mismatch, index, lever, keepList, disableList, optOut = false
-            keepList = plan.leverPlan.keep
-            disableList = plan.leverPlan.disable
-            if type(keepList) == "table" then
-                for index = 1, #keepList do
-                    lever = keepList[index]
-                    if disabledLevers[lever] then
-                        mismatch = true
-                        break
-                    end
-                end
-            end
-            if not mismatch and type(disableList) == "table" then
-                optOut = settings.leverOptOut or {}
-                for index = 1, #disableList do
-                    lever = disableList[index]
-                    if not optOut[lever] and not disabledLevers[lever]
-                        and (not Adapter.LeverHasKnownMember
-                            or Adapter.LeverHasKnownMember(lever)) then
-                        mismatch = true
-                        break
-                    end
-                end
-            end
-            if mismatch then
-                arm.promptedForAuto = true
-                if type(StaticPopup_Show) == "function" then
-                    StaticPopup_Show("NEXUS_LEVEL1_AUTO_TOMES")
-                end
-            end
-        end
+        Level1TomeProgressSync(level, plan, disabledLevers, settings,
+            sched.autoEnabled, Adapter, Store)
     end
     -- (b) Re-enable needed tomes before pruning the off-wishlist pool. A
     -- changed wishlist must not wait behind every unwanted disable while the
     -- player can leave level 1. Both directions share cadence.leverInterval
-    -- and fire at most cadence.leverBurst (1) ToggleLever accept per beat.
-    -- Different levers may still be in-flight (pending) at once; we never
-    -- send a second request in the same beat, and never re-call a pending lever.
+    -- and fire at most cadence.leverBurst ToggleLever attempts per beat
+    -- (accepted or refused). Different levers may still be in-flight
+    -- (pending) at once; we never re-call a pending lever.
     -- ReconcileTomePending owns per-lever confirmation.
     -- Visit bits represent only evaluations this short-circuit actually makes:
     -- Auto=1, permission=2, plan=4, not-advisor=8, discovery=16,
@@ -1068,24 +1261,30 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
     if allowed then
         visited=visited+64
         -- Strict < so a wake at exactly leverLastAt+interval still fires the
-        -- next burst instead of re-arming the same deadline forever.
-        if (GetTime() - arm.leverLastAt) < cadence.leverInterval then
-            if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,"spacing",#plan.leverPlan.keep,#plan.leverPlan.disable) end
-            if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
-            RequestStepAt(arm.leverLastAt + cadence.leverInterval)
-            MeasurePhase("overlayRender", RenderIdlePanel,
-                plan, owned, slots, static.catalog, static, locked)
-            return
+        -- next burst instead of re-arming the same deadline forever. Schedule
+        -- the follow-up slightly after the gate (leverWakeSlack) so timer /
+        -- poll jitter does not land back inside spacing and waste the beat.
+        do
+            local dueAt = arm.leverLastAt + cadence.leverInterval
+            if (GetTime() - arm.leverLastAt) < cadence.leverInterval then
+                if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,"spacing",#plan.leverPlan.keep,#plan.leverPlan.disable) end
+                if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
+                RequestStepAt(dueAt + cadence.leverWakeSlack)
+                MeasurePhase("overlayRender", RenderIdlePanel,
+                    plan, owned, slots, static.catalog, static, locked)
+                return
+            end
         end
         passed=passed+64
         if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,#plan.leverPlan.keep,#plan.leverPlan.disable) end
         -- Beat locals stay inside this do-block so they never join New()'s
-        -- 200-local pool. One ToggleLever accept per leverInterval beat
-        -- (leverBurst=1). Pending levers are skipped without a service call;
-        -- the scan continues for the next non-pending candidate. moreWork +
-        -- RequestStepAt wake the next beat so the queue drains sequentially.
+        -- 200-local pool. Exactly leverBurst (1) ToggleLever attempt per
+        -- leverInterval beat, whether accepted or refused. Pending levers are
+        -- skipped without a service call; the scan continues for the next
+        -- non-pending candidate. moreWork + RequestStepAt wake the next beat
+        -- so the queue drains sequentially.
         do
-            local sent, moreWork, lastStatus, optOut = 0, false, nil, nil
+            local attempted, moreWork, lastStatus, optOut = 0, false, nil, nil
             local ok, reason, lever, index, pendingMap, state = nil, nil, nil, nil, nil, nil
             local keepList, disableList = plan.leverPlan.keep, plan.leverPlan.disable
             local burst = cadence.leverBurst
@@ -1100,29 +1299,31 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
                         -- In-flight re-enable: mirror may still read disabled.
                         -- Never re-call ToggleLever; wake again after spacing.
                         moreWork = true
-                    elseif sent >= burst then
+                    elseif attempted >= burst then
                         moreWork = true
                         break
                     else
                         ok, reason = Adapter.ToggleLever(lever, false)
+                        -- Every service attempt consumes beat budget, including
+                        -- refusals, so one wake cannot retry forever.
+                        attempted = attempted + 1
                         if ok then
                             -- Accepted re-enable invalidates an earlier disable
                             -- attempt for this lever.
                             leversDoneThisVisit[lever] = nil
-                            sent = sent + 1
                             lastStatus = "re-enabling wishlist tome lever " .. lever
                         elseif reason == "pending" or reason == "pause"
                             or reason == "refused" then
                             moreWork = true
                         end
                     end
-                elseif disabledLevers[lever] == "pending" then
+                elseif disabledLevers[lever] == "pending" or pendingMap[lever] then
                     moreWork = true
                 end
             end
             -- (c) Disable off-wishlist conformant controls with leftover beat
-            -- budget (none once a keep already accepted this wake).
-            if sent < burst then
+            -- budget (none once a keep already attempted this wake).
+            if attempted < burst then
                 optOut = settings.leverOptOut or {}
                 for index = 1, #disableList do
                     lever = disableList[index]
@@ -1133,26 +1334,40 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
                         moreWork = true
                     elseif disabledLevers[lever] then
                         if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"disabled") end
-                    elseif leversDoneThisVisit[lever] then
-                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"visit_done") end
-                    elseif Adapter.LeverHasKnownMember(lever) then
-                        if sent >= burst then
-                            moreWork = true
-                            break
-                        end
-                        -- Unknown discovery is not an attempted disable.
-                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"candidate") end
-                        ok, reason = Adapter.ToggleLever(lever, true)
-                        if ok then
-                            leversDoneThisVisit[lever] = true
-                            sent = sent + 1
-                            lastStatus = "disabling off-wishlist tome lever " .. lever
-                        elseif reason == "pending" or reason == "pause"
-                            or reason == "refused" then
-                            moreWork = true
-                        end
+                        -- Mirror confirmed; drop any visit latch from the accept.
+                        leversDoneThisVisit[lever] = nil
                     else
-                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"no_known_member") end
+                        -- Pending cleared without a confirmed disable (typically
+                        -- ReconcileTomePending outcome=expired): release the
+                        -- visit latch so this lever may be toggled again.
+                        if leversDoneThisVisit[lever] then
+                            if Adapter.TomeObservationDecision then
+                                Adapter.TomeObservationDecision(lever,"expired_retry")
+                            end
+                            leversDoneThisVisit[lever] = nil
+                        end
+                        if Adapter.LeverHasKnownMember(lever) then
+                            if attempted >= burst then
+                                moreWork = true
+                                break
+                            end
+                            -- Unknown discovery is not an attempted disable.
+                            if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"candidate") end
+                            ok, reason = Adapter.ToggleLever(lever, true)
+                            attempted = attempted + 1
+                            if ok then
+                                -- In-flight only: pendingMap blocks re-calls.
+                                -- Do not permanently blacklist; expiry must
+                                -- allow another attempt on a later beat.
+                                leversDoneThisVisit[lever] = true
+                                lastStatus = "disabling off-wishlist tome lever " .. lever
+                            elseif reason == "pending" or reason == "pause"
+                                or reason == "refused" then
+                                moreWork = true
+                            end
+                        else
+                            if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"no_known_member") end
+                        end
                     end
                 end
             elseif type(disableList) == "table" and #disableList > 0 then
@@ -1162,22 +1377,24 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
                     lever = disableList[index]
                     if not optOut[lever] and not disabledLevers[lever]
                         and not pendingMap[lever]
-                        and not leversDoneThisVisit[lever]
                         and Adapter.LeverHasKnownMember(lever) then
+                        -- Include levers whose visit latch will be released
+                        -- above on the next wake (expired pending).
                         moreWork = true
                         break
                     end
                 end
             end
-            if sent > 0 then
+            if attempted > 0 then
                 arm.leverLastAt = GetTime()
                 if lastStatus then SetStatus(lastStatus) end
             end
-            -- Always re-arm the 0.15s beat while the plan still has work
-            -- (accepted this wake, or pending / later candidates remain).
-            if sent > 0 or moreWork then
-                RequestStepAt((sent > 0 and arm.leverLastAt or GetTime())
-                    + cadence.leverInterval)
+            -- Always re-arm slightly after leverLastAt+interval while work
+            -- remains, so the wake clears the spacing gate instead of
+            -- logging code=spacing and rescheduling.
+            if attempted > 0 or moreWork then
+                local base = attempted > 0 and arm.leverLastAt or GetTime()
+                RequestStepAt(base + cadence.leverInterval + cadence.leverWakeSlack)
             end
         end
     else
@@ -3565,7 +3782,15 @@ local function DispatchLevelStep(level, plan, slots, owned, flags,
         if plan.advisorOnly then
             SetStatus("No wishlist set -- advisor only")
         end
-    elseif level >= 2 and level < 80 then
+    else
+        -- StepArm only runs at level 1; cancel stale Level-1 prompt/progress
+        -- if the player leveled past 1 while either dialog was still open.
+        if type(StaticPopup_Hide) == "function" then
+            StaticPopup_Hide("NEXUS_LEVEL1_AUTO_TOMES")
+        end
+        Level1TomeProgressHide()
+    end
+    if level >= 2 and level < 80 then
         StepRun(level, plan, slots, owned, flags, disabledLevers, static,
             locked)
     elseif level == 80 then
@@ -4214,14 +4439,22 @@ end
                     FinishActionIntent("uncertain", "player_resumed", false)
                 end
                 -- Latch was only for the OFF→prompt path; Auto ON clears it so
-                -- a later OFF + mismatch can ask again.
+                -- a later OFF + mismatch can ask again. Keep the original
+                -- Level-1 dialog open and transition it immediately into live
+                -- progress when actionable tome changes remain.
                 arm.promptedForAuto = false
-                if type(StaticPopup_Hide) == "function" then
-                    StaticPopup_Hide("NEXUS_LEVEL1_AUTO_TOMES")
+                if (UnitLevel("player") or 0) == 1
+                    and (arm.promptTotal or 0) > (arm.promptDone or 0) then
+                    Level1TomeProgressUpdate("progress",
+                        arm.promptDone or 0, arm.promptTotal or 0)
+                elseif Level1TomeProgressFind()
+                    and arm.lastPopupMode == "prompt" then
+                    Level1TomeProgressHide()
                 end
             else
                 sched.authorizationStepPending = false
                 actionHold.worldNoticePending = nil
+                Level1TomeProgressHide()
                 if actionIntent and actionIntent.state == "prepared" then
                     local revokedDeadline = actionIntent.readyAt
                     FinishActionIntent("superseded", "authorization_changed", false)
@@ -4256,8 +4489,25 @@ end
         end)
     end
     -- File-scope StaticPopup OnAccept routes here (no New-local upvalue needed).
+    -- Revalidate tome-mutation permission and still-at-level-1: the player may
+    -- have flipped autoDisable or leveled past 1 while the dialog was open.
+    -- Returns true when Auto is now ON so StaticPopup_OnClick keeps the
+    -- original dialog box open on screen while it transitions to progress.
     level1AutoPromptEnable = function()
-        if not sched.autoEnabled then M.ToggleAuto() end
+        if sched.autoEnabled then return true end
+        local promptSettings = Store.Settings()
+        if not promptSettings or not promptSettings.autoDisable then return false end
+        if (UnitLevel("player") or 0) ~= 1 then return false end
+        -- Fresh Enable Auto from the prompt: allow the progress dialog again.
+        arm.progressDismissed = false
+        arm.lastPopupMode = nil
+        arm.lastProgressDone = nil
+        arm.lastProgressTotal = nil
+        M.ToggleAuto()
+        return sched.autoEnabled == true
+    end
+    level1ProgressDismiss = function()
+        arm.progressDismissed = true
     end
     -- Called by Main before the lifecycle sees the event. Returns "held",
     -- "resuming", "revoked" or "off" (Auto was not selected).

@@ -87,7 +87,10 @@ local MAX_RESPONSE_BYTES = 16384
 local MAX_RESPONSE_SEND_SECONDS = 75
 local MAX_RESPONSE_TRANSFERS = 8
 local MAX_RESPONSE_CONCURRENT_TRANSFERS = 8
-local MAX_KNOWN_PEERS = 512
+-- Strict admission bound for retained peer identities (session MarkPeer map).
+-- New identities above this are refused with an explicit reason; existing
+-- rows may still refresh lastSeen.
+local MAX_KNOWN_PEERS = 256
 local SEND_INTERVAL   = 1.10   -- conservative channel pacing; avoids server chat spam/mutes
 local RECEIVE_WINDOW  = 60     -- compatibility/status timer; receiving is always enabled
 local INFLIGHT_GRACE  = 30     -- seconds to finish an interrupted chunk transfer
@@ -3774,9 +3777,15 @@ end
 local function AcceptPeer(sender, version)
     local parsed = version and Nexus.Version and Nexus.Version.Parse
         and Nexus.Version.Parse(version) or nil
-    local marked = Session.MarkPeer(sender,
+    local marked, why = Session.MarkPeer(sender,
         parsed and parsed.normalized or nil)
-    if marked and parsed and Nexus.Updates and Nexus.Updates.Observe then
+    if not marked then
+        stats.peerAdmissionRejected = (stats.peerAdmissionRejected or 0) + 1
+        LogEvent("RX", "REJECT peer identity '%s': %s",
+            tostring(sender), tostring(why or "admission refused"))
+        return false, why or "admission refused"
+    end
+    if parsed and Nexus.Updates and Nexus.Updates.Observe then
         pcall(Nexus.Updates.Observe, parsed, sender)
     end
     return true

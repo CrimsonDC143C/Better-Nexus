@@ -2,7 +2,7 @@
 ## Title: Nexus
 ## Notes: Plan an Echo Wishlist, follow recommendations or enable automatic rolling, refine with approved Orbs, share builds, and compare recorded DPS. Experimental - back up saved data.
 ## Author: Valentine
-## Version: 1.20.0-beta.1 test.2026101704-84de97741ebd internal
+## Version: 1.20.0-beta.1
 ## OptionalDeps: ProjectEbonhold, StutterAlert
 ## SavedVariables: NexusDB WishlistRealizerDB
 
