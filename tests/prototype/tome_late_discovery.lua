@@ -231,4 +231,3 @@ end
 print('RESULT tome_late_discovery checks='..checks..' failures='..#failures)
 assert(#failures==0,table.concat(failures,'\n'))
 print('PASS late discovery and recovered discovery reads permit later real Journal tome reconciliation; accepted action pacing and stable unknown idle remain bounded')
-
