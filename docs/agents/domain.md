@@ -16,7 +16,7 @@ The `core/`, `logic/`, `ui/` and `data/` directories are modules of the same add
 - Read `CONTEXT.md` when present before domain-led work. Use its terms in requests, specifications, tests and implementation.
 - Read relevant `docs/adr/*.md` before design or changes in that area. Surface conflicts with accepted decisions before proceeding.
 - Keep implementation plans, tests, native evidence and release receipts outside the glossary. Reuse existing focused documents; migrate them only within an approved documentation scope.
-- Check document status and source pin against current code. `CONTRACTS.md` is a historical 1.19/stack-era reference per `docs/REPOSITORY_CONSOLIDATION.md`; prototype reports may also describe older snapshots.
+- Check document status and source pin against current code. `CONTRACTS.md` opens with the authoritative current rolling and Orb contract; its later v1.19.4 module sections are historical (see its status section). Prototype reports may also describe older snapshots.
 - Current source and verified tracker evidence take precedence over stale reports or chat summaries. Archived PR #67's `.vibe/**` layout and PowerShell/Node gates are historical and are not the current configuration.
 
 ## Native contracts and exports
