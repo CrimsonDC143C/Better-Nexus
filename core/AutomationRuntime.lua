@@ -1334,18 +1334,15 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
                         moreWork = true
                     elseif disabledLevers[lever] then
                         if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"disabled") end
-                        -- Mirror confirmed; drop any visit latch from the accept.
-                        leversDoneThisVisit[lever] = nil
+                        -- Mirror confirmed disabled: keep the visit latch so a
+                        -- player re-enable is not pruned again this visit.
+                        leversDoneThisVisit[lever] = true
+                    elseif leversDoneThisVisit[lever] then
+                        -- Accepted this visit, mirror not yet confirmed disabled
+                        -- and not pending: treat as visit_done unless pending
+                        -- expired without confirmation (retry below).
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"visit_done") end
                     else
-                        -- Pending cleared without a confirmed disable (typically
-                        -- ReconcileTomePending outcome=expired): release the
-                        -- visit latch so this lever may be toggled again.
-                        if leversDoneThisVisit[lever] then
-                            if Adapter.TomeObservationDecision then
-                                Adapter.TomeObservationDecision(lever,"expired_retry")
-                            end
-                            leversDoneThisVisit[lever] = nil
-                        end
                         if Adapter.LeverHasKnownMember(lever) then
                             if attempted >= burst then
                                 moreWork = true
@@ -1377,9 +1374,8 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
                     lever = disableList[index]
                     if not optOut[lever] and not disabledLevers[lever]
                         and not pendingMap[lever]
+                        and not leversDoneThisVisit[lever]
                         and Adapter.LeverHasKnownMember(lever) then
-                        -- Include levers whose visit latch will be released
-                        -- above on the next wake (expired pending).
                         moreWork = true
                         break
                     end
@@ -3181,7 +3177,7 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         -- counts stay unknown (arrived=false) and untrusted ones estimated
         -- (trustworthy=false). With Auto ON Nexus spends them itself and the
         -- panel is unchanged; renders without a board carry none.
-        charges = (not autoEnabled and type(charges) == "table") and {
+        charges = (not sched.autoEnabled and type(charges) == "table") and {
             banish = charges.banish, reroll = charges.reroll, freeze = charges.freeze,
             trustworthy = charges.trustworthy, arrived = charges.arrived,
         } or nil,

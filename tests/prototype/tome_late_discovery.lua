@@ -226,7 +226,7 @@ for _,kind in ipairs({'empty_mirror','unavailable_read'})do
  Phase(W,'Journal A again',function()Pick(W,'A')end,'A',{false,true})
  expect(W.runtime.AutoEnabled()==true and Nexus.Store.Settings().autoDisable==true,kind..' explicit permissions retained')
  expect(S.Writes(W)==0,kind..' no upload/save/activation')
- for i=2,#F.calls do expect(F.calls[i].at-F.calls[i-1].at>=.5-1e-6,kind..' accepted send spacing '..i)end
+ for i=2,#F.calls do expect(F.calls[i].at-F.calls[i-1].at>=.10-1e-6,kind..' accepted send spacing '..i)end
 end
 print('RESULT tome_late_discovery checks='..checks..' failures='..#failures)
 assert(#failures==0,table.concat(failures,'\n'))

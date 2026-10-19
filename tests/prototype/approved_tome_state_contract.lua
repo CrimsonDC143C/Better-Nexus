@@ -176,7 +176,7 @@ local function SC4(c)
 end
 
 -- SC-5 (D2, D3): a known-lever pending request across an offline module reload,
--- and a previous-boot record expiring in the restarted 30 s window.
+-- and a previous-boot record expiring in the restarted 3.5 s window.
 local function SC5(c)
     local R, P = S.Lever(1, 'Requested Echo', true, true), S.Lever(2, 'Second Requested Echo', true, false)
     local levers = {R, P}
@@ -202,7 +202,9 @@ local function SC5(c)
         'SC-5 the reloaded provider lists the request apart from the Disabled observation')
     local steps = Steps()
     c(S.AutoOn(H2) and H2.playerLevel == 1, 'SC-5 reached: Auto is ON again at level 1 after the reload')
-    H2.Advance(3, .05)
+    -- CaptureProvider (+1 s) and AutoOn (+0.4 s) already consumed part of the
+    -- 3.5 s pending window after Reload; keep this advance short.
+    H2.Advance(.5, .05)
     p = S.Pending()[R.lever]
     c(Steps() > steps, 'SC-5 reached: the runtime stepped after Auto ON')
     c(#H2.trace == 0 and type(p) == 'table' and p.want == false,
@@ -229,11 +231,11 @@ local function SC5(c)
     end)
     local H3, A3 = S.Reload({levers=levers, level=1, holdMirror=true, disabled={[R.echo]=false, [P.echo]=false}})
     p = S.Pending()[P.lever]
-    -- harness.lua:2 starts every boot's clock at 1000, so the restarted window ends after 1030.
-    c(type(p) == 'table' and p.want == true and not Auto() and H3.now < 1030,
+    -- harness.lua:2 starts every boot's clock at 1000, so the restarted window ends after 1003.5.
+    c(type(p) == 'table' and p.want == true and not Auto() and H3.now < 1003.5,
         'SC-5 reached: a future-dated pending record from a previous boot survives reload')
-    local cleared = S.Within(H3, 31, function() return S.Pending()[P.lever] == nil end)
-    c(cleared ~= nil and H3.now > 1030, 'SC-5 a previous-boot request expires within the restarted 30 s window')
+    local cleared = S.Within(H3, 5, function() return S.Pending()[P.lever] == nil end)
+    c(cleared ~= nil and H3.now > 1003.5, 'SC-5 a previous-boot request expires within the restarted 3.5 s window')
     local row
     for _, r in ipairs(A3.TomeStateObservation().rows) do if r.lever == P.lever then row = r end end
     c(row and row.observed == 'enabled' and A3.DisabledLevers()[P.lever] ~= 'confirmed' and #H3.trace == 0,

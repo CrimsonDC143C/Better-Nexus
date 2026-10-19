@@ -13,10 +13,11 @@ Nexus.GameAdapter = {}
 local A = Nexus.GameAdapter
 A.DIAGNOSTIC_PASSIVE = false
 
--- Hot-path WoW API locals (Poll and its callees run ~5 Hz). Captured once so
--- each beat avoids global table lookups. IsAddOnLoaded stays on _G so the
--- rival_picker_detection fixture can mock it without fighting a chunk local.
-local GetTime = GetTime
+-- Hot-path WoW API locals (Poll and its callees run ~5 Hz). UnitLevel is
+-- captured once. GetTime stays global so offline fixtures can replace it
+-- after load (tome pause provenance) without adding another New-scope local
+-- at the 200-local ceiling. IsAddOnLoaded stays on _G for the same reason
+-- (rival_picker_detection).
 local UnitLevel = UnitLevel
 
 -- Tome observations are session-only. No Store/history owner is used here.

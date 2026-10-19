@@ -65,7 +65,8 @@ local function controls(H,A,trace,route)
         check(row.id ~= UNKNOWN and row.id ~= NONCONFORMANT and row.id ~= OPTED_OUT,
             route..' unknown/nonconformant/opted-out controls are not pruned')
         if row.id == REQUIRED then targetSends = targetSends + 1 end
-        if i > 1 then check(row.at-trace[i-1].at >= .5-1e-6, route..' original send spacing retained') end
+        -- cadence.leverInterval is 0.10; accepted sends must not bunch tighter.
+        if i > 1 then check(row.at-trace[i-1].at >= .10-1e-6, route..' original send spacing retained') end
     end
     check(targetSends <= 1, route..' required enable is never duplicated')
     local plan = Nexus.Strategy.Compile(A.Catalog(),A.Wishlist(),Nexus.Store.Settings())
@@ -82,7 +83,8 @@ for _,route in ipairs({'first_run','active_saved'}) do
             check(#trace == 0 and H.disabled[REQUIRED] == true, route..' closed Orb gate sends nothing')
             H.orbKnown = true
         end
-        H.Advance(.25,.05)
+        -- One leverInterval beat (0.10 s); a longer window admits a prune send.
+        H.Advance(.12,.05)
         expect(#trace == 1 and trace[1].id == REQUIRED,
             route..' '..scenario..': first eligible action beat must restore required tome before pruning')
         if scenario == 'exit_level2' then
@@ -97,7 +99,9 @@ for _,route in ipairs({'first_run','active_saved'}) do
                 expect(pending and pending.want == false and H.disabled[REQUIRED] == true,
                     route..': first accepted required enable remains pending without its mirror')
             end
-            H.Advance(4,.05)
+            -- Drain the paced queue (0.10 s/beat) well before the 3.5 s pending
+            -- expiry, so an unmatched enable cannot re-fire inside this count.
+            H.Advance(2,.05)
             check(#trace == EXTRAS+1, route..' one enable plus all six eligible unwanted disables')
             if scenario == 'no_ack' then
                 local pending = Nexus.Store.State().tomeTogglePending[LEVER]

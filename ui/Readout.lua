@@ -274,7 +274,7 @@ end
 -- the Auto warning; Help carries the same paragraph.
 M.TOME_PARAGRAPH = "Tomes: with Auto ON and the tome permission (autoDisable) on, once the game's tome data is "
     .. "ready Nexus turns off Echo tomes your Wishlist does not use and turns back on tomes it needs, one change "
-    .. "about every half second. It never turns off a tome you opted out of. Nexus does not turn tomes back on "
+    .. "about every tenth of a second. It never turns off a tome you opted out of. Nexus does not turn tomes back on "
     .. "when you turn Auto OFF, log out or change the Wishlist: it turns back on only tomes a Wishlist needs (or "
     .. "that you opted out of), and only while Auto is ON. The tome list in the Echo Journal shows their state."
 
