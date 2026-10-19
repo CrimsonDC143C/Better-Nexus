@@ -258,7 +258,7 @@ local SELECTOR_LINES={
   ..'Assigning by itself does not change any Saved Build.',
  'With Auto ON, Nexus may replace the active Saved Build with a finished run that '
   ..'has more overall Wishlist progress, or equal progress after cleanup or an even swap of requested '
-  ..'copies. At level 80 after a finished run, Auto checks again right away when you change the assignment. '
+  ..'copies. At level 80, a changed assignment makes Auto check a finished run it has not saved yet. '
   ..'Saving edits to the assigned Wishlist can also lead to a replacement without a new run.',
  'The replaced build may hold an Echo you value, even one obtained with Orbs: '
   ..'Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged.',
@@ -467,9 +467,15 @@ check(tt:IsShown() and tt:GetOwner()~=selector and tt.lines[1].text=='Assign Wis
 leave(planC)
 check(Nexus.Store.State().loadoutWishlists[2].slot==103,'the stored assignment keeps the clicked server slot')
 open()
-local marked={}
-for _,x in ipairs(rows())do if x.nameButton.text:GetText():find('[Selected]',1,true)then marked[#marked+1]=x end end
-check(#marked==1 and marked[1]==row('Plan C'),'exactly the assigned row carries [Selected]')
+-- The selector names the assignment; the list offers only the other rows.
+local marked,listedC={},false
+for _,x in ipairs(rows())do
+ local label=x.nameButton.text:GetText()
+ if label:find('[Selected]',1,true)then marked[#marked+1]=x end
+ if label:find('Plan C',1,true)then listedC=true end
+end
+check(#marked==0 and not listedC and selector.text:GetText():find('Plan C',1,true),
+ 'the selector names the assigned row and the list leaves it out')
 enter(selector);selectorTipBesidePicker('after selection');leave(selector)
 -- A stale open row is refused and changes nothing.
 local stale=row('Plan B')

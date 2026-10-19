@@ -50,7 +50,13 @@ local function wishlistRevision() local _,_,_,_,r=A.PresentationRevisions();retu
 -- Plan A (slot 1) carries its own design; it stays the active Wishlist for every editor scenario.
 H.perks.serverActiveSlot=1;H.Notify();A.Poll()
 W.ImportEBH1String(assert(Nexus.Codec.EncodeEBH1(plan({{200080,1}}),'MAGE','Plan A')),'Plan A')
-for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist'then f:Click();break end end
+-- M3: the Create action is labelled by its effect (new label first, then legacy).
+do local clicked=false
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then f:Click();clicked=true;break end end
+  if clicked then break end
+ end
+end
 H.AcceptPopup();H.now=H.now+3.1
 local DESIGN=Clone(A.GetLoadoutWishlist(1).designTargets)
 check(DESIGN[200080]~=nil,'the design of Plan A is stored with its assignment')

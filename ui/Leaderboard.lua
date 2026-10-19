@@ -150,6 +150,12 @@ local function DpsText(v)
     return tostring(math.floor(v))
 end
 
+-- M4 (UX-14): the list is what this client knows, not a complete ranking.
+local function LeaderboardScope()
+    local userText = Nexus.UserText
+    return userText and userText.LEADERBOARD_SCOPE or "Best known exact loadout per character"
+end
+
 local function DurationText(v)
     v = tonumber(v) or 0
     if v <= 0 then return "—" end
@@ -1000,8 +1006,16 @@ RenderDetail = function(row)
             .." DPS|r\nAverage "..DpsText(row.average).."  •  Dummy "
             ..DpsText(row.dummyDps).."  •  LK "..DpsText(row.lkDps))
     else
+        -- M4 (UX-14/LP-14): the record's real category and only the facts it
+        -- carries (fight duration, level, recorded date); a missing or zero
+        -- value is left out instead of reading as "Level 0" or a dash.
         local label=row.category=="lk" and "Lich King" or "Training Dummy"
-        detail.record:SetText("|cff4dff80"..DpsText(row.dps).." DPS|r  •  "..label.."\n"..DurationText(row.duration).."  •  Level "..tostring(tonumber(row.level) or 0))
+        local userText=Nexus.UserText
+        local parts=userText and userText.RecordDetailParts and userText.RecordDetailParts({
+            duration=row.duration,level=row.level,ts=row.ts}) or nil
+        local facts=parts and (#parts>0 and table.concat(parts,"  •  ") or "Duration, level and date not recorded")
+            or (DurationText(row.duration).."  •  Level "..tostring(tonumber(row.level) or 0))
+        detail.record:SetText("|cff4dff80"..DpsText(row.dps).." DPS|r  •  "..label.."\n"..facts)
     end
     local displayDescription=DisplayRemoteText(
         b.description or "",4000,true,true)
@@ -1365,8 +1379,8 @@ function M.RefreshStatus()
         elseif state=="syncing" then statusText:SetText("|cff4dff80Syncing"..(receiving>0 and (" • "..receiving.." receiving") or "...").."|r")
         elseif state=="cleaning" then statusText:SetText("|cffffcc55Removing expired requests...|r")
         elseif state=="sending" then statusText:SetText("|cff4dff80Sending queued Nexus work...|r")
-        else statusText:SetText("|cff888888Best exact loadout per character|r") end
-    else statusText:SetText("|cff888888Best exact loadout per character|r") end
+        else statusText:SetText("|cff888888"..LeaderboardScope().."|r") end
+    else statusText:SetText("|cff888888"..LeaderboardScope().."|r") end
     -- Anchored at its right edge, the button widens left for a longer label.
     if Nexus.LayoutMetrics then Nexus.LayoutMetrics.FitButtonWidth(syncBtn,90,240) end
     virtualStats.statusRefreshes=virtualStats.statusRefreshes+1

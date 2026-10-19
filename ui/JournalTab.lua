@@ -81,8 +81,10 @@ local TOME_STALE = "This reading may be stale; Tome state coverage gives the rea
 local DeselectOurTab
 -- Assignment only records the target. The automatic save (Auto ON, autoSave,
 -- Ratchet.Dominates) is what may replace the active Saved Build. A changed
--- assignment marks the projection dirty, so at level 80 with a finished run
--- the save check runs again at once against the new Wishlist.
+-- assignment marks the adapter's data dirty (MarkWishlistProjectionDirty);
+-- Auto's next update step (AutomationRuntime RunUpdate -> StepSave) then
+-- checks a finished level-80 run not yet saved this visit against the newly
+-- assigned Wishlist. M4 (FN7): the copy states that trigger, not a latency.
 local ASSIGN_NOTE = "Assigning by itself does not change any Saved Build."
 -- An empty numbered Saved Build holds no Wishlist of its own and refuses an
 -- assignment. The name the Journal shows beside it is the retained first-run
@@ -94,10 +96,85 @@ local EMPTY_SLOT_SELECTOR = "This Saved Build is empty, so no Wishlist can be as
     .. "A name shown here is the first-run Wishlist, not an assignment to this Saved Build. " .. ASSIGN_NOTE
 local AUTO_SAVE_WARNING = "With Auto ON, Nexus may replace the active Saved Build with a finished run that "
     .. "has more overall Wishlist progress, or equal progress after cleanup or an even swap of requested "
-    .. "copies. At level 80 after a finished run, Auto checks again right away when you change the assignment. "
+    .. "copies. At level 80, a changed assignment makes Auto check a finished run it has not saved yet. "
     .. "Saving edits to the assigned Wishlist can also lead to a replacement without a new run."
 local AUTO_SAVE_ORBS = "The replaced build may hold an Echo you value, even one obtained with Orbs: "
     .. "Orb investment is not compared. Keep Auto OFF to leave the Saved Build unchanged."
+
+-- UX-05: an assignment to a numbered Saved Build while Auto is selected (ON,
+-- also while held) asks first, naming the Wishlist, the target captured when
+-- the player chose it and the conditional replacement (no timing promise).
+-- Cancel changes nothing; nothing here changes Auto. With Auto OFF the choice
+-- assigns at once. Used by the Journal picker and the editor's candidates.
+StaticPopupDialogs = StaticPopupDialogs or {}
+StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"] = {
+    text = "Assign '%s' to %s?\n" .. "Auto is ON. Assigning by itself does not change the Saved Build. But "
+        .. "when it is active and a finished run at level 80 passes Auto's checks, Nexus may replace it with "
+        .. "the run. Cancel changes nothing. To avoid that, choose Cancel, turn Auto OFF, then assign.",
+    button1 = "Assign",
+    button2 = "Cancel",
+    OnAccept = function(_, data)
+        if type(data) == "table" and type(data.assign) == "function" then data.assign() end
+    end,
+    timeout = 0, whileDead = true, hideOnEscape = true,
+}
+
+-- Whether Auto is selected (ON, also while held), from the runtime's
+-- counters (memory only).
+function M.AutoSelected()
+    if type(Nexus.RecomputeStats) ~= "function" then return false end
+    local ok, stats = pcall(Nexus.RecomputeStats)
+    return ok and type(stats) == "table" and stats.autoEnabled == true
+end
+
+-- A Wishlist or Saved Build name as it may be shown in chat or a dialog.
+function M.SafeName(text, fallback)
+    local display = Nexus.Identity and Nexus.Identity.DisplaySafeText
+    local shown = display and display(tostring(text or ""), 1024, false) or nil
+    if type(shown) ~= "string" or shown == "" then shown = tostring(fallback or "") end
+    return shown
+end
+
+local function OwnerKeyNow()
+    local store = Nexus.Store
+    if not (store and type(store.CurrentOwnerKey) == "function") then return nil end
+    local ok, owner = pcall(store.CurrentOwnerKey)
+    return ok and owner or nil
+end
+
+-- One assignment the player chose. `assign` performs it (and every role
+-- choice it starts) for the target captured when the player chose it. A
+-- numbered, non-empty target with Auto selected asks first; the first-run
+-- target has no Saved Build to replace, and an empty one is refused by the
+-- assignment itself. When the confirmation cannot be shown, nothing is
+-- assigned (never assigned unasked while Auto is selected). One accept
+-- performs it once; an accept after the character's saved data changed
+-- assigns nothing. Returns true when it asked, false when it assigned at
+-- once, nil and a reason when it refused.
+function M.AssignWithConsent(wishlistName, targetLabel, numbered, assign)
+    if not numbered or not M.AutoSelected() then
+        assign()
+        return false
+    end
+    if type(StaticPopup_Show) ~= "function" or type(StaticPopupDialogs) ~= "table"
+        or type(StaticPopupDialogs["NEXUS_ASSIGN_WISHLIST_AUTO_ON"]) ~= "table" then
+        print("|cffff6060Nexus:|r Nothing was assigned: Auto is ON and the confirmation that names its "
+            .. "consequence could not be shown. Turn Auto OFF to assign, or try again later.")
+        return nil, "consent_unavailable"
+    end
+    local owner, answered = OwnerKeyNow(), false
+    StaticPopup_Show("NEXUS_ASSIGN_WISHLIST_AUTO_ON", wishlistName, targetLabel, {assign = function()
+        if answered then return end
+        answered = true
+        if OwnerKeyNow() ~= owner then
+            print("|cffff6060Nexus:|r Nothing was assigned: this character's saved data changed after you "
+                .. "were asked. Open the Wishlist chooser again.")
+            return
+        end
+        assign()
+    end})
+    return true
+end
 
 ------------------------------------------------------------------------
 -- Text lines
@@ -1157,12 +1234,27 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
         wishlistPicker.title:SetPoint("TOPLEFT", 10, -8)
         wishlistPicker.title:SetText("Wishlists")
     end
+    -- The title names the target this picker's clicks act on (the context
+    -- captured with it), not only that these are Wishlists.
+    wishlistPicker.title:SetText(emptySlot and "Empty Saved Build: assigning is refused"
+        or ((tonumber(active) or 0) < 1 and "Assign to: first-run target")
+        or ("Assign to: " .. ShortName(tostring(loadoutName or ""), 24)))
     for i=1,#wishlistPickerRows do wishlistPickerRows[i]:Hide() end
     if wishlistPicker.emptyRow then wishlistPicker.emptyRow:Hide() end
     if wishlistPicker.clearRow then wishlistPicker.clearRow:Hide() end
     wishlistPicker:ClearAllPoints()
     wishlistPicker:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)
+    -- The selector already names the selected Wishlist, so the list offers
+    -- only the others. Only that one identity (IsAssignedPickerRow) is left
+    -- out: a row with the same name or contents is another Wishlist and stays.
+    -- With no name on the selector the selection stays listed and marked.
     local shown = wishes
+    if linked and tostring(linked.name or "") ~= "" then
+        shown = {}
+        for i=1,#wishes do
+            if not IsAssignedPickerRow(linked, wishes[i]) then shown[#shown+1] = wishes[i] end
+        end
+    end
     local width, rowH = 245, 24
     wishlistPicker:SetWidth(width)
     local count = math.max(1, #shown)
@@ -1241,27 +1333,44 @@ local function ShowWishlistPicker(anchor, wishes, linked, active, loadoutName, A
                 }
             end
             local function AssociateWishlistOnly()
+                local numbered = tonumber(active) and tonumber(active) > 0
+                local shownName = M.SafeName(cName, "Unnamed Wishlist")
+                local target = numbered and ("Saved Build '" .. M.SafeName(loadoutName, tostring(active)) .. "'")
+                    or "the first-run target"
                 if cSnapshot.lockEvidenceStatus=="unavailable" and Nexus.WishlistEditor
                     and Nexus.WishlistEditor.ResolveAndAssignWishlist then
+                    -- A Wishlist without lock evidence: its role choice (the
+                    -- current-lock default or the role picker) and the
+                    -- assignment it ends in wait for the same Auto-ON
+                    -- confirmation; Cancel writes neither.
+                    M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                        HideWishlistPicker()
+                        Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
+                    end)
+                    return
+                end
+                -- The captured target, candidate and empty-slot refusal as
+                -- before; Auto selected asks first (M.AssignWithConsent).
+                M.AssignWithConsent(shownName, target, numbered and not emptySlot, function()
+                    local ok, err
+                    if numbered then
+                        ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
+                    elseif type(A.SetFirstRunWishlist) == "function" then
+                        ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
+                    else
+                        ok, err = false, "first-run association unavailable"
+                    end
+                    if not ok then
+                        print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
+                        return
+                    end
                     HideWishlistPicker()
-                    Nexus.WishlistEditor.ResolveAndAssignWishlist(cSnapshot,tonumber(active) or 0)
-                    return
-                end
-                local ok, err
-                if tonumber(active) and tonumber(active) > 0 then
-                    ok, err = A.SetLoadoutWishlist(active, cSlot, cSnapshot)
-                elseif type(A.SetFirstRunWishlist) == "function" then
-                    ok, err = A.SetFirstRunWishlist(cSlot, cSnapshot)
-                else
-                    ok, err = false, "first-run association unavailable"
-                end
-                if not ok then
-                    print("|cffff6060Nexus:|r " .. tostring(err or "could not select wishlist"))
-                    return
-                end
-                HideWishlistPicker()
-                M.RefreshAssociations()
-                if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    M.RefreshAssociations()
+                    if Nexus.Panel and Nexus.Panel.Refresh then pcall(Nexus.Panel.Refresh) end
+                    -- A visible confirmation of what changed, and only that.
+                    print("|cff4dff80Nexus:|r '" .. shownName .. "' is now the Wishlist for " .. target
+                        .. ". No Saved Build was changed or activated.")
+                end)
             end
             local function OpenWishlistEditorOnly()
                 HideWishlistPicker()
@@ -1673,6 +1782,39 @@ local function EnsureLifecycleHooks()
     hooked = any
 end
 
+-- The live menu-bar button that opens Character Progression -> Echoes, or nil.
+-- Read-only: it finds the button and clicks nothing.
+local function FindEchoesMicroButton()
+    local button = _G["EchoJournalMicroButton"]
+    if button and type(button.Click) == "function" then return button end
+    local function walk(frame, depth)
+        if not frame or depth > 6 then return nil end
+        local name = frame.GetName and frame:GetName() or nil
+        if type(name) == "string" then
+            local lower = string.lower(name)
+            if string.find(lower, "echojournalmicrobutton", 1, true)
+                and type(frame.Click) == "function" then
+                return frame
+            end
+        end
+        local children = { frame.GetChildren and frame:GetChildren() }
+        for i = 1, #children do
+            local found = walk(children[i], depth + 1)
+            if found then return found end
+        end
+        return nil
+    end
+    return walk(_G["UIParent"], 0)
+end
+
+-- Whether the Echoes page can be opened now (read-only). Callers check this
+-- before closing their own window for the route, so a missing button loses
+-- nothing.
+function M.CanOpenBuilds()
+    local ok, button = pcall(FindEchoesMicroButton)
+    return ok and button ~= nil
+end
+
 local function ClickCurrentEchoesMicroButton()
     -- The server update moved Echoes into Character Progression. Calling the
     -- legacy ProjectEbonhold.EchoJournal.Show() still opens the retired
@@ -1711,18 +1853,50 @@ local function ClickCurrentEchoesMicroButton()
     return false
 end
 
-function M.OpenBuilds()
+-- The Wishlist chooser of the attached strip, opened through the selector's
+-- own click handler (the same candidates, target and checks as a player's
+-- click). Opening it assigns nothing; only a row click does. True when the
+-- chooser is open.
+local function OpenChooserNow()
+    local host = associationPanel
+    if not (host and host:IsVisible() and host.selector and host.selector:IsVisible()) then
+        return false
+    end
+    if wishlistPicker and wishlistPicker:IsShown() then return true end
+    local click = host.selector:GetScript("OnClick")
+    if type(click) ~= "function" then return false end
+    click(host.selector)
+    return wishlistPicker ~= nil and wishlistPicker:IsShown()
+end
+
+local CHOOSER_COACH = "The Echoes page is open. Click the Nexus Wishlist selector at its top to choose a "
+    .. "Wishlist; nothing is assigned until you choose one."
+
+-- `openChooser`: also open the Wishlist chooser once the strip is attached
+-- (Assign Wishlist, Set up current build, Help and the editor's Assign now);
+-- when the strip cannot be shown, say what to click instead. Without it the
+-- existing behaviour is unchanged. Returns true when the Echoes page opened.
+-- `beforeOpen` (optional): the caller's own step before the page opens (the
+-- HUD's Assign Wishlist closes its other windows). It runs only when the
+-- game's Character Progression entry is there; otherwise nothing runs and
+-- false, "unavailable" is returned, so the caller says why and loses nothing.
+function M.OpenBuilds(openChooser, beforeOpen)
+    if type(beforeOpen) == "function" then
+        if not M.CanOpenBuilds() then return false, "unavailable" end
+        beforeOpen()
+    end
     EnsureAssociationScanner()
 
     local opened = ClickCurrentEchoesMicroButton()
     if not opened then
         print("|cffff6060Nexus:|r Could not find the server Character Progression button. Open Character Progression → Echoes manually.")
-        return
+        return false
     end
 
+    local chooserPending = openChooser == true
     -- Let the server finish constructing/selecting its new Echoes page before
     -- attaching Nexus beside the live loadout dropdown.
-    local function finish()
+    local function finish(last)
         pcall(function()
             if not installed and pcall(Install) then installed = true end
             if installed then
@@ -1730,13 +1904,33 @@ function M.OpenBuilds()
                 DeselectOurTab(false)
             end
             RefreshAssociationRows()
+            if chooserPending then
+                if OpenChooserNow() then
+                    chooserPending = false
+                elseif last then
+                    chooserPending = false
+                    -- Truthful about the page: "open" only when Nexus sees its
+                    -- strip there. The game's button toggles the page, so one
+                    -- that was already open can close again (native behaviour,
+                    -- not observed offline); then no claim is made.
+                    local strip = associationPanel
+                    local shown = strip and strip.IsVisible and strip:IsVisible()
+                    print("|cffffd200Nexus:|r " .. (shown and CHOOSER_COACH
+                        or ("Nexus could not confirm that the Echoes page is open (if it was already open, "
+                            .. "the game's button may have closed it). Open Character Progression -> Echoes "
+                            .. "and click the Nexus Wishlist selector at its top; nothing is assigned until "
+                            .. "you choose one.")))
+                end
+            end
         end)
     end
-    finish()
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0.10, finish)
-        C_Timer.After(0.35, finish)
+    local timers = C_Timer and C_Timer.After
+    finish(not timers)
+    if timers then
+        C_Timer.After(0.10, function() finish(false) end)
+        C_Timer.After(0.35, function() finish(true) end)
     end
+    return true
 end
 
 function M.DebugSnapshot()

@@ -8,7 +8,8 @@
 -- manually", because nothing can resolve it.
 -- N2: for a restored receipt the blocked reasons of the real mutators must not
 -- say "owns the current action" or "Stop and settle". They must say what the
--- only exit is: the player's explicit Continue (035), not a settlement. (Before
+-- conditional exit is: the player's explicit Continue (035) applies only to its
+-- bounded class, not every restored record. (Before
 -- 035 they said that no exit exists and that a settlement path is only a proposal.)
 local H=dofile('tests/prototype/orbs_support.lua');local M,A,O=H.M,H.A,H.O
 local checks=0;local function check(v,m)assert(v,m);checks=checks+1 end
@@ -25,7 +26,10 @@ M=Nexus.OrbRuntime;check(M.Status().state=='RECOVERY','passive recovery');H.Adva
 local s=M.Status()
 check(s.reason:find('Desired A',1,true)~=nil,'the instruction names the proposed Echo: '..s.reason)
 check(s.reason:find('only if you choose that same Echo',1,true)~=nil,'the instruction limits what can be confirmed')
-check(s.reason:find('different Echo',1,true)~=nil and s.reason:find('only exit',1,true)~=nil and s.reason:find('Continue',1,true)~=nil,'the instruction states the consequence of a different choice and the only exit')
+check(s.reason:find('different Echo',1,true)~=nil and s.reason:find('Continue is available only after a reload',1,true)~=nil
+ and s.reason:find('client-observed spend',1,true)~=nil and s.reason:find('no usable recorded choice and no open offer',1,true)~=nil
+ and s.reason:find('/nexus orbs',1,true)~=nil and not s.reason:find('only exit',1,true),
+ 'the instruction states the different-choice consequence and conditional Continue eligibility')
 check(s.recovery.kind=='OFFER_OPEN' and s.recovery.proposed==true,'open offer with a proposed key')
 -- While the action can still progress, the blocked reasons say so.
 local function reasons()
@@ -46,8 +50,11 @@ check(H.service.SelectPerk(410004)==true,'manual choice of another Echo');H.Adva
 s=M.Status()
 check(s.pending and s.state=='PAUSED','the action pauses unresolved')
 check(not s.reason:find('Resolve it manually',1,true),'the text does not tell the player to resolve what cannot be resolved')
-check(s.reason:find('cannot confirm',1,true)~=nil and s.reason:find('kept',1,true)~=nil and s.reason:find('only exit',1,true)~=nil
- and s.reason:find('Continue',1,true)~=nil and not s.reason:find('only a proposal',1,true),'the text states: cannot confirm, record kept, the only exit is Continue')
+check(s.reason:find('cannot confirm',1,true)~=nil and s.reason:find('kept',1,true)~=nil
+ and s.reason:find('Continue is available only after a reload',1,true)~=nil
+ and s.reason:find('client-observed spend',1,true)~=nil and s.reason:find('no usable recorded choice and no open offer',1,true)~=nil
+ and not s.reason:find('only exit',1,true) and not s.reason:find('only a proposal',1,true),
+ 'the text states: cannot confirm, record kept, Continue is conditional')
 local out=H.Clone(H.granted);local removed=false
 for _,es in pairs(out)do for i=#es,1,-1 do if not removed and es[i].spellId==source then table.remove(es,i);removed=true end end end
 assert(removed);out['Desired B']={{spellId=410004,quality=3}};H.granted=out
@@ -69,4 +76,30 @@ for name,call in pairs({Prepare=function()return M.Prepare()end,UseAssignedWishl
 end
 local allowed,why=A.OrdinaryBoardAllowed()
 check(allowed==false and Nexus.UserText.Message(why)==why,'the visible ordinary reason is the same truthful sentence')
+-- Missing retained spend history is outside Continue, not proof the client
+-- never observed it or the server spent nothing. Opening the explanation sends
+-- nothing and every mutator remains blocked for this class too.
+local R=dofile('tests/prototype/orb_recovery_support.lua');local S=R.S
+local HU,MU,AU,OU=R.Class({latch=false,edit=function(row,state)row.spendConfirmed=false;state.spendConfirmed=false end})
+OU.charges=OU.charges-2;S.Pass(HU,MU,AU,1)
+local vu=MU.ContinueView();local su=MU.Status()
+check(su.recovery.kind=='UNOBSERVABLE' and vu.reason=='spend_unconfirmed' and not vu.eligible,'missing retained history is not Continue class')
+check(su.reason:find('no retained observation',1,true) and su.reason:find('does not prove that the server spent nothing',1,true)
+ and not su.reason:find('never observed',1,true) and not su.reason:find('only exit',1,true),'missing history stays unknown with no universal exit promise')
+local base=HU.Clone(R.Saved());local actions=#HU.actions;local sends=#HU.sent;local reqs=OU.requests
+Nexus.OrbPanel.Show();Nexus.OrbPanel.Refresh();NexusOrbPanel.cont:Click()
+check(not NexusOrbContinue.check:IsEnabled() and not NexusOrbContinue.go:IsEnabled(),'explanation does not enable a check or consent')
+for name,call in pairs({take=function()return AU.Take(410002)end,reroll=function()return AU.Reroll()end,
+ banish=function()return AU.Banish(1)end,freeze=function()return AU.Freeze(1)end,lock=function()return AU.LockPerk(410001)end,
+ unlock=function()return AU.UnlockPerk(410001)end,save=function()return AU.Save(1,'x')end,activate=function()return AU.Activate(1)end,
+ upload=function()return AU.UploadWishlist(0,'x',{{spellId=410002,quality=2,stacks=1}})end})do
+ local ok,refusal=call();check(not ok and type(refusal)=='string',name..': missing history still blocks mutation')
+ check(refusal:find('this record retains an observation',1,true) and refusal:find('no offer is open',1,true)
+  and refusal:find('check passes',1,true) and not refusal:find('if this client observed',1,true)
+  and not refusal:find('only exit',1,true),name..': refusal conditions Continue on retained evidence and a passing check')
+end
+check(#HU.actions==actions and #HU.sent==sends and OU.requests==reqs and R.Same(R.Saved(),base),
+ 'explanation and refused mutators make no action/request/receipt changes')
+check(MU.Status().pending and MU.Status().spent==su.spent and MU.Status().reserved==su.reserved and su.reserved==1 and MU.BlocksOrdinary()
+ and not MU.Resume() and not MU.Prepare(),'original unobserved spending exposure and block retained')
 print('PASS F7/N2 instructions and blocked reasons state what the code can and cannot do checks='..checks)

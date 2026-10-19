@@ -18,7 +18,10 @@ local function save(slot,id,name)
  W.ImportEBH1String(code,name)
  assert(W.DebugDraftState().pending==79 and W.DebugDraftState().pendingLock==1,'actual imported draft has exact roles')
  local b
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist'then b=f;break end end
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then b=f;break end end
+  if b then break end
+ end
  assert(b,'normal Create button exists');b:Click();H.AcceptPopup()
  assert(not W.IsApplyPending(),'synthetic save completes')
  H.now=H.now+3.1

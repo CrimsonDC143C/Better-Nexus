@@ -36,7 +36,11 @@ local function saveWithDesign(slot,name,locks)
  H.perks.serverActiveSlot=slot;H.Notify();A.Poll()
  W.ImportEBH1String(assert(Nexus.Codec.EncodeEBH1(plan(locks),'MAGE',name)),name)
  local create
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()=='Create Wishlist'then create=f;break end end
+ -- M3: the Create action is labelled by its effect (new label first, then legacy).
+ for _,label in ipairs({'Create & assign','Create unassigned','Create Wishlist'})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then create=f;break end end
+  if create then break end
+ end
  assert(create);create:Click();H.AcceptPopup();H.now=H.now+3.1
  check(A.AssignedWishlist().name==name and A.AssignedWishlist().state=='ready','assigned with its own design: '..name)
 end

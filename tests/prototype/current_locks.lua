@@ -25,8 +25,14 @@ local function split(echoes)
  for _,e in ipairs(echoes)do if e.locked==true then l=l+e.stacks else o=o+e.stacks end end
  return o,l
 end
+-- M3: the editor's actions are named by their effect; a legacy label also
+-- finds the action with that default intent (new label first, then legacy).
+local LABELS={['Create Wishlist']={'Create & assign','Create unassigned','Create Wishlist'},
+ ['Save Wishlist']={'Save & assign','Save changes','Save Wishlist'}}
 local function button(text)
- for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==text then return f end end
+ for _,label in ipairs(LABELS[text] or {text})do
+  for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible() and f:GetText()==label then return f end end
+ end
  error('button not found: '..text)
 end
 local original=H.Clone(H.locked);local mirrors=H.Clone(H.perks.serverBuildSlots)

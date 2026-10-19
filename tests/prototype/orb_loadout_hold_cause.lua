@@ -193,18 +193,40 @@ do
   check(Nexus.SupportReport.Summary():find('Orb action',1,true)~=nil,case.name..': the summary is still produced')
  end
 end
--- The fields a hold adds to a receipt are exactly three small scalars. A receipt that a post-reload session
--- latched has the key set of the reported receipt (the fixture plus its GUID) and nothing else.
+-- A hold still adds exactly three small scalars. A receipt may also carry the
+-- approved bounded boundary journal from its original live session; that is
+-- diagnostic evidence, not a new hold fact or a settlement permission.
 do
  local F=S.Shape()
- local H,M,A,O,src,slots=S.Build(S.CAUSES[1])
+ local H,M,A,O=S.Fresh()
+ local src,slots=S.SpendOfferNoChoice(H,M,A,O)
+ M=S.Reload(H)
+ -- Capture the inherited original-live journal before the restored session
+ -- observes the changed slot and writes any hold annotation.
+ local inheritedJournal=H.Clone(S.Receipt().boundaryJournal)
+ H.perks.serverActiveSlot=0;H.perks.serverBuildSlots=nil;S.Pass(H,M,A)
+ H.perks.serverActiveSlot=2;H.perks.serverBuildSlots=slots;S.Pass(H,M,A);S.Rechecks(H,M,2)
  local latched=S.Receipt()
  local function Keys(t,skip)
   local ks={};for k in pairs(t)do if not (skip and skip[k]) then ks[#ks+1]=k end end;table.sort(ks);return table.concat(ks,',')
  end
  local want={guid=true};for k in pairs(F.receipt)do want[k]=true end
- check(Keys(latched,{loadoutCause=true,loadoutObservedSlot=true,loadoutObservedAt=true})==Keys(want),
-  'a hold latched after a reload has exactly the keys of the reported receipt, apart from the two annotations: '..Keys(latched))
+ check(Keys(latched,{loadoutCause=true,loadoutObservedSlot=true,loadoutObservedAt=true,boundaryJournal=true})==Keys(want),
+ 'apart from the three hold annotations and optional bounded journal, original receipt keys stay exact: '..Keys(latched))
+ check(Same(latched.boundaryJournal,inheritedJournal),'restored hold does not create or alter the inherited journal')
+ if latched.boundaryJournal~=nil then
+  local jd=Nexus.OrbRuntime.BoundaryDiagnostics()
+  check(type(latched.boundaryJournal)=='table' and getmetatable(latched.boundaryJournal)==nil
+   and #latched.boundaryJournal>0 and #latched.boundaryJournal<=8 and jd.retained==#latched.boundaryJournal
+   and Same(latched.boundaryJournal,jd.receiptJournal),'only the approved bounded, validated journal is permitted')
+  local approved={event=true,epoch=true,phase=true,charge=true,relation=true,owned=true,offer=true,pick=true,host=true}
+  for _,entry in ipairs(latched.boundaryJournal)do
+   local fields=0
+   for k,v in pairs(entry)do fields=fields+1;check(approved[k] and (type(v)=='number' or type(v)=='boolean' or type(v)=='string'),
+    'journal has only the nine approved scalar fields')end
+   check(fields<=9,'journal cannot add an unbounded state/payload field')
+  end
+ end
  check(latched.restored==true and latched.refreshRequested==false,'a save made in a session that restored the receipt writes restored and refreshRequested')
  check(type(latched.loadoutCause)=='string' and #latched.loadoutCause<=24 and type(latched.loadoutObservedSlot)=='number' and type(latched.loadoutObservedAt)=='number',
   'the annotations are a short name and two whole numbers')

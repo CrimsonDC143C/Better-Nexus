@@ -75,7 +75,7 @@ local rows,m=OpenRows()
 local text=Texts(rows)
 check(#rows==6,'six declared Saved Builds give six rows: '..#rows..' ('..table.concat(text,' | ')..')')
 check(text[1]:find('One',1,true) and text[6]:find('Six',1,true),'row 1 is One and row 6 is Six: '..table.concat(text,' | '))
-for i=2,5 do check(text[i]:find('Loadout '..i,1,true) and text[i]:find('Empty',1,true) and not rows[i].enabled,
+for i=2,5 do check(text[i]:find('Saved Build '..i,1,true) and text[i]:find('Empty',1,true) and not rows[i].enabled,
  'slot '..i..' has no data: a disabled Empty row, nothing guessed: '..text[i]) end
 check(rows[6].enabled and rows[1].enabled,'the two populated rows are enabled')
 for _,t in ipairs(text) do check(not t:find('W-',1,true),'a designed Wishlist mirror is not a Saved Build row: '..t) end
@@ -131,14 +131,14 @@ for i=1,5 do check(not rows[i].enabled and text[i]:find('Empty',1,true),'unreada
 Boot({maxSlots=6,active=1,slots={[1]={name='One',verified=true,echoes=E1},[101]={name='W-One',verified=false,echoes=E1}}})
 SlashCmdList.NEXUS('editor')
 rows=OpenRows();text=Texts(rows)
-check(#rows==6 and not rows[6].enabled and text[6]:find('Loadout 6',1,true) and text[6]:find('Empty',1,true),'a declared sixth slot without data is a disabled Empty row: '..text[6])
+check(#rows==6 and not rows[6].enabled and text[6]:find('Saved Build 6',1,true) and text[6]:find('Empty',1,true),'a declared sixth slot without data is a disabled Empty row: '..text[6])
 check(rows[1].enabled,'slot 1 stays selectable')
 
 -- 4b. A readable slot 6 with no name keeps the generic label and stays selectable.
 Boot({maxSlots=6,active=6,slots={[6]={name='',verified=true,echoes=E6}}})
 SlashCmdList.NEXUS('editor')
 rows=OpenRows();text=Texts(rows)
-check(#rows==6 and rows[6].enabled and text[6]:find('Loadout 6',1,true) and not text[6]:find('Empty',1,true),'an unnamed readable sixth slot is labelled Loadout 6 and enabled: '..text[6])
+check(#rows==6 and rows[6].enabled and text[6]:find('Saved Build 6',1,true) and not text[6]:find('Empty',1,true),'an unnamed readable sixth slot is labelled Saved Build 6 and enabled: '..text[6])
 Select(rows[6]);ctx,target=Ctx()
 check((ctx.loadoutSlot or target.loadoutSlot)==6,'and it selects Saved Build 6')
 

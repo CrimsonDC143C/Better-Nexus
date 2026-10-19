@@ -717,7 +717,7 @@ function Renderer.New(options)
             results=virtualStats.results,
             labels={
                 search="Search title, author, or description",
-                scope="All Shared",mine="My Builds",
+                scope="All Shared",mine="Mine",
                 class="Current Class Only",qualified="Require both DPS records",
                 sort="Sort: Highest DPS",sync="Listening...",
                 share="Share Build",
@@ -2646,7 +2646,9 @@ local function EnsureFrame()
     frame._myBuildsBtn = myBuildsBtn
     myBuildsBtn:SetSize(84,22)
     myBuildsBtn:SetPoint("LEFT",scopeBtn,"RIGHT",4,0)
-    myBuildsBtn:SetText("My Builds")
+    -- M4 (UX-15): the scope is Mine, so the words My Builds keep one meaning,
+    -- the game's own page of Saved Builds. The internal scope key stays mine.
+    myBuildsBtn:SetText("Mine")
     myBuildsBtn:SetScript("OnClick",function()
         ControllerInstance().SetFilter("scope", "mine")
         ControllerInstance().ClearSelection()
@@ -2655,8 +2657,9 @@ local function EnsureFrame()
     end)
     myBuildsBtn:SetScript("OnEnter",function(self)
         GameTooltip:SetOwner(self,"ANCHOR_TOP")
-        GameTooltip:AddLine("My Builds",1,0.82,0.2)
+        GameTooltip:AddLine("Mine",1,0.82,0.2)
         GameTooltip:AddLine("Browse your Saved Builds and shared listings.",0.8,0.8,0.8,true)
+        GameTooltip:AddLine("This is a Build Library scope. The game's own My Builds page (Nexus panel button) is where a Saved Build is chosen or assigned.",0.65,0.65,0.65,true)
         GameTooltip:Show()
     end)
     myBuildsBtn:SetScript("OnLeave",function() GameTooltip:Hide() end)
@@ -2690,7 +2693,7 @@ local function EnsureFrame()
 
     -- The DPS-record qualifier: one check box with a fixed label. Checked
     -- requires both records; unchecked imposes no DPS-record requirement.
-    -- The browsing scope stays on the All Shared / My Builds buttons. The
+    -- The browsing scope stays on the All Shared / Mine buttons. The
     -- check always shows the saved filter (M.Refresh), never a guess.
     local qualifiedBox = CreateFrame("Button",nil,frame)
     qualifiedBox:SetSize(196,22)
@@ -3345,6 +3348,12 @@ function M.Refresh()
             if bClass == "UNKNOWN" then
                 qualityTag = qualityTag .. "  |cffaaaaaaClass not supplied|r"
             end
+            -- M4 (UX-14): a shared row whose owner the presentation layer did
+            -- not establish says so on the row itself (the detail already
+            -- carries the same note). Display only; no owner inference.
+            if b.publicIdentityVerified == false and ownerTag == "" then
+                qualityTag = qualityTag .. "  |cff999999Owner not established|r"
+            end
             local displayAuthor = b.displayAuthor
                 or (Nexus.Identity and Nexus.Identity.DisplaySafeText
                     and Nexus.Identity.DisplaySafeText(
@@ -3359,7 +3368,15 @@ function M.Refresh()
                 local destinationName = displayText
                     and displayText(b.destinationWishlistName, 1024, false)
                     or "Wishlist"
-                card.destination:SetText(string.format("|cffffd200Assigned Wishlist:|r %s  |cff66ff99%d/%d in progress|r", destinationName, tonumber(b.destinationProgress) or 0, tonumber(b.destinationTotal) or 79))
+                -- M4 (UX-13): the Wishlist's copies found in this Saved
+                -- Build (CommunityController EchoProgress), a different unit
+                -- from run or planned copies. An unknown total is said as
+                -- unavailable, never replaced by a guessed 79.
+                local userText = Nexus and Nexus.UserText
+                local count = userText and userText.CountText
+                    and userText.CountText("savedBuild", b.destinationProgress, b.destinationTotal)
+                    or "Wishlist copies in this Saved Build: unavailable"
+                card.destination:SetText(string.format("|cffffd200Assigned Wishlist:|r %s  |cff66ff99%s|r", destinationName, count))
             else
                 card.destination:SetText("|cff999999No Wishlist assigned|r")
             end
@@ -3395,8 +3412,12 @@ function M.Refresh()
                     dummy=0,lk=0,best=0,average=0,count=0,
                 }
                 if dps.count == 2 then
+                    -- M4 (UX-14): the headline is one category's record, so it
+                    -- names that category (the best single record decides it).
+                    local headline = dps.lk > dps.dummy and "Lich King"
+                        or dps.dummy > dps.lk and "Dummy" or "both records"
                     card.echoCount:SetText(string.format(
-                        "|cff4dff80%s DPS|r", DpsText(dps.best)))
+                        "|cff4dff80Best %s DPS|r |cff999999(%s)|r", DpsText(dps.best), headline))
                     card.dpsBreakdown:SetText(string.format(
                         "Dummy %s  |cff777777•|r  LK %s  |cff777777•|r  Avg %s",
                         DpsText(dps.dummy), DpsText(dps.lk),

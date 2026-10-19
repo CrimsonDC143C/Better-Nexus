@@ -1,7 +1,9 @@
--- The Journal picker marks exactly the resolved assignment with [Selected].
--- Drives the real selector and picker rows over equal-content server Wishlists:
--- the marker follows the current resolved server slot and content key (or an
--- equal assignmentId), never equal contents in another slot and never a name.
+-- The Journal picker singles out exactly the resolved assignment: the selector
+-- names it and the list leaves it out (an unnamed one stays listed, marked
+-- [Selected]). Drives the real selector and picker rows over equal-content
+-- server Wishlists: the selection follows the current resolved server slot and
+-- content key (or an equal assignmentId), never equal contents in another slot
+-- and never a name.
 -- Display only: opening and reading the picker assigns, saves and spends nothing.
 local originalDofile=dofile
 local H
@@ -43,13 +45,24 @@ local function row(p,name)
   if label==name or label:sub(1,#name+2)==name..'  ' then return r end
  end
 end
--- Names of the visible rows that carry the marker, in list order.
+-- Names singled out as the selection: visible rows that carry the marker, in
+-- list order, then candidates the list leaves out. A left-out candidate must
+-- be the one the selector names.
 local function marked()
- local p=open();local out={}
+ local p=open();local out={};local listed={}
  for _,r in ipairs(rows(p))do
   local label=r.nameButton.text:GetText()
-  if label:find('[Selected]',1,true)then
-   out[#out+1]=label:gsub('|c%x%x%x%x%x%x%x%x%[Selected%] |r',''):gsub('  |c.*$','')
+  local name=label:gsub('|c%x%x%x%x%x%x%x%x%[Selected%] |r',''):gsub('  |c.*$','')
+  listed[name]=(listed[name] or 0)+1
+  if label:find('[Selected]',1,true)then out[#out+1]=name end
+ end
+ for _,c in ipairs(A.GetWishlistCandidates())do
+  local name=(c.name~='' and c.name) or 'Unnamed Wishlist'
+  if (listed[name] or 0)>0 then listed[name]=listed[name]-1
+  else
+   out[#out+1]=name
+   check(NexusActiveWishlistSelector.text:GetText():find(name,1,true),
+    'a candidate left out of the list is the one the selector names: '..name)
   end
  end
  close()
@@ -61,7 +74,13 @@ local function saved(context)
  return state.loadoutWishlists[context]
 end
 local function pick(name,context)
- local p=open();local r=assert(row(p,name),'actual picker has '..name)
+ local p=open();local r=row(p,name)
+ if not r and A.AssignedWishlist().name==name then
+  -- Already the selection, so named on the selector and not listed:
+  -- unassign through the picker, then pick its row afresh.
+  p.clearRow:Click();p=open();r=row(p,name)
+ end
+ r=assert(r,'actual picker has '..name)
  r.nameButton:Click()
  check(not p:IsShown() and A.AssignedWishlist().name==name,'clicking '..name..' assigns it')
  check(saved(context).assignmentId,'SETUP: the stored assignment carries an assignmentId')
@@ -169,5 +188,79 @@ for _,c in ipairs(A.GetWishlistCandidates())do
 end
 check(foreign,'SETUP: loadout 1\'s design plan (another assignment) holds the slot-102 row')
 expect(2,'','legacy association against another assignment\'s row')
+-- 10. The reported list: the selection plus three more Wishlists under its
+-- name, and a Wishlist with the selection's contents in another slot. Only the
+-- selected identity leaves the list, before the picker is sized; the others
+-- stay and each row assigns and edits its own slot. Nothing is merged or
+-- deduplicated by name or contents, and opening, reading or the gears change
+-- no assignment. (Two same-name rows with equal contents are ambiguous to the
+-- resolver and leave nothing out: case 6 above.)
+local SAME='DeathrageV4'
+server({[101]={SAME,rolled},[102]={SAME,variant(3)},[103]={SAME,variant(4)},[104]={SAME,variant(5)},
+ [105]={'empty2',variant(6)},[106]={'Equal elsewhere',rolled}})
+local function named(p,name)
+ local out={}
+ for _,r in ipairs(rows(p))do
+  if r.nameButton.text:GetText():gsub('|c%x%x%x%x%x%x%x%x%[Selected%] |r',''):gsub('  |c.*$','')==name then out[#out+1]=r end
+ end
+ return out
+end
+-- The slot each row's gear would open, with the editor call spied (no editor opens).
+local function gearSlots(list)
+ local editor=Nexus.WishlistEditor
+ local original=editor.OpenForWishlist
+ local slots={}
+ editor.OpenForWishlist=function(w) slots[#slots+1]=tostring(w.slot) end
+ for _,r in ipairs(list)do r.gear:Click() end
+ editor.OpenForWishlist=original
+ return table.concat(slots,',')
+end
+local p=open()
+if p.clearRow and p.clearRow:IsVisible() then p.clearRow:Click();p=open() end
+local all=named(p,SAME)
+check(#all==4,'SETUP: unassigned, all four same-name Wishlists are offered: '..#all)
+all[1].nameButton:Click()
+check(saved(2) and saved(2).slot==101 and A.AssignedWishlist().name==SAME,'SETUP: the first one (slot 101) is selected')
+local function offered(label,want)
+ local before=H.Clone(saved(2))
+ local saves,spends=H.Count('save'),H.Count('orb-spend')
+ local q=open()
+ local same=named(q,SAME)
+ local total=#A.GetWishlistCandidates()
+ check(#same==3,label..': exactly three same-name alternatives are offered: '..#same)
+ check(#named(q,'empty2')==1,label..': the other Wishlist stays offered')
+ local equal=named(q,'Equal elsewhere')
+ check(#equal==1,label..': equal contents in another slot stay offered')
+ check(NexusActiveWishlistSelector.text:GetText():find(SAME,1,true),label..': the selector names the selection')
+ for _,r in ipairs(rows(q))do
+  check(not r.nameButton.text:GetText():find('[Selected]',1,true),label..': no offered row is marked as the selection')
+ end
+ check(#rows(q)==total-1,label..': exactly one candidate, the selection, is left out: '..#rows(q)..' of '..total)
+ check(q:GetHeight()==26+(total-1)*24+24+6,label..': the picker is sized for the offered rows only')
+ check(select(3,q.clearRow:GetPoint(1))==-24-(total-1)*24,label..': Unassign follows the last offered row')
+ close()
+ local slots=gearSlots(same)
+ print('SELECTED_OMITTED',label,'gear slots',slots)
+ check(slots==want,label..': each offered gear edits its own slot ('..want..'), got '..slots)
+ check(gearSlots(equal)=='106',label..': the equal-contents row edits its own slot 106')
+ check(T.Equal(before,saved(2)) and H.Count('save')==saves and H.Count('orb-spend')==spends and #H.actions==actions,
+  label..': opening, reading and the gears change no assignment, save, spend or action')
+ return same
+end
+local same=offered('slot 101 selected','102,103,104')
+same=offered('reopened','102,103,104')
+-- An offered alternative assigns exactly its own identity.
+p=open();same=named(p,SAME)
+same[2].nameButton:Click()
+check(not p:IsShown() and saved(2).slot==103 and saved(2).key==A.WishlistKey(variant(4)) and A.AssignedWishlist().name==SAME,
+ 'the second alternative assigns exactly slot 103')
+offered('slot 103 selected','101,102,104')
+-- Unassign: nothing is selected, so every same-name Wishlist is offered again.
+p=open();p.clearRow:Click()
+check(A.AssignedWishlist().state=='unassigned','Unassign clears the selection')
+p=open()
+check(#named(p,SAME)==4 and NexusActiveWishlistSelector.text:GetText():find('Select wishlist',1,true),
+ 'unassigned: all four same-name Wishlists are offered')
+close()
 check(#H.actions==actions and H.Count('orb-spend')==0,'no gameplay or service mutation in the whole test')
-print('PASS picker [Selected] marks exactly the resolved assignment; equal contents elsewhere, names, changed live rows and ambiguous identities mark nothing; checks='..checks)
+print('PASS picker singles out exactly the resolved assignment; equal contents elsewhere, names, changed live rows and ambiguous identities single out nothing; checks='..checks)
