@@ -165,7 +165,7 @@ H.Advance(.8,.05);before=observationCalls
 local actions=#H.actions;H.Notify();A.Poll();H.Advance(2,.05)
 expect(observationCalls==before,'equivalent notification and idle add zero page observations',true)
 expect(#H.actions==actions,'equivalent notification/idle send no gameplay action',true)
-for i=2,#calls do expect(calls[i].at-calls[i-1].at>=.10-1e-6,'accepted request spacing '..i,true)end
+for i=2,#calls do expect(calls[i].at-calls[i-1].at>=.5-1e-6,'accepted request spacing '..i,true)end
 -- The real row hover owns the tooltip. Reusing its pooled row must not
 -- leave the earlier tome's text visible, nor dismiss an unrelated tooltip.
 function GameTooltip:SetOwner(owner)self._testOwner=owner;self._testLines={}end

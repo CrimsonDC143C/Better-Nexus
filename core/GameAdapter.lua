@@ -4116,6 +4116,30 @@ function A.DisabledLevers()
     return out
 end
 
+-- Typed current member observation for a single lever. DisabledLevers omits
+-- unreadable answers, so an absent key is not proof of enabled. Returns
+-- "disabled" (any readable true), "enabled" (every member is boolean false),
+-- or "unknown" (no members, mixed/unreadable answers, or no API).
+function A.LeverMirrorKind(leverId)
+    local cat = A.Catalog()
+    local svc = PS()
+    if not cat or not svc then return "unknown" end
+    local lv = cat.levers[leverId]
+    if not lv then return "unknown" end
+    local yes, no, unreadable, members = 0, 0, 0, lv.members or {}
+    if #members == 0 then return "unknown" end
+    for i = 1, #members do
+        local value = SafeCall(svc.IsTomeEchoDisabled, members[i])
+        if value == true then yes = yes + 1
+        elseif value == false then no = no + 1
+        else unreadable = unreadable + 1 end
+    end
+    if unreadable > 0 then return "unknown" end
+    if yes > 0 then return "disabled" end
+    if no > 0 then return "enabled" end
+    return "unknown"
+end
+
 function A.ToggleLever(leverId, wantDisabled)
     if A.DIAGNOSTIC_PASSIVE then
         A.TomeObservationAttempt(leverId,wantDisabled,"passive",0,"not_evaluated")
@@ -4175,18 +4199,16 @@ end
 -- called from the poll: clear pending entries the client mirror has confirmed
 -- or that expired with no match. Confirmation is NOT an aura or spell buff
 -- check: it re-reads ProjectEbonholdOptionsService:IsTomeEchoDisabled for
--- each lever member (the same client catalog mirror DisabledLevers uses). If
--- the service accepts ToggleTomeEcho locally but never flips that mirror, the
--- entry expires and StepArm must be allowed to retry (pending clear alone is
--- the unlock; AutomationRuntime drops its visit latch when pending is gone
--- and the lever still needs work).
--- Short expiry (2.5s): successful mirrors usually match on the next poll
--- (age≈0); a dropped service call must not sit for tens of seconds before
--- retry. Expiry only counts once the session's discovery mirror is
--- authoritative (first SS-530 arrived) and clamps timestamps from a previous
--- boot (GetTime() restarts at reboot -- a persisted future timestamp would
+-- each lever member (the same client catalog mirror DisabledLevers uses).
+-- Expiry is not proof that resubmission is safe: ToggleTomeEcho is a
+-- non-idempotent toggle, so a late first effect can be undone by a second
+-- call. AutomationRuntime visit-latches an accepted request and will not
+-- send another in that direction during the same level-1 visit.
+-- Expiry only counts once the session's discovery mirror is authoritative
+-- (first SS-530 arrived) and clamps timestamps from a previous boot
+-- (GetTime() restarts at reboot -- a persisted future timestamp would
 -- otherwise never expire).
-local TOME_PENDING_EXPIRE = 3.5
+local TOME_PENDING_EXPIRE = 30
 local function ReconcileTomePending()
     local st = Store and Store.State()
     -- Every shaped row has this map, usually empty. With nothing pending the
@@ -4227,15 +4249,16 @@ local function ReconcileTomePending()
         end
         -- Only confirm from a readable boolean mirror. An unreadable member
         -- answer must not count as "already enabled" (cur stays false). Age
-        -- still expires the pending entry so StepArm can retry.
+        -- still expires the pending entry so the UI is not stuck; expiry
+        -- does not authorize a second ToggleTomeEcho.
         local confirmed = lv and readable and (cur == want)
         local expired = mirrorLive and (now - sentAt) > TOME_PENDING_EXPIRE
         if confirmed or not lv or expired then
             A.TomeObservationResolve(lever,want,confirmed and "mirror_match"
                 or (not lv and "catalog_missing" or "expired"),cur,rawKind,now-sentAt)
-            -- clear pending so StepArm may retry after expiry; a genuine
-            -- failure just leaves the echo in the pool (mild), and we no
-            -- longer disable unknown tomes (the old "no confirmation" spam)
+            -- clear pending; a genuine failure just leaves the echo in the
+            -- pool (mild), and we no longer disable unknown tomes (the old
+            -- "no confirmation" spam)
             map[lever] = nil
             leverProjectionRevision = leverProjectionRevision + 1
         end
