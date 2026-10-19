@@ -124,6 +124,28 @@ end
 function P.Channel(q,text,sender)
  q.H.Fire('CHAT_MSG_CHANNEL',text,sender,nil,'1. '..q.e.Nexus.Sync.ChannelName(),nil,nil,nil,nil,q.e.Nexus.Sync.ChannelName())
 end
+-- Establish the addon route through accepted discovery and a captured local
+-- immediate HELLO before the matching ACK. Exact sender keys stay isolated.
+function P.NegotiateAddon(peer,sender)
+ peer.negotiatedAddon=peer.negotiatedAddon or {}
+ if peer.negotiatedAddon[sender] then return end
+ local N,H=peer.e.Nexus,peer.H
+ local start=#H.sent
+ P.Channel(peer,'WLNP|'..sender..'|1.19.5',sender)
+ H.now=H.now+1.01
+ local ctl=N.ChatThrottleLib
+ ctl.bQueueing=false;ctl.avail=4000;ctl.LastAvailUpdate=H.now
+ N.SyncWire.PumpHandshake()
+ local submitted=false
+ for i=start+1,#H.sent do
+  local packet=H.sent[i]
+  if packet.route=='addon' and packet.kind=='WHISPER' and packet.target==sender
+   and packet.text=='HELLO1' then submitted=true end
+ end
+ assert(submitted,'fixture: actual current HELLO1 submitted for '..sender)
+ H.Fire('CHAT_MSG_ADDON',N.SyncWire.PREFIX,'ACK1','WHISPER',sender)
+ peer.negotiatedAddon[sender]=true
+end
 local function Deliver(p,q)
  while p.cursor<#p.H.sent do
   local packet=p.H.sent[p.cursor+1]

@@ -10,8 +10,9 @@
 --  5 an unreadable Perks table is not a cleared flag;
 --  6 a short loading screen answered before the watchdog resumes once;
 --  7 repeated world events coalesce: one record, paced rechecks, no resend;
---  8 an outside Select flag or a refused automatic Take reads as a wait;
---  9 passive display and report reads call nothing and change no authority;
+--  8 an old pending flag without a grant survives OFF/ON without a resend;
+--  9 an outside Select flag or a refused automatic Take reads as a wait;
+-- 10 passive display and report reads call nothing and change no authority;
 --    the heading names the wait, the button the selection, and the roll
 --    record and report keep the evidence.
 local R=dofile('tests/prototype/select_recovery_support.lua')
@@ -104,6 +105,26 @@ scenario('repeated world events coalesce on one unresolved Select',function(chec
  local sent=H.grantedRequests-before
  check(sent>=2 and sent<=8,'settled rechecks run, paced and coalesced: '..sent..' in 60 s')
  check(H.selectAttempts==1 and H.Count()==1 and H.Auto(),'nothing is resent and Auto stays selected')
+end)
+
+-- The private test.20261013-4ed7c43 support report showed this exact class
+-- of case: one crossed own Select, a pending client flag after 198 seconds,
+-- no matching granted copy, and ten read refresh requests. A timer or Auto
+-- OFF/ON is not a server receipt and must not submit a second selection.
+scenario('old pending flag without grant stays unresolved after Auto off and on',function(check)
+ local H,A=R.Boot();R.AutoSubmit(H);R.Travel(H);H.Advance(200)
+ local own=A.SelectRecoveryFacts().unresolved
+ check(own and own.phase=='latch' and own.baseline==0 and own.count==0
+  and own.entries==1 and own.rechecks>0,
+  'one crossed Select has no observed grant despite read refreshes')
+ check(H.perks.pendingSelectSpellId==R.X and A.InFlight()==true
+  and H.selectAttempts==1,'the still-set client flag holds the one submitted Select')
+ SlashCmdList.NEXUS('auto');H.Advance(.5)
+ SlashCmdList.NEXUS('auto');H.Advance(2)
+ check(H.Auto() and A.SelectRecoveryFacts().unresolved~=nil and A.InFlight()==true,
+  'OFF/ON clears the world pause but cannot prove or retire the adapter Select')
+ check(H.selectAttempts==1 and H.Count()==1,
+  'neither long elapsed time nor OFF/ON sends another resource action')
 end)
 
 scenario('an outside Select flag and a refused automatic Take read as waits',function(check)

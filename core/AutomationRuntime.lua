@@ -378,6 +378,7 @@ local refusedRerollSig = nil
 -- observed leave is not classified and revokes Auto.
 local actionHold = { externalUntil = 0, worldLeaving = false,
     worldSettleUntil = nil, worldSettle = 3, worldPending = nil,
+    worldNoticePending = nil,
     -- Rolling-policy selection and the open decision's recorder link. Kept on
     -- this table: the factory has no free local slot. `set` is false until the
     -- first read; `inForce` changes only while no action intent exists.
@@ -499,7 +500,7 @@ local function AutoAllowed()
     if actionHold.worldPending then
         -- Auto off and on ends this hold, but not the adapter's own
         -- unresolved Select: the text must not promise more than that. Its
-        -- exact grant is named as the end of this hold only for the Select
+        -- exact grant and pending-flag clearance end this hold only for the Select
         -- this hold tracks (its ordinal) while a grant can still settle it:
         -- after a same-Echo overlap ("ambiguous") or a run boundary ("run")
         -- none can. Read refreshes are named only while they could settle
@@ -515,12 +516,14 @@ local function AutoAllowed()
             .. (ownSelect and ((noGrant
                         and "a grant can no longer settle the Echo selection already sent; Auto off and on ends only this hold, not the wait for that selection"
                     or actionHold.worldPending.ordinal == ownSelect
-                        and "it ends with the exact grant of the Echo selection already sent"
+                        and "it ends only after the exact grant of the Echo selection already sent and the client's pending Select flag clears"
                     or "the Echo selection already sent still waits for its exact grant; Auto off and on ends only this hold")
                 .. ((wait == "grant" or wait == "latch")
                     and " (Nexus re-reads the granted Echoes while Auto is ON and nothing else pauses it; nothing is resent)"
                     or " (nothing is resent)"))
-                or "turn Auto off and on to continue")
+                or (actionHold.worldPending.rerollOrdinal
+                    and "Nexus checks the same run's server reroll count and new offer; if it cannot match this request, turn Auto off and on to continue"
+                    or "turn Auto off and on to continue"))
     end
     if GetTime() < actionHold.externalUntil then return false, "user acting" end
     if Adapter.RivalDetected() then return false, "Another Echo automation addon is loaded -- disable it" end
@@ -932,6 +935,7 @@ local function MissingEchoSummary(plan, owned, catalog)
 end
 
 local function StepArm(level, plan, owned, slots, disabledLevers, static, locked)
+    if Adapter.TomeObservationBegin then Adapter.TomeObservationBegin() end
     local settings = Store.Settings()
     local automationAllowed = AutoAllowed()
     -- (a) Loadout selection is owned by the stock Echo Journal. Each saved
@@ -945,59 +949,97 @@ local function StepArm(level, plan, owned, slots, disabledLevers, static, locked
             SetStatus("Choose or create a wishlist to begin your first run")
         end
     end
-    -- (b) disable off-wishlist conformant tome levers (one send per 0.5s)
-    if automationAllowed and settings.autoDisable and plan and not plan.advisorOnly
-        and Adapter.DiscoverySynced()
-        and not (Adapter.TomeMutationPaused
-            and Adapter.TomeMutationPaused()) then
-        if (GetTime() - lastLeverSendAt) <= 0.5 then
-            RequestStepAt(lastLeverSendAt + 0.5)
-            MeasurePhase("overlayRender", RenderIdlePanel,
-                plan, owned, slots, static.catalog, static, locked)
-            return
-        end
-        local optOut = settings.leverOptOut or {}
-        for _, lever in ipairs(plan.leverPlan.disable) do
-            if not optOut[lever] and not disabledLevers[lever]
-                and not leversDoneThisVisit[lever] then
-                if not Adapter.LeverHasKnownMember(lever) then
-                    -- unknown tome: its echo isn't in your pool, so there is
-                    -- nothing to disable. Skip (marking done so we never
-                    -- retry it -- this was the "no confirmation" spam).
-                    leversDoneThisVisit[lever] = true
-                else
-                    local ok = Adapter.ToggleLever(lever, true)
-                    if ok then
-                        leversDoneThisVisit[lever] = true
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("disabling off-wishlist tome lever " .. lever)
-                        break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
-                    end
-                end
-            end
-        end
-        -- (c) RE-ENABLE any confirmed-disabled lever the wishlist now
-        -- needs (a wishlist switch after earlier disables would otherwise
-        -- silently make convergence impossible)
-        if (GetTime() - lastLeverSendAt) > 0.5 then
-            for _, lever in ipairs(plan.leverPlan.keep) do
-                if disabledLevers[lever] == "confirmed" then
-                    local ok = Adapter.ToggleLever(lever, false)
-                    if ok then
-                        lastLeverSendAt = GetTime()
-                        RequestStepAt(lastLeverSendAt + 0.5)
-                        SetStatus("re-enabling wishlist tome lever " .. lever)
-                        break
-                    else
-                        RequestStepAt(GetTime() + 0.5)
+    -- (b) Re-enable needed tomes before pruning the off-wishlist pool. A
+    -- changed wishlist must not wait behind every unwanted disable while the
+    -- player can leave level 1. Both directions still share one 0.5s send gate.
+    -- Visit bits represent only evaluations this short-circuit actually makes:
+    -- Auto=1, permission=2, plan=4, not-advisor=8, discovery=16,
+    -- not-paused=32, spacing=64. An unvisited bit is unknown, not false.
+    local visited,passed,gate,allowed = 1,0,"auto",automationAllowed
+    if allowed then
+        passed=1;visited=visited+2;gate="permission";allowed=settings.autoDisable
+        if allowed then
+            passed=passed+2;visited=visited+4;gate="plan";allowed=plan
+            if allowed then
+                passed=passed+4;visited=visited+8;gate="advisor";allowed=not plan.advisorOnly
+                if allowed then
+                    passed=passed+8;visited=visited+16;gate="discovery";allowed=Adapter.DiscoverySynced()
+                    if allowed then
+                        passed=passed+16;visited=visited+32;gate="pause"
+                        allowed=not (Adapter.TomeMutationPaused and Adapter.TomeMutationPaused())
+                        if allowed then passed=passed+32;gate="eligible" end
                     end
                 end
             end
         end
     end
+    if allowed then
+        visited=visited+64
+        if (GetTime() - lastLeverSendAt) <= 0.5 then
+            if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,"spacing",#plan.leverPlan.keep,#plan.leverPlan.disable) end
+            if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
+            RequestStepAt(lastLeverSendAt + 0.5)
+            MeasurePhase("overlayRender", RenderIdlePanel,
+                plan, owned, slots, static.catalog, static, locked)
+            return
+        end
+        passed=passed+64
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,#plan.leverPlan.keep,#plan.leverPlan.disable) end
+        for _, lever in ipairs(plan.leverPlan.keep) do
+            if disabledLevers[lever] == "confirmed" then
+                local ok = Adapter.ToggleLever(lever, false)
+                if ok then
+                    -- This accepted re-enable invalidates an earlier disable
+                    -- attempt. Adapter pending/mirror checks still own whether
+                    -- another direction can be sent; this is not confirmation.
+                    leversDoneThisVisit[lever] = nil
+                    lastLeverSendAt = GetTime()
+                    RequestStepAt(lastLeverSendAt + 0.5)
+                    SetStatus("re-enabling wishlist tome lever " .. lever)
+                    break
+                else
+                    RequestStepAt(GetTime() + 0.5)
+                end
+            end
+        end
+        -- (c) Disable off-wishlist conformant controls only if this beat did
+        -- not restore a needed control. Keep the existing unknown/opt-out and
+        -- once-per-visit refusal protections for the remaining disables.
+        if (GetTime() - lastLeverSendAt) > 0.5 then
+            local optOut = settings.leverOptOut or {}
+            for _, lever in ipairs(plan.leverPlan.disable) do
+                if optOut[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"opt_out") end
+                elseif disabledLevers[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"disabled") end
+                elseif leversDoneThisVisit[lever] then
+                    if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"visit_done") end
+                else
+                    -- Unknown or unreadable discovery is not an attempted
+                    -- disable. Leave it eligible for a later normal step; do
+                    -- not consume its visit marker or schedule a retry.
+                    if Adapter.LeverHasKnownMember(lever) then
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"candidate") end
+                        local ok = Adapter.ToggleLever(lever, true)
+                        if ok then
+                            leversDoneThisVisit[lever] = true
+                            lastLeverSendAt = GetTime()
+                            RequestStepAt(lastLeverSendAt + 0.5)
+                            SetStatus("disabling off-wishlist tome lever " .. lever)
+                            break
+                        else
+                            RequestStepAt(GetTime() + 0.5)
+                        end
+                    else
+                        if Adapter.TomeObservationDecision then Adapter.TomeObservationDecision(lever,"no_known_member") end
+                    end
+                end
+            end
+        end
+    else
+        if Adapter.TomeObservationGate then Adapter.TomeObservationGate(level,visited,passed,gate,0,0) end
+    end
+    if Adapter.TomeObservationEnd then Adapter.TomeObservationEnd() end
     MeasurePhase("overlayRender", RenderIdlePanel,
         plan, owned, slots, static.catalog, static, locked)
 end
@@ -1776,7 +1818,32 @@ local function StaticContext(probe, forceCompile)
         wishlistKey=wishlistKey,targets=targets,plan=plan,
     }
     staticInvalidated = false
-    CaptureFallbackSignature()
+    -- This capture reconciles the Echo mirrors, so it can move a generation
+    -- after ConsumeDirty keyed this poll's projections, and it makes that
+    -- generation the fallback baseline: no later fallback would repair it.
+    -- A projection whose generation moved here is read again in this step,
+    -- not served under the earlier key (its value predates the change), so
+    -- what the step renders and caches matches the revisions now current.
+    -- The keys stay as ConsumeDirty set them: a disagreeing stub can cause an
+    -- extra read, never a stale one. Inline and allocation-free: New is at
+    -- the 200-local limit.
+    if CaptureFallbackSignature() and projectionRevisions.valid then
+        local s, k = fallbackSignature, projectionRevisions
+        if (type(s.slots) == "number" and s.slots ~= k.slots)
+            or (type(s.activeSlot) == "number"
+                and s.activeSlot ~= k.activeSlot) then
+            projectionCache.slots.set, projectionCache.slots.value = false, nil
+        end
+        if type(s.granted) == "number" and s.granted ~= k.granted then
+            projectionCache.owned.set, projectionCache.owned.value = false, nil
+        end
+        if type(s.locked) == "number" and s.locked ~= k.locked then
+            projectionCache.locked.set, projectionCache.locked.value = false, nil
+        end
+        if type(s.discovery) == "number" and s.discovery ~= k.discovery then
+            projectionCache.levers.set, projectionCache.levers.value = false, nil
+        end
+    end
     return staticCache
 end
 
@@ -1923,7 +1990,15 @@ local function TryAutoLock(owned, catalog, slots, wishlist, targets, wishlistKey
     local ownedBySpell = {}
     for id, n in pairs((owned and owned.bySpell) or {}) do ownedBySpell[id] = n end
     local activeIdx = slots and tonumber(slots.activeSlot)
-    local activeRow = activeIdx and activeIdx > 0 and slots.bySlot and slots.bySlot[activeIdx]
+    -- Only a whole native active index in 1..the declared Saved Build range
+    -- (the bound the adapter's association writers use) names a Saved Build.
+    -- A higher index is a native Wishlist: its row lists desired Echoes, not
+    -- owned ones, so it is neither ownership evidence below nor a context for
+    -- the destructive unlock, also while Nexus keeps a Saved Build selected.
+    local declaredSavedBuilds = slots and (tonumber(slots.maxSlots) or 5) or 5
+    local activeRow = activeIdx and activeIdx >= 1 and activeIdx <= declaredSavedBuilds
+        and activeIdx == math.floor(activeIdx)
+        and slots.bySlot and slots.bySlot[activeIdx]
     trace[#trace + 1] = string.format("active loadout: slot=%s echoes=%s",
         tostring(activeIdx),
         tostring(activeRow and type(activeRow.echoes) == "table" and #activeRow.echoes or "n/a"))
@@ -2740,6 +2815,16 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         paused = autoEnabled and (not okAuto and tostring(autoWhy)
             or selectWait) or nil,
         version = Nexus.VERSION,
+        -- The compact charges row of the manual (Auto OFF) recommendation:
+        -- a display copy of the charges this decision already read above
+        -- (no second read; Adapter.Charges reconciles a ledger). Unreported
+        -- counts stay unknown (arrived=false) and untrusted ones estimated
+        -- (trustworthy=false). With Auto ON Nexus spends them itself and the
+        -- panel is unchanged; renders without a board carry none.
+        charges = (not autoEnabled and type(charges) == "table") and {
+            banish = charges.banish, reroll = charges.reroll, freeze = charges.freeze,
+            trustworthy = charges.trustworthy, arrived = charges.arrived,
+        } or nil,
     }
     panelModel.effective = {}
     panelModel.effective.state, panelModel.effective.reason, panelModel.effective.hold =
@@ -2877,6 +2962,8 @@ local function StepRun(level, plan, slots, owned, flags, disabledLevers, static,
         local ok = Adapter.Reroll()
         if ok then
             lastDecision = immutable
+            intent.rerollOrdinal = Adapter.RerollOrdinal
+                and Adapter.RerollOrdinal() or nil
             MarkIntentSubmitted(intent)
             lastBoardForRerollWatch = board
             if immutable.reason == "bracket fishing: reroll filler guarantee" then
@@ -3180,6 +3267,7 @@ local function ResetRunBoundary()
         actionHold.rolling.decisionId, actionHold.rolling.sig = nil, nil
     end
     actionHold.worldPending = nil -- the dead run's pending action ends here
+    actionHold.worldNoticePending = nil
     lastDecision = nil
     lastLoggedSig = nil
     lastBoardForRerollWatch = nil
@@ -3350,6 +3438,20 @@ local function DispatchLevelStep(level, plan, slots, owned, flags,
             FinishActionIntent("confirmed", "grant_observed", false)
         end
     end
+    -- Only a single crossed, own reroll can use the adapter's same-run
+    -- server-counter settlement. The ordinal is local provenance, never a
+    -- request ID. Ambiguous or external requests keep the world hold.
+    held = actionHold.worldPending
+    if held and held.rerollOnly and held.rerollOrdinal
+        and Adapter.RerollOutcome
+        and Adapter.RerollOutcome(held.rerollOrdinal) == "proven" then
+        actionHold.worldPending = nil
+        if actionIntent and actionIntent.crossedWorld
+            and actionIntent.action.type == "reroll"
+            and actionIntent.rerollOrdinal == held.rerollOrdinal then
+            FinishActionIntent("confirmed", "reroll_run_data_observed", false)
+        end
+    end
     if level == 1 then
         StepArm(level, plan, owned, slots, disabledLevers, static, locked)
         if plan.advisorOnly then
@@ -3470,11 +3572,11 @@ end
 local function JournalData()
     local catalog = Adapter.Catalog()
     local wishlist = Adapter.Wishlist()
-    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), Store.Settings())
+    local settings = Store.Settings()
+    local plan = Strategy.Compile(catalog, WishlistWithLockTargets(wishlist, catalog), settings)
     local owned = Adapter.Owned()
     local slots = Adapter.Slots()
     local flags = EffectiveFlags()
-    local disabledLevers = Adapter.DisabledLevers()
     local sections = {}
 
     if not wishlist then
@@ -3518,15 +3620,82 @@ local function JournalData()
         sections[#sections + 1] = { title = "Extra copies compared with the plan", lines = fillerLines }
     end
 
-    local leverLines = {}
-    for _, lever in ipairs(plan.leverPlan.disable) do
-        leverLines[#leverLines + 1] = string.format("lever %d: disable%s", lever,
-            disabledLevers[lever] and " (done)" or "")
+    local tomeHold = actionHold.worldLeaving and "world transition in progress"
+        or (actionHold.worldSettleUntil and GetTime() < actionHold.worldSettleUntil
+            and "character data is settling after a world transition") or nil
+    local tomes = Adapter.TomeStateObservation(tomeHold)
+    local coverage = {
+        string.format("Known client catalog: %d tomes; coverage of the whole game is unverified.", #tomes.rows),
+        "Client mirror observed when this page was refreshed; server freshness and current server state are unverified.",
+        "Missing Tomes means undiscovered Wishlist requirements; disabled tomes and pending requests are separate below.",
+    }
+    if not tomes.catalogAvailable then coverage[#coverage + 1] = "Catalog unavailable; no complete tome list can be shown." end
+    if tomes.stale then
+        coverage[#coverage + 1] = "State may be stale: " .. table.concat(tomes.reasons, "; ") .. "."
+    end
+    sections[#sections + 1] = { title="Tome state coverage", lines=coverage }
+    -- Each state section has readable lines and the same entries as
+    -- structured tomeRows for the Journal's icon rows. The request title must
+    -- not begin with "Pending": the Journal reads every such title as the
+    -- Wishlist's missing-family list, and a second one makes progress unknown.
+    -- Enabled tomes, usually the longest list, come last.
+    local disabled = { title="Disabled tomes (client mirror)", lines={}, tomeRows={} }
+    local requests = { title="Tome requests awaiting confirmation", lines={}, tomeRows={} }
+    local unknown = { title="Unknown or mixed tome state", lines={}, tomeRows={} }
+    local enabled = { title="Enabled tomes (client mirror)", lines={}, tomeRows={} }
+    local plans = {}
+    if wishlist then
+        -- Keep also holds the player's opt-outs, not only Wishlist families.
+        local optOut = type(settings) == "table" and type(settings.leverOptOut) == "table"
+            and settings.leverOptOut or {}
+        for _, lever in ipairs(plan.leverPlan.disable) do plans[lever] = "plan: disable" end
+        for _, lever in ipairs(plan.leverPlan.keep) do
+            plans[lever] = optOut[lever] and "plan: keep enabled (opted out of automatic disabling)"
+                or "plan: keep enabled (a Wishlist family uses it)"
+        end
     end
     for _, lever in ipairs(plan.leverPlan.skippedNonConformant) do
-        leverLines[#leverLines + 1] = string.format("lever %d: skipped (non-conformant data)", lever)
+        plans[lever] = "automatic toggle skipped: unsupported availability data"
     end
-    sections[#sections + 1] = { title = "Tome levers", lines = leverLines }
+    for _, row in ipairs(tomes.rows) do
+        local status, target
+        if row.observed == "disabled" then status, target = "Disabled", disabled
+        elseif row.observed == "enabled" and row.known == true then status, target = "Enabled", enabled
+        elseif row.observed == "mixed" then status, target = "Mixed", unknown
+        elseif row.known == false and row.observed == "enabled" then status, target = "Undiscovered", unknown
+        else status, target = "Unknown", unknown end
+        local reason = row.reason
+        if row.known == false then
+            reason = (reason and (reason .. "; ") or "") .. "undiscovered in the client mirror"
+        elseif row.known == nil then
+            reason = (reason and (reason .. "; ") or "") .. "discovery state unavailable"
+        end
+        if tomes.stale then status = status .. " (stale)" end
+        -- One entry per tome. Its status is always the observation; a
+        -- pending request lists the same entry again, direction in pending.
+        local detail = {
+            name=row.name, icon=row.icon, iconSource=row.iconSource, leverId=row.lever,
+            observed=row.observed, pending=row.pending, known=row.known,
+            reason=reason, echoNames=row.echoNames, status=status,
+            plan=plans[row.lever], stale=tomes.stale,
+        }
+        local tail = (reason and ("; " .. reason) or "") .. (detail.plan and ("; " .. detail.plan) or "")
+        target.tomeRows[#target.tomeRows + 1] = detail
+        target.lines[#target.lines + 1] = row.name .. ": " .. status .. tail
+        if row.pending then
+            requests.tomeRows[#requests.tomeRows + 1] = detail
+            requests.lines[#requests.lines + 1] = row.name .. ": "
+                .. (row.pending == "unknown" and "request direction unknown" or (row.pending .. " requested"))
+                .. "; awaiting confirmation; last observed: " .. status .. tail
+        end
+    end
+    for _, section in ipairs({disabled, requests, unknown, enabled}) do
+        if #section.lines == 0 then
+            section.lines[1] = section == requests and "No pending requests recorded for tomes in the known catalog."
+                or (tomes.stale and "None observed; state may be stale." or "None observed in this client catalog.")
+        end
+        sections[#sections + 1] = section
+    end
     local est = "no estimate (advisor mode)"
     if wishlist then
         -- The estimate counts known deficits only; no future offer is assumed.
@@ -3792,6 +3961,28 @@ actionHold.SelectPoll = function()
     end
 end
 
+-- Called after the poll's full step (or when no step is due). A same-poll
+-- grant or run boundary must get the first chance to end the world hold.
+actionHold.ShowWorldNotice = function(now)
+    if not actionHold.worldNoticePending then return end
+    local ok, err = pcall(function()
+        if not actionHold.worldPending then
+            actionHold.worldNoticePending = nil
+            return
+        end
+        if not autoEnabled or actionHold.worldLeaving
+            or (actionHold.worldSettleUntil
+                and now < actionHold.worldSettleUntil)
+            or not Adapter.Ready() then return end
+        actionHold.worldNoticePending = nil
+        -- The gate's wording distinguishes an unresolved Echo selection,
+        -- whose own wait may outlive the world hold and an Auto toggle.
+        local _, reason = AutoAllowed()
+        Print("Auto is ON but paused: " .. reason)
+    end)
+    if not ok then RecordError("AutomationRuntime.WorldNotice", err) end
+end
+
 -- Effective: memory only, for the HUD, M.EffectiveState and the support
 -- report. The Auto selection is autoEnabled; this says what it is doing now
 -- and why. It reads no client data, no clock, requests nothing and calls no
@@ -3897,44 +4088,69 @@ end
     function M.AutoEnabled() return autoEnabled end
     function M.AutoAllowed() return AutoAllowed() end
     function M.ToggleAuto()
-        if not autoEnabled and Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary() then
+        local function CommitToggle()
+            autoEnabled = not autoEnabled
+            if Nexus.RollRecorder then
+                Nexus.RollRecorder.Boundary("auto", autoEnabled and "on" or "off")
+            end
+            if autoEnabled then
+                -- Authorization changed, represented data did not. Coalesce one
+                -- bounded decision evaluation without invalidating static state.
+                authorizationStepPending = true
+                -- New player input ends the hold of an action that a loading
+                -- screen left unresolved. Its result stays unknown: it is
+                -- recorded as uncertain, never as confirmed.
+                actionHold.worldPending = nil
+                actionHold.worldNoticePending = nil
+                if actionIntent and actionIntent.crossedWorld then
+                    FinishActionIntent("uncertain", "player_resumed", false)
+                end
+            else
+                authorizationStepPending = false
+                actionHold.worldNoticePending = nil
+                if actionIntent and actionIntent.state == "prepared" then
+                    local revokedDeadline = actionIntent.readyAt
+                    FinishActionIntent("superseded", "authorization_changed", false)
+                    if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
+                        nextStepAt = nil
+                        ScheduleKnownDeadlines()
+                    end
+                end
+            end
+            return autoEnabled
+        end
+        local warning = Nexus.OverwriteWarning
+        if autoEnabled then
+            if warning and warning.CancelAuto then warning.CancelAuto(M) end
+            return CommitToggle()
+        end
+        if Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary() then
             SetStatus("Ordinary Automation stays OFF while the Orb operation is active or unresolved.")
             return false
         end
-        autoEnabled = not autoEnabled
-        if Nexus.RollRecorder then
-            Nexus.RollRecorder.Boundary("auto", autoEnabled and "on" or "off")
+        if not warning or type(warning.RequestAuto) ~= "function" then
+            SetStatus("Auto stays OFF: its overwrite warning is unavailable.")
+            return false
         end
-        if autoEnabled then
-            -- Authorization changed, represented data did not. Coalesce one
-            -- bounded decision evaluation without invalidating static state.
-            authorizationStepPending = true
-            -- New player input ends the hold of an action that a loading
-            -- screen left unresolved. Its result stays unknown: it is
-            -- recorded as uncertain, never as confirmed.
-            actionHold.worldPending = nil
-            if actionIntent and actionIntent.crossedWorld then
-                FinishActionIntent("uncertain", "player_resumed", false)
-            end
-        else
-            authorizationStepPending = false
-            if actionIntent and actionIntent.state == "prepared" then
-                local revokedDeadline = actionIntent.readyAt
-                FinishActionIntent("superseded", "authorization_changed", false)
-                if revokedDeadline ~= nil and nextStepAt == revokedDeadline then
-                    nextStepAt = nil
-                    ScheduleKnownDeadlines()
-                end
-            end
-        end
-        return autoEnabled
+        return warning.RequestAuto(M, function()
+            -- Approval belongs to this still-OFF request. Recheck interruption
+            -- and Orb exclusion rather than authorizing a stale UI callback.
+            if autoEnabled or (Nexus.OrbRuntime and Nexus.OrbRuntime.BlocksOrdinary()) then return false end
+            local enabled = CommitToggle()
+            if Nexus.Panel and Nexus.Panel.SetAuto then Nexus.Panel.SetAuto(enabled) end
+            return enabled
+        end)
     end
     -- Called by Main before the lifecycle sees the event. Returns "held",
     -- "resuming", "revoked" or "off" (Auto was not selected).
     function M.OnWorldEvent(event)
+        if Nexus.OverwriteWarning and Nexus.OverwriteWarning.CancelAuto then
+            Nexus.OverwriteWarning.CancelAuto(M)
+        end
         if event == "PLAYER_LEAVING_WORLD" then
             actionHold.worldLeaving = true
             actionHold.worldSettleUntil = nil
+            actionHold.worldNoticePending = nil
             -- A prepared (unsubmitted) action is dropped, not kept for after
             -- the loading screen. A sent action without a result is marked:
             -- nothing is resent, and it stays unresolved (ResolveActionIntent,
@@ -4000,18 +4216,26 @@ end
                     and only.source ~= "latch"
                     and (not crossed or (actionIntent.action.type == "take"
                         and tonumber(actionIntent.action.spellId) == only.spellId))
+                local byReroll = crossed and actionIntent.action.type == "reroll"
+                    and actionIntent.rerollOrdinal
+                    and (#pendingNow == 0 or (only and only.kind == "reroll"
+                        and only.source == "own"))
                 -- `ordinal`: the adapter's own Select keeps its local
                 -- provenance, so only that request's settlement ends the hold.
                 if not held then
                     held = { kinds = {}, label = "",
                         spellId = byGrant and only.spellId or nil,
                         baseline = byGrant and only.baseline or nil,
-                        ordinal = byGrant and only.ordinal or nil }
+                        ordinal = byGrant and only.ordinal or nil,
+                        rerollOrdinal = byReroll and actionIntent.rerollOrdinal or nil }
                     actionHold.worldPending = held
                 elseif held.spellId and #pendingNow > 0
                     and not (byGrant and only.spellId == held.spellId
                         and only.ordinal == held.ordinal) then
                     held.spellId, held.baseline, held.ordinal = nil, nil, nil
+                end
+                if held.rerollOrdinal and not byReroll then
+                    held.rerollOrdinal = nil
                 end
                 -- Requests per kind, for a truthful reason. A crossed Take is
                 -- the adapter's own tracked Select ("own"/"grant") when one is
@@ -4038,6 +4262,11 @@ end
                 for kind, n in pairs(counts) do
                     if n > (held.kinds[kind] or 0) then held.kinds[kind] = n end
                 end
+                held.rerollOnly = held.rerollOrdinal ~= nil
+                    and held.kinds.reroll == 1
+                for kind in pairs(held.kinds) do
+                    if kind ~= "reroll" then held.rerollOnly = false end
+                end
                 local names, labels = {}, {}
                 for kind in pairs(held.kinds) do names[#names + 1] = kind end
                 table.sort(names)
@@ -4063,9 +4292,11 @@ end
         if closesTransition then
             actionHold.worldSettleUntil = GetTime() + actionHold.worldSettle
             if not autoEnabled then return "off" end
+            actionHold.worldNoticePending = actionHold.worldPending ~= nil or nil
             RequestStepAt(actionHold.worldSettleUntil)
             return "resuming"
         end
+        actionHold.worldNoticePending = nil
         -- Logout, or an entry this session cannot classify (no leave seen).
         if not autoEnabled then return "off" end
         M.ToggleAuto()
@@ -4316,6 +4547,7 @@ end
                 or authorizationStepPending or isDirty or autoLockDirty
                 or deadlineDue or autoLockDeadlineDue or retrying) then
                 recomputeStats.skipped = recomputeStats.skipped + 1
+                actionHold.ShowWorldNotice(now)
                 return
             end
             fallbackStatic = fallbackRepair
@@ -4326,6 +4558,7 @@ end
             or isDirty or autoLockDirty or deadlineDue
             or autoLockDeadlineDue or fallbackRepair or retrying) then
             recomputeStats.skipped = recomputeStats.skipped + 1
+            actionHold.ShowWorldNotice(now)
             return
         end
         if deadlineDue then nextStepAt = nil end
@@ -4385,6 +4618,7 @@ end
             recomputeStats.stepRetries = recomputeStats.stepRetries + 1
         end
         local stepSucceeded = RunFullStep(trigger, "Main.Step", work)
+        actionHold.ShowWorldNotice(now)
         if not stepSucceeded then
             if retrying then
                 recomputeStats.stepRetryExhausted =

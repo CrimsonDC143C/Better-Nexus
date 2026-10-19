@@ -231,14 +231,21 @@ local function DB()
     -- Serving readiness can change without replacing the database or bundle
     -- (notably the startup seal). Do not retain its earlier read-only verdict.
     local catalog = Nexus and Nexus.BuildCatalog
-    local status = catalog and type(catalog.Status) == "function"
-        and catalog.Status() or nil
-    dbPolicyReadOnly = type(status) == "table" and status.readOnly == true
+    local readOnly, state
+    if catalog and type(catalog.ServingPolicy) == "function" then
+        readOnly, state = catalog.ServingPolicy()
+    else
+        local status = catalog and type(catalog.Status) == "function"
+            and catalog.Status() or nil
+        readOnly = type(status) == "table" and status.readOnly == true
+        state = type(status) == "table" and status.state or nil
+    end
+    dbPolicyReadOnly = readOnly == true
     if dbPolicyReadOnly then
         -- A root the catalog refuses (a catalog schema this build does not
         -- know, an invalid bundle) shows nothing. The copy is made once, when
         -- the catalog admits the root.
-        local admitted = status.state == "ROOT_ADMITTED"
+        local admitted = state == "ROOT_ADMITTED"
         if transientDbOwner ~= NexusDB
             or (admitted and dbBinding.projectedFor ~= NexusDB) then
             transientDbOwner = NexusDB
@@ -3514,6 +3521,18 @@ function DPS.GetCharacterBest(category, playerName, expectedOwnerKey,
     else
         row = playerName and FindCharacterRow(rows, name)
             or rows[CurrentCharacterKey(name)] or rows[PlayerKey(name)]
+        -- A normalized-realm shim may have appeared after this character's
+        -- native record was captured. Only the actual current native owner
+        -- may fill a missing default lookup; preserve both stored keys.
+        if not playerName and not row
+            and type(Identity.NativeChannelSender) == "function" then
+            local nativeSender = Identity.NativeChannelSender(name)
+            local nativeOwner = Identity.CanonicalOwnerFromTransport(nativeSender)
+            local nativeRow = nativeOwner and rows[nativeOwner] or nil
+            if nativeOwner and DPS.VerifiedOwnerKey(nativeRow) == nativeOwner then
+                row = nativeRow
+            end
+        end
     end
     if not row or (tonumber(row.dps) or 0) <= 0
         or not DPS.IsDurationEligible(category, row.duration) then return nil end
@@ -4105,6 +4124,32 @@ function DPS.LocalOwnsDpsBucket(bucket)
     row = store.lk and (store.lk[playerKey] or store.lk[legacyKey])
     if type(row) == "table"
         and DPS.VerifiedOwnerKey(row) == playerKey
+        and (tonumber(row.dps) or 0) > 0
+        and DPS.IsDurationEligible("lk", row.duration)
+        and DpsBucket("lk", me) == bucket then
+        return true
+    end
+    -- A compatibility shim may normalize the realm differently from the
+    -- game's native channel. Keep the current player's verified native row
+    -- from being suppressed by an equivalent peer claim, just as the default
+    -- current-character getter can read that exact row. This is a direct map
+    -- lookup; it does not rekey, promote, or traverse saved DPS records.
+    local nativeSender = type(Identity.NativeChannelSender) == "function"
+        and Identity.NativeChannelSender(me) or nil
+    local nativeOwner = nativeSender
+        and Identity.CanonicalOwnerFromTransport(nativeSender) or nil
+    if not nativeOwner or nativeOwner == playerKey then return false end
+    row = store.dummy and store.dummy[nativeOwner]
+    if type(row) == "table"
+        and DPS.VerifiedOwnerKey(row) == nativeOwner
+        and (tonumber(row.dps) or 0) > 0
+        and DPS.IsDurationEligible("dummy", row.duration)
+        and DpsBucket("dummy", me) == bucket then
+        return true
+    end
+    row = store.lk and store.lk[nativeOwner]
+    if type(row) == "table"
+        and DPS.VerifiedOwnerKey(row) == nativeOwner
         and (tonumber(row.dps) or 0) > 0
         and DPS.IsDurationEligible("lk", row.duration)
         and DpsBucket("lk", me) == bucket then

@@ -13,6 +13,163 @@ Nexus.GameAdapter = {}
 local A = Nexus.GameAdapter
 A.DIAGNOSTIC_PASSIVE = false
 
+-- Tome observations are session-only. No Store/history owner is used here.
+-- The working arm summary and 16 ring rows are allocated once, not per beat.
+-- Repeated multi-lever scans commit only if their final primitive facts change.
+do
+    local fields = {"level","visited","passed","gate","keep","disable",
+        "checked","noKnown","optOut","disabled","done","lastLever","knownKind","known","knownMember","assignmentSequence"}
+    local eventFields = {"seq","kind","code","lever","want","member","rawKind","cur","age","visited","passed"}
+    local codes = {not_observed=true,auto=true,permission=true,plan=true,advisor=true,
+        discovery=true,pause=true,spacing=true,eligible=true,opt_out=true,disabled=true,
+        visit_done=true,candidate=true,no_known_member=true,accepted=true,refused=true,
+        passive=true,["no api"]=true,["unknown lever"]=true,["non-conformant lever"]=true,
+        ["not level 1"]=true,pending=true,already=true,mirror_match=true,
+        catalog_missing=true,expired=true,first=true,loadout=true,unknown=true}
+    local kinds = {boolean=true,["nil"]=true,number=true,string=true,table=true,
+        ["function"]=true,userdata=true,thread=true,mixed=true,not_evaluated=true,unknown=true}
+    local f = {schema=1,cap=16,revision=0,sequence=0,count=0,head=1,dropped=0,
+        armObserved=false,active=false,attempts=0,accepted=0,associations=0,
+        arm={},work={},assignment={observed=false},transaction={observed=false},
+        tracked={observed=false},resolution={observed=false},pause={observed=false},events={}}
+    for i=1,16 do f.events[i]={} end
+    local function id(v)
+        return type(v)=="number" and v==math.floor(v) and v>=0 and v<=2147483647 and v or 0
+    end
+    local function code(v) return type(v)=="string" and codes[v] and v or "unknown" end
+    local function kind(v) return type(v)=="string" and kinds[v] and v or "unknown" end
+    local function boolean(v) if type(v)=="boolean" then return v end end
+    local function emit(event,reason,lever,want,member,rawKind,cur,age,visited,passed)
+        local index
+        if f.count<16 then index=((f.head+f.count-1)%16)+1;f.count=f.count+1
+        else index=f.head;f.head=(f.head%16)+1;f.dropped=f.dropped+1 end
+        f.sequence=f.sequence+1;f.revision=f.revision+1
+        local row=f.events[index]
+        row.seq=f.sequence;row.kind=event;row.code=code(reason);row.lever=id(lever)
+        row.want=boolean(want);row.member=id(member)
+        row.rawKind=kind(rawKind);row.cur=boolean(cur)
+        row.age=type(age)=="number" and age>=0 and age<8640000 and age or nil
+        row.visited=id(visited);row.passed=id(passed)
+    end
+    function A.TomeObservationBegin()
+        f.armObserved=true;f.active=true
+        local w=f.work
+        w.level=0;w.visited=0;w.passed=0;w.gate="not_observed";w.keep=0;w.disable=0
+        w.checked=0;w.noKnown=0;w.optOut=0;w.disabled=0;w.done=0;w.lastLever=0
+        w.knownKind="not_evaluated";w.known=nil;w.knownMember=0
+        w.assignmentSequence=f.associations
+    end
+    function A.TomeObservationGate(level,visited,passed,reason,keep,disable)
+        if not f.active then return end
+        local w=f.work;w.level=id(level);w.visited=id(visited);w.passed=id(passed)
+        w.gate=code(reason);w.keep=id(keep);w.disable=id(disable)
+    end
+    function A.TomeObservationDecision(lever,reason)
+        if not f.active then return end
+        local w=f.work;w.checked=w.checked+1;w.lastLever=id(lever)
+        if reason=="opt_out" then w.optOut=w.optOut+1
+        elseif reason=="disabled" then w.disabled=w.disabled+1
+        elseif reason=="visit_done" then w.done=w.done+1
+        elseif reason=="no_known_member" then w.noKnown=w.noKnown+1 end
+    end
+    function A.TomeObservationKnown(lever,rawKind,known,member)
+        if not f.active then return end
+        f.work.lastLever=id(lever);f.work.knownKind=kind(rawKind);f.work.known=known==true
+        f.work.knownMember=known==true and id(member) or 0
+    end
+    function A.TomeObservationEnd()
+        if not f.active then return end
+        f.active=false
+        local changed=false
+        for _,key in ipairs(fields) do if f.arm[key]~=f.work[key] then changed=true;break end end
+        if changed then
+            for _,key in ipairs(fields) do f.arm[key]=f.work[key] end
+            emit("arm",f.arm.gate,f.arm.lastLever,nil,f.arm.knownMember,f.arm.knownKind,nil,nil,f.arm.visited,f.arm.passed)
+        end
+    end
+    function A.TomeObservationAssignment(which,loadout,wishlist)
+        f.associations=f.associations+1
+        local a=f.assignment;a.observed=true;a.kind=code(which);a.loadout=id(loadout)
+        a.wishlist=id(wishlist);a.sequence=f.associations
+        emit("assignment",a.kind,a.wishlist,nil,a.loadout,"not_evaluated")
+    end
+    function A.TomeObservationAttempt(lever,want,reason,member,rawKind,cur)
+        f.attempts=f.attempts+1
+        local t=f.transaction;t.observed=true;t.lever=id(lever);t.want=want==true
+        t.admission=code(reason);t.member=id(member);t.rawKind=kind(rawKind)
+        t.cur=boolean(cur)
+        if reason=="accepted" then
+            f.accepted=f.accepted+1
+            local tracked=f.tracked
+            tracked.observed=true;tracked.lever=t.lever;tracked.want=t.want
+            tracked.member=t.member;tracked.rawKind=t.rawKind
+            tracked.pending=true;tracked.acceptedOrdinal=f.accepted
+        end
+        emit("attempt",t.admission,t.lever,t.want,t.member,t.rawKind,t.cur)
+    end
+    function A.TomeObservationResolve(lever,want,outcome,cur,rawKind,age)
+        local r=f.resolution;r.observed=true;r.lever=id(lever);r.want=want==true
+        r.outcome=code(outcome);r.cur=boolean(cur);r.rawKind=kind(rawKind)
+        r.age=type(age)=="number" and age>=0 and age<8640000 and age or nil
+        if f.tracked.observed and f.tracked.lever==r.lever and f.tracked.want==r.want then
+            f.tracked.pending=false
+        end
+        emit("resolution",r.outcome,r.lever,r.want,0,r.rawKind,r.cur,r.age)
+    end
+    function A.TomeObservationPause(source,remaining)
+        -- Copy only the result of a normal guard read. Reports never probe bags,
+        -- popups or clocks, and no item names, links or popup text are retained.
+        local p=f.pause;p.observed=true
+        p.source=(source=="bag" or source=="popup" or source=="settling"
+            or source=="clear") and source or "unknown"
+        if source=="bag" or source=="popup" then p.lastPositive=source end
+        p.remainingSeconds=type(remaining)=="number" and remaining>=0
+            and remaining<8640000 and math.ceil(remaining) or nil
+    end
+    function A.TomeObservationFacts()
+        -- Clone only the bounded, already-observed primitives. No facade,
+        -- Store, service, clock, callback, poll or repair is entered.
+        local out={schema=1,cap=16,revision=f.revision,retained=f.count,dropped=f.dropped,
+            armObserved=f.armObserved,armInProgress=f.active,attempts=f.attempts,
+            accepted=f.accepted,arm={},assignment={},transaction={},tracked={},resolution={},pause={},events={}}
+        for _,key in ipairs(fields) do out.arm[key]=f.arm[key] end
+        for _,name in ipairs({"assignment","transaction","tracked","resolution","pause"}) do
+            for key,value in pairs(f[name]) do out[name][key]=value end
+        end
+        for i=1,f.count do
+            local row=f.events[((f.head+i-2)%16)+1];local copy={}
+            for _,key in ipairs(eventFields) do copy[key]=row[key] end
+            out.events[i]=copy
+        end
+        return out
+    end
+end
+
+-- Explicit opt-in, memory-only detail. The ordinary path reads no detail clock
+-- and creates no scope/closure; Performance owns bounded nesting when enabled.
+local function AssignmentMeasure(name, callback, ...)
+    local performance = Nexus.Performance
+    if performance and performance.DetailAssignmentEnabled
+        and performance.DetailAssignmentEnabled() then
+        return performance.MeasureAssignmentDetail(name, callback, ...)
+    end
+    return callback(...)
+end
+local function AssignmentCount(name, amount)
+    local performance = Nexus.Performance
+    if performance and performance.DetailAssignmentEnabled
+        and performance.DetailAssignmentEnabled() then
+        performance.NoteAssignmentCount(name, amount)
+    end
+end
+local function AssignmentBranch(name)
+    local performance = Nexus.Performance
+    if performance and performance.DetailAssignmentEnabled
+        and performance.DetailAssignmentEnabled() then
+        performance.NoteAssignmentBranch(name)
+    end
+end
+
 -- Forward-declare every closure-captured local (Lua 5.1 scoping rule).
 local Store
 
@@ -59,9 +216,15 @@ local catalogCache, playerMaskCache
 local catalogObservedRef, catalogObservedHint
 local catalogPublishedCanonical, catalogPublishedHash
 local catalogFailureMessage
+-- NX-01 scheduled verifier: the one pending pass (nil when none), the pass
+-- serial, the reused spell-ID stamps that reject a row seen twice in one pass,
+-- and its functions (Drop, Start). One main-chunk local: this chunk is close
+-- to the Lua limit of 200 active locals. See the verifier block below.
+local catalogVerify = {pass=nil, serial=0, seen={}}
 local catalogStatus = {
     checks=0, fastHits=0, equivalent=0, rebuilds=0,
     failures=0, familyBlocks=0, scheduled=false,
+    intervalVerified=0, intervalFallbacks=0, intervalAbandoned=0,
 }
 local boardDirty, slotsDirty, dataDirty = true, true, true
 local staticDirty = false
@@ -111,7 +274,9 @@ local lockedProjectionRevision = 0
 local leverProjectionRevision = 0
 local wishlistProjectionRevision = 0
 local wishlistEvidenceObservations = {}
-local ledger = { banish = nil, reroll = nil, freeze = nil, runDataRef = nil, banishThisPush = false }
+local ledger = { banish = nil, reroll = nil, freeze = nil, runDataRef = nil,
+    banishThisPush = false,
+    rerollRecovery = { ordinal = 0, record = nil, externalEpoch = 0 } }
 local selfFreezeSig, selfFreezeIndex
 local lastBuildOpAt = -10
 local ownedSyncedFlag, ownedRequestAt, ownedRetries = false, nil, 0
@@ -155,6 +320,12 @@ local echoNotificationPending = false
 local echoSnapshot = nil
 local echoActiveSlot = 0
 local echoVerifiedAt = nil
+-- Display-only reuse (NX-02; see A.EchoActiveSlotGeneration). The record of
+-- the last clean scan a display read made: {at, pe, svc, guid}, or nil. Every
+-- scan clears it first; only a clean display scan sets it again. The window is
+-- this fixed constant; no caller value changes it.
+local ECHO_DISPLAY_REUSE_SECONDS = 1
+local echoDisplayReuse = nil
 -- The Echo fields the strict check rejected at the last scan: field -> reason.
 -- Current state only (never the last accepted one); see CaptureEchoSnapshot.
 local echoRejected = {}
@@ -199,6 +370,9 @@ local function MarkWishlistProjectionDirty()
     staticDirty = true
     wishlistEvidenceObservations = {}
     MarkWishlistPresentationDirty()
+    -- Marks a held-open Journal page only (no read); the UI may be absent.
+    local journal = Nexus.JournalTab
+    if journal and type(journal.Invalidate) == "function" then pcall(journal.Invalidate) end
 end
 
 local CORRECTED_CLASS_MASKS = {
@@ -241,7 +415,9 @@ end
 
 ------------------------------------------------------------------------
 -- Revision-aware catalog. Ordinary reads are O(1); the keyed noncritical
--- scheduler performs the slower canonical source check for in-place edits.
+-- scheduler starts a resumable verifier for in-place edits (NX-01). Every
+-- explicit check and every change, error, reference/hint, class or no-catalog
+-- case uses the complete atomic source check.
 ------------------------------------------------------------------------
 
 local CATALOG_CHECK_INTERVAL = 30
@@ -274,7 +450,18 @@ local function CaptureCatalogSource()
     return pe.PerkDatabase, SourceVersionHint(pe)
 end
 
+-- An atomic check or a recorded failure is newer than any pending verifier
+-- pass. The pass is dropped so it can never record over the newer state.
+function catalogVerify.Drop()
+    if catalogVerify.pass then
+        catalogVerify.pass = nil
+        catalogStatus.intervalAbandoned = catalogStatus.intervalAbandoned + 1
+    end
+end
+
 local function RecordCatalogFailure(message, familyBlock)
+    catalogVerify.Drop()
+    catalogStatus.lastCheckKind = "atomic"
     message = CatalogText(message)
     catalogStatus.failures = catalogStatus.failures + 1
     if familyBlock then catalogStatus.familyBlocks = catalogStatus.familyBlocks + 1 end
@@ -290,6 +477,8 @@ local function RecordCatalogFailure(message, familyBlock)
 end
 
 local function InspectCatalogSource(database, sourceHint)
+    catalogVerify.Drop()
+    catalogStatus.lastCheckKind = "atomic"
     catalogStatus.checks = catalogStatus.checks + 1
     catalogObservedRef, catalogObservedHint = database, sourceHint
 
@@ -387,6 +576,137 @@ function A.CheckCatalogSource()
     return completed, catalogStatus.lastResult, result ~= before
 end
 
+------------------------------------------------------------------------
+-- NX-01 scheduled verifier. The 30-second task no longer materializes and
+-- hashes the whole source in one frame while it is unchanged. It starts a
+-- pass that reads at most CATALOG_VERIFY_ENTRIES source entries per frame and
+-- compares each catalog row with the published row (name and lever tome name
+-- resolved again, so a name the client answers late is still retried). A
+-- completed pass needs the same row count, no row seen twice and the same
+-- source reference, hint, class and published catalog. The verifier never builds or
+-- publishes a catalog and never authorizes an action. Any difference, row
+-- error, next() error, reference/hint change, class change, missing catalog,
+-- prior failure/block/wait or a pass older than one interval runs the
+-- complete atomic A.CheckCatalogSource() in that frame instead (O(N) there,
+-- as before). An atomic check or a recorded failure drops the pass.
+--
+-- A completed pass is INTERVAL evidence, not an atomic snapshot: each row was
+-- equal when its frame read it. It records lastResult "unchanged" with
+-- lastCheckKind "interval" and adds to equivalent and intervalVerified. It
+-- runs only from a clean atomic "unchanged"/"rebuilt" state with no error, so
+-- it cannot clear a failure or a family block, and it does not change the
+-- published catalog, hash, observedHash, sourceVersion or revisions.
+------------------------------------------------------------------------
+
+do
+    local CATALOG_VERIFY_KEY = "catalog.source-verify"
+    local CATALOG_VERIFY_ENTRIES = 32
+
+    local function SpellName(spellId) return GetSpellInfo(spellId) end
+
+    local function Clean()
+        return catalogCache ~= nil and catalogStatus.lastError == nil
+            and (catalogStatus.lastResult == "unchanged"
+                or catalogStatus.lastResult == "rebuilt")
+    end
+
+    -- The class the published catalog was built for is still the known class.
+    local function SameClass()
+        local ok, _, classToken = pcall(UnitClass, "player")
+        local mask = ok and CORRECTED_CLASS_MASKS[classToken or ""] or nil
+        return mask ~= nil and catalogCache ~= nil and mask == catalogCache.playerMask
+    end
+
+    -- The source reference, hint and published catalog of the pass are current.
+    local function Current(pass)
+        local ok, database, sourceHint = pcall(CaptureCatalogSource)
+        return ok and database == pass.database and sourceHint == pass.hint
+            and catalogCache == pass.catalog
+    end
+
+    local function Fallback()
+        catalogVerify.pass = nil
+        catalogStatus.intervalFallbacks = catalogStatus.intervalFallbacks + 1
+        A.CheckCatalogSource()
+    end
+
+    local function Finish(pass)
+        if catalogVerify.pass ~= pass then return end
+        if pass.rows ~= pass.catalog.rowCount or not Clean()
+            or not Current(pass) or not SameClass() then
+            return Fallback()
+        end
+        catalogVerify.pass = nil
+        catalogStatus.checks = catalogStatus.checks + 1
+        catalogStatus.equivalent = catalogStatus.equivalent + 1
+        catalogStatus.intervalVerified = catalogStatus.intervalVerified + 1
+        catalogStatus.lastResult = "unchanged"
+        catalogStatus.lastCheckKind = "interval"
+    end
+
+    local function Step()
+        local pass = catalogVerify.pass
+        if not pass then return end
+        local source = Nexus and Nexus.EchoCatalogSource
+        if not (source and type(source.VerifyRow) == "function")
+            or not Current(pass) then
+            return Fallback()
+        end
+        local database, catalog, serial = pass.database, pass.catalog, pass.serial
+        local seen, cursor = catalogVerify.seen, pass.cursor
+        for _ = 1, CATALOG_VERIFY_ENTRIES do
+            -- The cursor is held across frames. A foreign edit can make next()
+            -- raise or skip/repeat keys: raise, repeat and a wrong row count
+            -- fall back to the atomic check.
+            local ok, spellId, row = pcall(next, database, cursor)
+            if not ok then return Fallback() end
+            if spellId == nil then return Finish(pass) end
+            cursor = spellId
+            local same = source.VerifyRow(catalog, spellId, row, SpellName)
+            if catalogVerify.pass ~= pass then return end
+            if same ~= "skip" then
+                if same ~= true or seen[spellId] == serial
+                    or pass.rows >= catalog.rowCount then
+                    return Fallback()
+                end
+                seen[spellId] = serial
+                pass.rows = pass.rows + 1
+            end
+        end
+        pass.cursor = cursor
+        local scheduler = Nexus and Nexus.Scheduler
+        local scheduled = scheduler and type(scheduler.After) == "function"
+            and scheduler.After(CATALOG_VERIFY_KEY, 0, Step)
+        if scheduled ~= true then return Fallback() end
+    end
+
+    -- The 30-second scheduled task.
+    function catalogVerify.Start()
+        if catalogVerify.pass then
+            -- A pass that outlived one interval is not resumed.
+            return Fallback()
+        end
+        local scheduler = Nexus and Nexus.Scheduler
+        local source = Nexus and Nexus.EchoCatalogSource
+        if not (scheduler and type(scheduler.After) == "function"
+            and source and type(source.VerifyRow) == "function")
+            or not Clean() or not SameClass() then
+            return A.CheckCatalogSource()
+        end
+        local ok, database, sourceHint = pcall(CaptureCatalogSource)
+        if not ok or type(database) ~= "table" or database ~= catalogObservedRef
+            or sourceHint ~= catalogObservedHint then
+            return A.CheckCatalogSource()
+        end
+        catalogVerify.serial = catalogVerify.serial + 1
+        catalogVerify.pass = {
+            database=database, hint=sourceHint, catalog=catalogCache,
+            serial=catalogVerify.serial, rows=0, cursor=nil,
+        }
+        return Step()
+    end
+end
+
 function A.CatalogStatus()
     return {
         checks=catalogStatus.checks,
@@ -402,6 +722,15 @@ function A.CatalogStatus()
         observedHash=catalogStatus.observedHash,
         publishedHash=catalogPublishedHash,
         rows=catalogStatus.rows or 0,
+        -- Additive NX-01 diagnostics. lastCheckKind is "atomic" (complete
+        -- one-frame source check or recorded failure) or "interval" (a
+        -- completed scheduled verifier pass); interval is never fresh
+        -- authority. intervalVerified is the interval part of equivalent.
+        lastCheckKind=catalogStatus.lastCheckKind,
+        intervalVerified=catalogStatus.intervalVerified,
+        intervalFallbacks=catalogStatus.intervalFallbacks,
+        intervalAbandoned=catalogStatus.intervalAbandoned,
+        intervalPending=catalogVerify.pass ~= nil,
     }
 end
 
@@ -1034,6 +1363,10 @@ function A.RunBoundaryReset()
         end
     end
     awaitingGrant = nil
+    -- A run boundary voids the previous run's reroll evidence, never proves
+    -- that a request sent in that run succeeded.
+    ledger.rerollRecovery.record = nil
+    ledger.rerollRecovery.externalEpoch = 0
     ownedProjectionRevision = ownedProjectionRevision + 1
     pendingOwnPick, pendingOwnBaseline = nil, nil
     ownedGeneration = ownedGeneration + 1
@@ -1956,7 +2289,7 @@ function A.ResolveWishlistEvidence(candidate)
     return ResolveWishlistEvidence(candidate)
 end
 
-local function LiveWishlistCandidates(slots)
+local function ReadLiveWishlistCandidates(slots)
     slots = slots or A.Slots()
     if not slots then return {} end
     local maxSlots = slots.maxSlots or 5
@@ -2031,7 +2364,14 @@ local function LiveWishlistCandidates(slots)
         end
     end
     table.sort(out, function(a, b) return (tonumber(a.slot) or 0) < (tonumber(b.slot) or 0) end)
+    AssignmentCount("candidate_rows", #out)
     return out
+end
+
+local function LiveWishlistCandidates(slots)
+    AssignmentCount("candidate_builds", 1)
+    local candidates = AssignmentMeasure("assignment.candidates", ReadLiveWishlistCandidates, slots)
+    return candidates
 end
 
 -- One assignment read builds the candidate list at most once. AssignedWishlist
@@ -2057,9 +2397,12 @@ local function ContextCandidates(context, slots)
     return list
 end
 
-function A.GetWishlistCandidates()
-    local slots = A.Slots()
-    local out = LiveWishlistCandidates(slots)
+-- Discovery retains the complete live + saved merge. Its immutable live list
+-- belongs to this exact read/projection; stamps/replacements are made only in a
+-- detached result. No previous prepare, character, or missing read is cached.
+local function ReadWishlistCandidates(slots, context)
+    local live = ContextCandidates(context, slots)
+    local out = WishlistRoles.CopyDesign(live)
 
     -- Slot mirrors are eventually consistent. When the complete designed list
     -- is absent or partial, also expose immutable identities the user already
@@ -2083,7 +2426,11 @@ function A.GetWishlistCandidates()
         if candidate and candidate.designTargets~=nil and candidate.assignmentId then
             if seenAssignments[candidate.assignmentId] then return end
             seenAssignments[candidate.assignmentId]=true
-            candidate=WishlistRoles.ResolveSaved(saved,LiveWishlistCandidates(slots))
+            -- A missing initial projection is not an empty authoritative list.
+            -- Preserve the existing per-design retry: a later native read may
+            -- supply the mirror before this synchronous discovery completes.
+            local current = slots ~= nil and live or LiveWishlistCandidates(slots)
+            candidate=WishlistRoles.ResolveSaved(saved,current)
             candidate=ResolveWishlistEvidence(candidate,slots)
             Stamp(candidate)
             for index,live in ipairs(out) do
@@ -2128,8 +2475,22 @@ function A.GetWishlistCandidates()
     table.sort(out, function(a, b)
         return (tonumber(a.slot) or 0) < (tonumber(b.slot) or 0)
     end)
+    AssignmentCount("discovery_rows", #out)
     return out
 end
+
+local function PublicWishlistCandidates()
+    AssignmentBranch("discovery")
+    local slots = A.Slots()
+    return AssignmentMeasure("assignment.discovery", ReadWishlistCandidates,
+        slots, CandidateContext(slots))
+end
+function A.GetWishlistCandidates()
+    return AssignmentMeasure("assignment.read", PublicWishlistCandidates)
+end
+-- Respect an explicitly injected public discovery facade as before. Only the
+-- established implementation can consume the private projection/context seam.
+WishlistRoles.DiscoveryGetter = A.GetWishlistCandidates
 
 -- Revalidate the actual selected server identity before recording a role
 -- choice. Neither a duplicate name nor a recycled numeric slot is proof.
@@ -2254,7 +2615,15 @@ local function ResolveAssociation(loadoutSlot, slots, context)
     -- here: Store.State() is a detached copy, and a write to it is lost.
     if type(saved) == "number" or type(saved) == "string" then
         local wanted = tonumber(saved)
-        for _, c in ipairs(A.GetWishlistCandidates()) do
+        local candidates
+        if slots ~= nil and context and context.slots == slots
+            and A.GetWishlistCandidates == WishlistRoles.DiscoveryGetter then
+            candidates = AssignmentMeasure("assignment.discovery",
+                ReadWishlistCandidates, slots, context)
+        else
+            candidates = A.GetWishlistCandidates()
+        end
+        for _, c in ipairs(candidates) do
             if tonumber(c.slot) == wanted then
                 return c
             end
@@ -2445,6 +2814,7 @@ function A.SetFirstRunWishlist(wishlistSlot, candidate)
         WishlistRoles.ReplaceFirstRun(state,record)
     end) then return false, "store unavailable" end
     MarkWishlistProjectionDirty()
+    A.TomeObservationAssignment("first",0,wishlistSlot)
     return true
 end
 
@@ -2494,6 +2864,49 @@ end
 -- Read-only; the editor asks it before it uploads for that destination.
 function A.IsLoadoutPopulated(loadoutSlot)
     return IsPopulatedLoadout(loadoutSlot)
+end
+
+-- The Saved Build Nexus targets is kept apart from the native active slot.
+-- The native active slot can be a Wishlist, numbered above the declared Saved
+-- Build range. Switching the native Wishlist chooses no other Saved Build, so
+-- while a Wishlist is natively active Nexus keeps the Saved Build it last read
+-- as the native active slot. Session memory only, never saved, so a reload
+-- starts with none. It is set only by reading a populated Saved Build as the
+-- native active slot; reading slot 0 or an empty or missing Saved Build as
+-- active drops it, and so does a kept Saved Build that is no longer populated
+-- or no longer declared. An unreadable active slot changes nothing.
+-- A.Slots().activeSlot stays the native fact. (Fields of WishlistRoles: this
+-- file is near the main chunk's local-variable limit.)
+WishlistRoles.keptSavedBuild = nil
+
+function WishlistRoles.ObserveSavedBuild(slots)
+    if type(slots) ~= "table" or slots.activeKnown == false then return end
+    local active = tonumber(slots.activeSlot) or 0
+    if active > (tonumber(slots.maxSlots) or 5) then return end
+    WishlistRoles.keptSavedBuild = active >= 1 and IsPopulatedLoadout(active, slots)
+        and active or nil
+end
+
+-- The Saved Build slot Nexus targets for `slots`, and whether it is the kept
+-- one: the native active slot when it is in 1..maxSlots; while a Wishlist above
+-- that range is natively active, the kept Saved Build if it is still populated
+-- and declared; otherwise nil (slot 0, unknown, or nothing kept).
+function WishlistRoles.SelectedSavedBuild(slots)
+    if type(slots) ~= "table" or slots.activeKnown == false then return nil, false end
+    local active = tonumber(slots.activeSlot) or 0
+    local maxSlots = tonumber(slots.maxSlots) or 5
+    if active >= 1 and active <= maxSlots then return active, false end
+    if active <= maxSlots or active >= math.huge then return nil, false end
+    local kept = WishlistRoles.keptSavedBuild
+    if kept and kept <= maxSlots and IsPopulatedLoadout(kept, slots) then
+        return kept, true
+    end
+    WishlistRoles.keptSavedBuild = nil
+    return nil, false
+end
+
+function A.SelectedSavedBuild(slots)
+    return WishlistRoles.SelectedSavedBuild(slots or A.Slots())
 end
 
 -- Read-only association diagnosis for presentation code. Unlike
@@ -2740,6 +3153,7 @@ function A.SetLoadoutWishlist(loadoutSlot, wishlistSlot, candidate)
         WishlistRoles.Wrote(nil, "first")
     end) then return false, "store unavailable" end
     MarkWishlistProjectionDirty()
+    A.TomeObservationAssignment("loadout",loadoutSlot,wishlistSlot)
     return true
 end
 
@@ -3158,6 +3572,9 @@ function A.Wishlist(slots, context)
     end
     local activeSlot = slots and tonumber(slots.activeSlot) or 0
     local maxSlots = slots and (tonumber(slots.maxSlots) or 5) or 5
+    -- While a Wishlist is natively active, the kept Saved Build is the target.
+    local selected, kept = WishlistRoles.SelectedSavedBuild(slots)
+    if kept then activeSlot = selected end
     if activeSlot < 1 or activeSlot > maxSlots then
         local starter = ResolveFirstRunWishlist(slots, context)
         if starter then
@@ -3204,8 +3621,9 @@ function A.Wishlist(slots, context)
     end
     -- Promote one explicitly selected zero-slot target when the server later
     -- publishes a real populated active loadout. This is the only automatic
-    -- hand-off; ambiguous stored associations remain unresolved.
-    local starter = IsPopulatedLoadout(activeSlot, slots)
+    -- hand-off; ambiguous stored associations remain unresolved. A kept Saved
+    -- Build is not natively active, so it never triggers this write.
+    local starter = not kept and IsPopulatedLoadout(activeSlot, slots)
         and ResolveFirstRunWishlist(slots, context) or nil
     if starter then
         local record = StoredWishlistRecord(starter)
@@ -3255,32 +3673,7 @@ end
 -- would compare the whole row with the read snapshot on every call. The
 -- candidate list is built at most once for this read's projection: the
 -- association lookup and the mirror check below share it (CandidateContext).
-function A.AssignedWishlist()
-    local slots=A.Slots()
-    local context=CandidateContext(slots)
-    local state=Store and Store.State and Store.State() or {}
-    local active=slots and tonumber(slots.activeSlot)
-    local saved=active and active>0 and state.loadoutWishlists and state.loadoutWishlists[active]
-    -- The first-run plan is the target only where no Saved Build is in use. An
-    -- empty Saved Build with no association of its own is unassigned: it has
-    -- no saved assignment, and the first-run plan is not one.
-    local emptySlot = active and active>0 and active<=(tonumber(slots.maxSlots) or 5)
-        and IsKnownEmptyLoadout(active,slots)
-    if not saved and not emptySlot then saved=state.firstRunWishlist end
-    local w=A.Wishlist(slots,context)
-    local result={state="unassigned",activeSlot=active,owner=Store and Store.CurrentOwnerKey and Store.CurrentOwnerKey(),
-        note=A.WishlistNote(),name=type(saved)=="table" and saved.name or nil}
-    if not slots or slots.activeKnown==false then
-        result.state=(state.firstRunWishlist or (type(state.loadoutWishlists)=="table" and next(state.loadoutWishlists)))
-            and "restoring" or "loading"
-        return result
-    end
-    if not w then
-        if result.note=="Restoring assigned Wishlist..." then result.state="restoring"
-        elseif saved then result.state="unavailable"
-        elseif emptySlot then result.emptySlot=true end
-        return result
-    end
+function WishlistRoles.ProjectAssignment(result, w, state, saved, slots, context)
     result.state="ready";result.name=w.name;result.wishlist=w;result.entries={}
     result.key=A.WishlistKey(w.entries)
     result.identity=type(saved)=="table" and (saved.assignmentId or saved.key) or result.key
@@ -3304,7 +3697,8 @@ function A.AssignedWishlist()
         if w.designAmbiguous then
             result.state="unavailable"
             result.note="More than one saved locked-target design exists for this Wishlist's rolled contents. Nexus does not choose one: assign or restore the intended plan, or set its locked targets in the Wishlist Editor."
-            return result
+            AssignmentCount("projection_rows", #result.entries)
+    return result
         end
         targets=state.lockDesignTargetsBySlot and state.lockDesignTargetsBySlot[result.key]
     end
@@ -3313,7 +3707,8 @@ function A.AssignedWishlist()
         local rows=A._assignmentTargetModel.TargetMapEntries(targets,A.Catalog())
         if not rows then
             result.state="unavailable";result.note="Assigned locked targets are unavailable. Open the Wishlist Editor to inspect them."
-            return result
+            AssignmentCount("projection_rows", #result.entries)
+    return result
         end
         for _,e in ipairs(rows) do
             local extra=e.copies-(permanent[e.spellId] or 0)
@@ -3329,7 +3724,51 @@ function A.AssignedWishlist()
         for _,candidate in ipairs(ContextCandidates(context,slots)) do if candidate.key==saved.key then found=true;break end end
         if not found then result.mirrorNote="Assigned Wishlist is absent from the current server list. Its saved plan is retained. Refresh the list or reassign deliberately." end
     end
+    AssignmentCount("projection_rows", #result.entries)
     return result
+end
+
+local function ReadAssignedWishlist()
+    local slots=A.Slots()
+    local context=CandidateContext(slots)
+    local state=Store and Store.State and AssignmentMeasure("assignment.state", Store.State) or {}
+    local active=slots and tonumber(slots.activeSlot)
+    -- The Saved Build Nexus selects, as A.Wishlist resolves it. result.activeSlot
+    -- below stays the native fact (an Orb run binding compares it).
+    local selected,kept=WishlistRoles.SelectedSavedBuild(slots)
+    local target=kept and selected or active
+    local saved=target and target>0 and state.loadoutWishlists and state.loadoutWishlists[target]
+    -- The first-run plan is the target only where no Saved Build is in use. An
+    -- empty Saved Build with no association of its own is unassigned: it has
+    -- no saved assignment, and the first-run plan is not one.
+    local emptySlot = target and target>0 and target<=(tonumber(slots.maxSlots) or 5)
+        and IsKnownEmptyLoadout(target,slots)
+    if not saved and not emptySlot then saved=state.firstRunWishlist end
+    if not slots or slots.activeKnown==false then AssignmentBranch("loading")
+    elseif type(saved)=="number" or type(saved)=="string" then AssignmentBranch("legacy")
+    elseif saved and saved==state.firstRunWishlist then AssignmentBranch("first_run")
+    elseif type(saved)=="table" then AssignmentBranch("table")
+    else AssignmentBranch("unassigned") end
+    local w=AssignmentMeasure("assignment.wishlist", A.Wishlist, slots, context)
+    local result={state="unassigned",activeSlot=active,owner=Store and Store.CurrentOwnerKey and Store.CurrentOwnerKey(),
+        note=A.WishlistNote(),name=type(saved)=="table" and saved.name or nil}
+    if not slots or slots.activeKnown==false then
+        result.state=(state.firstRunWishlist or (type(state.loadoutWishlists)=="table" and next(state.loadoutWishlists)))
+            and "restoring" or "loading"
+        return result
+    end
+    if not w then
+        if result.note=="Restoring assigned Wishlist..." then result.state="restoring"
+        elseif saved then result.state="unavailable"
+        elseif emptySlot then result.emptySlot=true end
+        return result
+    end
+    return AssignmentMeasure("assignment.projection", WishlistRoles.ProjectAssignment,
+        result, w, state, saved, slots, context)
+end
+
+function A.AssignedWishlist()
+    return AssignmentMeasure("assignment.read", ReadAssignedWishlist)
 end
 
 function A.GetLoadoutCandidates()
@@ -3360,7 +3799,8 @@ end
 -- Build slots (nil-until-540; sparse; verified-field + parse heuristics)
 ------------------------------------------------------------------------
 
-function A.Slots()
+local function ReadSlots()
+    AssignmentCount("slots_reads", 1)
     projectionStatus.slots.calls = projectionStatus.slots.calls + 1
     local svc = PS()
     local raw = svc and SafeCall(svc.GetServerBuildSlots)
@@ -3368,6 +3808,9 @@ function A.Slots()
     local maxSlots = tonumber(svc and SafeCall(svc.GetServerMaxSlots)) or 5
     local bySlot = {}
     local anyFalse, designedTrue = false, false
+    -- One fresh catalog acquisition per projection (NX-03), taken at the
+    -- first projected Echo. A nil result is not kept past this projection.
+    local cat, catRead = nil, false
     for slot, s in pairs(raw) do
         if type(s) == "table" then
             projectionStatus.slots.slots = projectionStatus.slots.slots + 1
@@ -3396,11 +3839,12 @@ function A.Slots()
                         roleSourceValid = false
                     end
                     if id then
+                        if not catRead then cat, catRead = A.Catalog(), true end
                         echoes[#echoes + 1] = {
                             spellId = id, stacks = tonumber(e.stacks) or 1,
                             quality = tonumber(e.quality),
                             locked = LockState(e.locked),
-                            family = FamilyOf(id),
+                            family = cat and cat.familyOf[id] or ("s" .. tostring(id)),
                         }
                     end
                 end
@@ -3426,7 +3870,14 @@ function A.Slots()
     local rawActive = svc and SafeCall(svc.GetServerActiveSlot)
     local active = tonumber(rawActive)
     local activeKnown=active~=nil and active>=0 and active==math.floor(active)
-    return { bySlot = bySlot, activeSlot = activeKnown and active or 0, activeKnown=activeKnown,maxSlots = maxSlots }
+    local result = { bySlot = bySlot, activeSlot = activeKnown and active or 0, activeKnown=activeKnown,maxSlots = maxSlots }
+    -- Every read observes the native active slot (see keptSavedBuild).
+    WishlistRoles.ObserveSavedBuild(result)
+    return result
+end
+
+function A.Slots()
+    return AssignmentMeasure("assignment.slots", ReadSlots)
 end
 
 -- NOTE: this is a READ (asks the server to re-send slot data), so it has
@@ -3468,10 +3919,16 @@ function A.LeverHasKnownMember(leverId)
     if not cat or not svc then return false end
     local lv = cat.levers[leverId]
     if not lv then return false end
-    local discovered = SafeCall(svc.GetDiscoveredEchoes) or {}
+    local discovered = SafeCall(svc.GetDiscoveredEchoes)
+    local rawKind = type(discovered)
+    discovered = discovered or {}
     for i = 1, #lv.members do
-        if discovered[lv.members[i]] ~= nil then return true end
+        if discovered[lv.members[i]] ~= nil then
+            A.TomeObservationKnown(leverId,rawKind,true,lv.members[i])
+            return true
+        end
     end
+    A.TomeObservationKnown(leverId,rawKind,false)
     return false
 end
 
@@ -3508,6 +3965,115 @@ function A.UnknownTomesForEchoes(echoes)
     return out
 end
 
+-- On-demand UI observation only. Pool math deliberately keeps DisabledLevers'
+-- separate pending semantics. No requests, reconciliation or retained state:
+-- these are client mirror answers, never proof of fresh server state.
+-- The Journal supplies its existing world-transition hold, without changing it.
+function A.TomeStateObservation(unavailableReason)
+    -- Icons are the GetSpellInfo texture of a spell ID, which the Journal's
+    -- family rows already rely on. GetSpellTexture is not used: what it does
+    -- with a bare number is not established for this 3.3.5 client.
+    local function SpellIcon(id)
+        if type(GetSpellInfo) ~= "function" then return nil end
+        local ok, _, _, texture = pcall(GetSpellInfo, id)
+        if ok and ((type(texture) == "string" and texture ~= "") or type(texture) == "number") then
+            return texture
+        end
+    end
+    local cat = A.Catalog()
+    local svc = PS()
+    local ready = A.Ready() and not unavailableReason
+    local reasons = {}
+    if not cat then reasons[#reasons + 1] = "catalog is unavailable" end
+    if unavailableReason then reasons[#reasons + 1] = unavailableReason
+    elseif not ready then reasons[#reasons + 1] = "character data is not ready" end
+    if not A.DiscoverySynced() then
+        reasons[#reasons + 1] = "discovery mirror is unsynced"
+    end
+    if echoNotificationPending then
+        reasons[#reasons + 1] = "client mirror update is awaiting reconciliation"
+    end
+    local catalogState = A.CatalogStatus().lastResult
+    if catalogState == "failed" or catalogState == "family-blocked"
+        or catalogState == "waiting-for-class" then
+        reasons[#reasons + 1] = "catalog may be stale (" .. catalogState .. ")"
+    end
+    local discovered = ready and svc and SafeCall(svc.GetDiscoveredEchoes)
+    if ready and type(discovered) ~= "table" then
+        reasons[#reasons + 1] = "discovery state is unavailable"
+    end
+    local state = Store and Store.State()
+    local pending = state and state.tomeTogglePending or {}
+    local out = { rows={}, stale=#reasons > 0, reasons=reasons,
+        catalogAvailable=cat ~= nil, serverFreshness="unverified" }
+    for lever, lv in pairs(cat and cat.levers or {}) do
+        local names, seenNames = {}, {}
+        local yes, no, unreadable, known, invalidDiscovery = 0, 0, 0, false, false
+        local members = lv.members or {}
+        for i = 1, #members do
+            local id = members[i]
+            local member = cat.rows[id]
+            local name = member and member.name or ("Echo name unavailable (#" .. tostring(id) .. ")")
+            if not seenNames[name] then names[#names + 1] = name; seenNames[name] = true end
+            if type(discovered) == "table" then
+                local marker = discovered[id]
+                if marker == true or (type(marker) == "number" and marker == marker
+                    and marker ~= math.huge and marker ~= -math.huge) then known = true
+                elseif marker ~= nil and marker ~= false then invalidDiscovery = true end
+            end
+            local ok, value = false, nil
+            if ready and svc and type(svc.IsTomeEchoDisabled) == "function" then
+                ok, value = pcall(svc.IsTomeEchoDisabled, id)
+            end
+            if ok and value == true then yes = yes + 1
+            elseif ok and value == false then no = no + 1
+            else unreadable = unreadable + 1 end
+        end
+        table.sort(names)
+        local observed = "unknown"
+        if #members > 0 and unreadable == 0 then
+            observed = yes > 0 and (no > 0 and "mixed" or "disabled") or "enabled"
+        end
+        local p = pending[lever]
+        local direction
+        if type(p) == "table" then
+            if p.want == true then direction = "disable"
+            elseif p.want == false then direction = "enable"
+            else direction = "unknown" end
+        elseif type(p) == "number" and p == p and p >= 0
+            and p ~= math.huge then direction = "disable"
+        elseif p ~= nil then direction = "unknown" end
+        local discoveredKnown
+        if type(discovered) == "table" and A.DiscoverySynced() then
+            if known then discoveredKnown = true
+            elseif not invalidDiscovery then discoveredKnown = false end
+        end
+        local name = type(lv.tomeName) == "string" and lv.tomeName ~= ""
+            and lv.tomeName or ("Tome name unavailable: " .. table.concat(names, ", "))
+        -- The tome's own icon, else the first member Echo that has one; the
+        -- source is stated, and with neither the Journal shows a neutral tile.
+        local icon, iconSource = SpellIcon(lever), "tome spell"
+        if icon == nil then
+            iconSource = nil
+            for i = 1, #members do
+                icon = SpellIcon(members[i])
+                if icon ~= nil then iconSource = "representative Echo spell"; break end
+            end
+        end
+        out.rows[#out.rows + 1] = {
+            lever=lever, name=name, echoNames=names, icon=icon, iconSource=iconSource,
+            observed=observed, known=discoveredKnown, pending=direction,
+            reason=observed == "unknown" and "member state unavailable or unreadable"
+                or (observed == "mixed" and "members have different disable states" or nil),
+        }
+    end
+    table.sort(out.rows, function(a,b)
+        if a.name ~= b.name then return a.name < b.name end
+        return a.lever < b.lever
+    end)
+    return out
+end
+
 -- values: "confirmed" (server mirror says disabled) or "pending" (our
 -- disable request not yet 530-confirmed). Both are truthy for pool math;
 -- only "confirmed" may drive the flag self-check (a pending lever proves
@@ -3540,26 +4106,36 @@ function A.DisabledLevers()
 end
 
 function A.ToggleLever(leverId, wantDisabled)
-    if A.DIAGNOSTIC_PASSIVE then return false, "internal.6 passive diagnostic: write blocked" end
+    if A.DIAGNOSTIC_PASSIVE then
+        A.TomeObservationAttempt(leverId,wantDisabled,"passive",0,"not_evaluated")
+        return false, "internal.6 passive diagnostic: write blocked"
+    end
     if A.TomeMutationPaused and A.TomeMutationPaused() then
+        A.TomeObservationAttempt(leverId,wantDisabled,"pause",0,"not_evaluated")
         return false, "Tome of Echo transaction settling"
     end
     local cat = A.Catalog()
     local svc = PS()
-    if not cat or not svc or not svc.ToggleTomeEcho then return false, "no api" end
+    if not cat or not svc or not svc.ToggleTomeEcho then
+        A.TomeObservationAttempt(leverId,wantDisabled,"no api",0,"not_evaluated")
+        return false, "no api"
+    end
     local lv = cat.levers[leverId]
-    if not lv then return false, "unknown lever" end
-    if not lv.conformant then return false, "non-conformant lever" end
-    if (UnitLevel("player") or 0) ~= 1 then return false, "not level 1" end
+    if not lv then A.TomeObservationAttempt(leverId,wantDisabled,"unknown lever",0,"not_evaluated");return false, "unknown lever" end
+    if not lv.conformant then A.TomeObservationAttempt(leverId,wantDisabled,"non-conformant lever",0,"not_evaluated");return false, "non-conformant lever" end
+    if (UnitLevel("player") or 0) ~= 1 then A.TomeObservationAttempt(leverId,wantDisabled,"not level 1",0,"not_evaluated");return false, "not level 1" end
     local st = Store and Store.State()
     local pending = st and st.tomeTogglePending or {}
-    if pending[leverId] then return false, "pending" end
+    if pending[leverId] then A.TomeObservationAttempt(leverId,wantDisabled,"pending",0,"not_evaluated");return false, "pending" end
     -- effective state: any member disabled OR pending counts as disabled
     local cur = false
     for i = 1, #lv.members do
         if SafeCall(svc.IsTomeEchoDisabled, lv.members[i]) then cur = true; break end
     end
-    if cur == (wantDisabled and true or false) then return false, "already" end
+    if cur == (wantDisabled and true or false) then
+        A.TomeObservationAttempt(leverId,wantDisabled,"already",lv.members[1],"not_evaluated",cur)
+        return false, "already"
+    end
     local ok = SafeCall(svc.ToggleTomeEcho, lv.members[1])
     if ok then
         -- `pending` belongs to the read snapshot. The entry is written into
@@ -3572,8 +4148,13 @@ function A.ToggleLever(leverId, wantDisabled)
             state.tomeTogglePending = durable
         end)
         leverProjectionRevision = leverProjectionRevision + 1
+        -- The new request badge: mark a held-open Journal page (no read).
+        local journal = Nexus.JournalTab
+        if journal and type(journal.Invalidate) == "function" then pcall(journal.Invalidate) end
+        A.TomeObservationAttempt(leverId,wantDisabled,"accepted",lv.members[1],type(ok),cur)
         return true
     end
+    A.TomeObservationAttempt(leverId,wantDisabled,"refused",lv.members[1],type(ok),cur)
     return false, "refused"
 end
 
@@ -3594,6 +4175,7 @@ local function ReconcileTomePending()
     if not cat or not svc then return end
     local now = GetTime()
     local mirrorLive = A.DiscoverySynced()
+    local revision = leverProjectionRevision
     UpdateStoreState(function(state)
     local map = state.tomeTogglePending
     if not map then return end
@@ -3607,15 +4189,20 @@ local function ReconcileTomePending()
             sentAt = now
         end
         local lv = cat.levers[lever]
-        local cur = false
+        local cur, rawKind = false, "not_evaluated"
         if lv then
             for i = 1, #lv.members do
-                if SafeCall(svc.IsTomeEchoDisabled, lv.members[i]) then cur = true; break end
+                local value = SafeCall(svc.IsTomeEchoDisabled, lv.members[i])
+                if type(value) ~= "boolean" then rawKind = "mixed"
+                elseif rawKind == "not_evaluated" then rawKind = "boolean" end
+                if value then cur = true; break end
             end
         end
         local confirmed = lv and (cur == want)
         local expired = mirrorLive and (now - sentAt) > 30
         if confirmed or not lv or expired then
+            A.TomeObservationResolve(lever,want,confirmed and "mirror_match"
+                or (not lv and "catalog_missing" or "expired"),cur,rawKind,now-sentAt)
             -- clear silently: a genuine failure just leaves the echo in the
             -- pool (mild), and we no longer disable unknown tomes (the cause
             -- of the old per-lever "no confirmation" chat spam)
@@ -3624,6 +4211,11 @@ local function ReconcileTomePending()
         end
     end
     end)
+    -- Every request cleared by this pass marks a held-open Journal page once.
+    if leverProjectionRevision ~= revision then
+        local journal = Nexus.JournalTab
+        if journal and type(journal.Invalidate) == "function" then pcall(journal.Invalidate) end
+    end
 end
 
 ------------------------------------------------------------------------
@@ -4111,17 +4703,84 @@ function A.Reroll()
     if A.InFlight() then return false, "in flight" end
     local ch = A.Charges()
     if ch.reroll <= 0 then return false, "no charges" end
+    -- Capture raw server-derived run data before the client service call.
+    -- Charges() has an optimistic local ledger and cannot confirm a spend.
+    local recovery = ledger.rerollRecovery
+    local prior = recovery.record
+    local priorOutcome = prior and A.RerollOutcome(prior.ordinal) or nil
+    local d = RawRunData()
+    local used = d and NonNegativeInteger(d.usedRerolls)
+    local total = d and NonNegativeInteger(d.totalRerolls)
+    local board = A.Board()
+    local attributable = used ~= nil and total ~= nil
+        and board ~= nil and board.idSignature ~= nil
+        -- A prior player/rival reroll can have advanced the board before its
+        -- run-data push arrives. Without a request ID, later +1 is ambiguous.
+        and recovery.externalEpoch == 0
+        and (not prior or (priorOutcome == "proven"
+            and used == prior.used + 1 and total == prior.total))
     local svc = PS()
     selfCalling = true
     local ok = svc and SafeCall(svc.RequestReroll)
     selfCalling = false
     if ok then
+        recovery.ordinal = recovery.ordinal + 1
+        recovery.record = { ordinal = recovery.ordinal,
+            runGeneration = ownedGeneration, dataRef = d,
+            used = used, total = total,
+            boardIdSignature = board and board.idSignature or nil,
+            externalEpoch = recovery.externalEpoch,
+            attributable = attributable, outcome = "waiting" }
         ledger.reroll = math.max(0, (ledger.reroll or 1) - 1)
         local b = A.Board()
         inFlightKind, inFlightSig = "reroll", b and b.signature or ""
         return true
     end
     return false, "refused"
+end
+
+-- Session-only, read-only settlement of an own reroll. A fresh server run
+-- record with exactly one additional used reroll, a changed offer, a clear
+-- client latch, the same run, and no competing reroll are all required. The
+-- service supplies no request ID, so uncertain cases stay uncertain; this
+-- never sends, refunds, or manufactures a charge.
+function A.RerollOutcome(ordinal)
+    local recovery = ledger.rerollRecovery
+    local own = recovery.record
+    if not own or own.ordinal ~= ordinal then return nil end
+    if own.outcome ~= "waiting" then return own.outcome end
+    if ownedGeneration ~= own.runGeneration then
+        own.outcome = "voided"
+        return own.outcome
+    end
+    if not own.attributable or recovery.externalEpoch ~= own.externalEpoch then
+        own.outcome = "ambiguous"
+        return own.outcome
+    end
+    local d = RawRunData()
+    local used = d and NonNegativeInteger(d.usedRerolls)
+    local total = d and NonNegativeInteger(d.totalRerolls)
+    if d == own.dataRef or used == nil or total == nil then return "waiting" end
+    if total ~= own.total or used < own.used or used > own.used + 1 then
+        own.outcome = "ambiguous"
+        return own.outcome
+    end
+    -- Unrelated server refreshes may replace this table before the spend
+    -- appears. Do not turn a delayed matching +1 into a permanent failure.
+    if used == own.used then return "waiting" end
+    local p = PerksTbl()
+    local board = A.Board()
+    if type(p) ~= "table" or p.pendingReroll ~= nil or not board then
+        return "waiting"
+    end
+    if board.idSignature == own.boardIdSignature then return "waiting" end
+    own.outcome = "proven"
+    return own.outcome
+end
+
+function A.RerollOrdinal()
+    local own = ledger.rerollRecovery.record
+    return own and own.ordinal or nil
 end
 
 -- FreezePerk emits no success signal of its own [mirrors BanishPerk/
@@ -4279,8 +4938,20 @@ function A.UploadWishlist(slot, name, echoes, expected)
         local current = A.ServerWishlistSlotToken(slot)
         if current == nil or not expected[current] then return false, "stale_slot" end
     end
-    local ok = svc and SafeCall(svc.UploadServerBuildSlot,
-        tonumber(slot) or 0, tostring(name or "Nexus"), clean)
+    -- The one native call of an upload. A falsy return is the host's own
+    -- refusal: nothing was sent, and the caller may try again. A raise inside
+    -- the host function is not a refusal: the host may have sent the change
+    -- before it failed, so the outcome is unknown ("host_error"); the caller
+    -- must not repeat it blindly. Either way the spacing clock and the slot
+    -- list are treated as after a send. (Only this call; SafeCall is unchanged.)
+    local upload = svc and svc.UploadServerBuildSlot
+    if type(upload) ~= "function" then return false, "refused" end
+    local called, ok = pcall(upload, tonumber(slot) or 0, tostring(name or "Nexus"), clean)
+    if not called then
+        lastBuildOpAt = GetTime()
+        A.RequestSlots()
+        return false, "host_error"
+    end
     if ok then
         lastBuildOpAt = GetTime()
         -- the slot cache is now stale; re-request like Save/seed does
@@ -4985,7 +5656,16 @@ local function RefreshEchoAssociations()
     end
 end
 
-local function ReconcileEchoState(markDirty, source)
+-- The character a display reuse record belongs to; nil when unreadable.
+local function DisplayReuseGUID()
+    if type(UnitGUID) ~= "function" then return nil end
+    local ok, guid = pcall(UnitGUID, "player")
+    return ok and guid or nil
+end
+
+-- `display` is true only for a display-only read (A.EchoActiveSlotGeneration).
+-- Every other caller passes nothing and keeps the identical-time rule only.
+local function ReconcileEchoState(markDirty, source, display)
     local hadPending = echoNotificationPending
     echoNotificationPending = false
     echoStatus.reconciliations = echoStatus.reconciliations + 1
@@ -4996,6 +5676,26 @@ local function ReconcileEchoState(markDirty, source)
         echoStatus.equivalentFallbacks = echoStatus.equivalentFallbacks + 1
         EchoReason(tostring(source or "reconcile") .. ":cached")
         return true, false
+    end
+    -- Display-only reuse: the last clean display scan stands for less than
+    -- ECHO_DISPLAY_REUSE_SECONDS, with no dirty or forced request, no pending
+    -- notification, no scan since it, and the same ProjectEbonhold table,
+    -- PerkService reference and character. It moves no generation and claims
+    -- no new verification (echoVerifiedAt stays at that scan).
+    local reuse = echoDisplayReuse
+    if display == true and not markDirty and not hadPending and echoSnapshot
+        and reuse and echoVerifiedAt == reuse.at
+        and now - reuse.at >= 0 and now - reuse.at < ECHO_DISPLAY_REUSE_SECONDS
+        and PE() == reuse.pe and PS() == reuse.svc
+        and DisplayReuseGUID() == reuse.guid then
+        echoStatus.cacheHits = echoStatus.cacheHits + 1
+        EchoReason(tostring(source or "reconcile") .. ":display-reused")
+        return true, false
+    end
+    echoDisplayReuse = nil
+    local displayPE, displaySvc, displayGUID
+    if display == true then
+        displayPE, displaySvc, displayGUID = PE(), PS(), DisplayReuseGUID()
     end
     echoStatus.scans = echoStatus.scans + 1
     local ok, snapshot, activeSlot, rejected = pcall(CaptureEchoSnapshot)
@@ -5021,6 +5721,15 @@ local function ReconcileEchoState(markDirty, source)
     if #rejectedParts > 0 then
         echoStatus.failures = echoStatus.failures + 1
         rejectedText = ";failure:" .. table.concat(rejectedParts, ",")
+    end
+    -- Only a clean display scan may be reused: a PerkService and a character
+    -- were present, and no field was rejected. A failed capture (above), an
+    -- unavailable snapshot or any rejected field leaves the record cleared.
+    if display == true and displaySvc and displayGUID ~= nil
+        and #rejectedParts == 0 then
+        echoDisplayReuse = {
+            at=now, pe=displayPE, svc=displaySvc, guid=displayGUID,
+        }
     end
     if not echoSnapshot then
         echoSnapshot, echoActiveSlot = snapshot, activeSlot or 0
@@ -5069,9 +5778,28 @@ local function ReconcileEchoState(markDirty, source)
         RefreshWishlistEvidenceTransitions()
         RefreshEchoAssociations()
     end
+    -- Tome states (discovery carries the disabled reading) and the target
+    -- (slots, active slot) feed the Journal tome rows. Mark only; no read.
+    if changed.discovery or changed.slots or changed.activeSlot then
+        local journal = Nexus.JournalTab
+        if journal and type(journal.Invalidate) == "function" then pcall(journal.Invalidate) end
+    end
     EchoReason(tostring(source or "reconcile") .. ":" .. table.concat(changedNames, ",")
         .. rejectedText)
     return true, true
+end
+
+-- Keep the same reconciliation function and arguments. The disabled branch
+-- reads no diagnostic clocks/heap and does not cache or suppress fresh reads.
+do
+    local reconcile = ReconcileEchoState
+    ReconcileEchoState = function(...)
+        local performance = Nexus.Performance
+        if performance and type(performance.MeasureDiagnostic) == "function" then
+            return performance.MeasureDiagnostic("echo.reconcile", reconcile, ...)
+        end
+        return reconcile(...)
+    end
 end
 
 local function ReconcilePendingEchoState()
@@ -5124,7 +5852,11 @@ end
 local function VisibleBindConfirmation()
     for i = 1, 4 do
         local frame = _G["StaticPopup" .. i]
-        if frame and frame.IsShown and frame:IsShown() then
+        -- IsShown ignores hidden ancestors. A retained popup beneath a hidden
+        -- parent must not keep renewing a supposedly visible confirmation.
+        -- Keep the conservative legacy check if visibility is unavailable.
+        if frame and frame.IsShown and frame:IsShown()
+            and (not frame.IsVisible or frame:IsVisible()) then
             local popupText = frame.text and frame.text.GetText
                 and frame.text:GetText() or nil
             if IsBindConfirmation(frame.which, popupText) then return true end
@@ -5134,10 +5866,19 @@ local function VisibleBindConfirmation()
 end
 
 function A.TomeMutationPaused()
-    if EchoTomeInBags() or VisibleBindConfirmation() then
+    -- Preserve the existing short circuit: a positive bag detector does not
+    -- inspect popups. Retain that attribution rather than guessing both ran.
+    local source
+    if EchoTomeInBags() then source="bag"
+    elseif VisibleBindConfirmation() then source="popup" end
+    if source then
         HoldTomeMutations()
     end
-    return (GetTime and GetTime() or 0) < tomeMutationPausedUntil
+    local now=GetTime and GetTime() or 0
+    local paused=now<tomeMutationPausedUntil
+    A.TomeObservationPause(source or (paused and "settling" or "clear"),
+        math.max(0,tomeMutationPausedUntil-now))
+    return paused
 end
 
 local function InstallHooks()
@@ -5247,8 +5988,9 @@ local function InstallHooks()
         hooksecurefunc(svc, "RequestReroll", function()
             pcall(function()
                 boardDirty = true
-                if not selfCalling and (not inFlightKind
-                    or (inFlightKind == "select" and deadLatch.select)) then
+                if not selfCalling then
+                    ledger.rerollRecovery.externalEpoch =
+                        ledger.rerollRecovery.externalEpoch + 1
                     externalActionSeen = true
                     A._lastUserAction = { kind = "RequestReroll",
                         t = GetTime() }
@@ -5439,8 +6181,25 @@ end
 -- same reconciliation as AutomationSignature, and nothing of the rest of that
 -- five-second check (the character-row comparison through the Store mutation
 -- entry, the bag scan for a Tome, the settings), whose results it discarded.
-function A.EchoActiveSlotGeneration()
-    local echoOk = ReconcileEchoState(false, "fallback")
+--
+-- Display-only opt-in (NX-02): only the boolean `true` (the Orb display read,
+-- OrbAdapter O.Read("display")) may reuse the last clean display scan for less
+-- than ECHO_DISPLAY_REUSE_SECONDS (see ReconcileEchoState). Every other value
+-- (none, a number of any size or sign, NaN, infinity, a string, a table) is
+-- not an opt-in: the call reconciles as before, with no caller window. A
+-- generation returned through reuse is the one of that scan: retained and
+-- NON-AUTHORITATIVE. No action, recovery or ownership decision may use it;
+-- those read through calls with no argument, which stay fresh in every frame.
+-- While only display reads run, an unnotified change reaches the Echo
+-- generations (and their HUD, overlay, Journal and automation readers) up to
+-- ECHO_DISPLAY_REUSE_SECONDS later than a per-refresh scan would show it.
+function A.EchoActiveSlotGeneration(display)
+    local echoOk
+    if display == true then
+        echoOk = ReconcileEchoState(false, "fallback", true)
+    else
+        echoOk = ReconcileEchoState(false, "fallback")
+    end
     if not echoOk then return nil end
     -- An active slot the strict check rejected is unknown: no generation is
     -- handed out for it, as when the whole reconciliation failed.
@@ -5467,7 +6226,7 @@ function A.Init(cb, store)
     if scheduler and scheduler.IsInitialized and scheduler.IsInitialized()
         and type(scheduler.Every) == "function" then
         local scheduled = scheduler.Every("catalog.source-check",
-            CATALOG_CHECK_INTERVAL, function() A.CheckCatalogSource() end)
+            CATALOG_CHECK_INTERVAL, function() catalogVerify.Start() end)
         catalogStatus.scheduled = scheduled == true
     end
 end
@@ -5669,6 +6428,15 @@ function A.Poll()
     end
     lastAutoAcceptState, lastRivalState = autoAcceptState, rivalState
     ResolveInFlight()
+    -- Run-data pushes do not emit an Echo-board dirty event. Detect an own
+    -- reroll settlement here so a delayed server count can wake the runtime
+    -- after its normal action deadline has passed. This is read-only and
+    -- schedules no resend.
+    local ownReroll = ledger.rerollRecovery.record
+    if ownReroll and ownReroll.outcome == "waiting"
+        and A.RerollOutcome(ownReroll.ordinal) == "proven" then
+        dataDirty = true
+    end
     ConfirmAwaitingGrant()
     WatchLatches()
     ReconcileTomePending()

@@ -57,12 +57,12 @@ local function Icons()
  end
  return count,ids
 end
-C.setup(Region('Locked')~=nil and Region('Rolled copies:')~=nil,'the actual locked strip label and footer exist')
+C.setup(Region('Locked')~=nil and Region('Planned rolled copies:')~=nil,'the actual locked strip label and footer exist')
 local actions=#H.actions
 
 local function Show(label,records)
  H.locked=H.Clone(records);H.Notify();A.Poll();r.Refresh()
- local strip,footer=Region('Locked (') or '',Region('Rolled copies:') or ''
+ local strip,footer=Region('Locked (') or '',Region('Planned rolled copies:') or ''
  local count,ids=Icons()
  print('OBSERVED',label,'label='..strip,'footer='..(footer:gsub('\n',' | ')),'locked icons='..count)
  return strip,footer,count,ids

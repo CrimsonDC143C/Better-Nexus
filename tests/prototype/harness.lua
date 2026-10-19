@@ -280,6 +280,27 @@ ProjectEbonholdOptionsService={GetSetting=function(_,k) return opts[k] end,SetSe
 H.service=S
 function H.Notify() EJ.OnDataChanged() end
 function H.Board(cards) P.currentChoice=H.Clone(cards);PU.Show(P.currentChoice) end
+-- Unrelated integration fixtures model a player who already chose both
+-- warning opt-outs. Use the real warning UI; do not bypass runtime gates.
+-- Warning regressions opt out of this setup with keepOverwriteWarningPrompts.
+function H.AcknowledgeOverwriteWarnings()
+ local w=Nexus and Nexus.OverwriteWarning
+ if not w then return end
+ local outcome=w.EnsureOnboarding()
+ local f=NexusOverwriteWarning
+ if outcome=='pending' and f then
+  -- Move only the external warning clock for this synthetic user's reading
+  -- period. Do not advance lifecycle work or weaken any permission gate.
+  local clock=GetTime
+  GetTime=function()return clock()+5.01 end
+  local update=f:GetScript('OnUpdate');if update then update(f,5.01)end
+  if f.yes:IsEnabled()then f.suppress:SetChecked(true);f.yes:Click()end
+  GetTime=clock
+ end
+ w.RequestAuto(H,function()return false end)
+ f=NexusOverwriteWarning
+ if f and f:IsShown() and f.yes:IsEnabled()then f.suppress:SetChecked(true);f.yes:Click()end
+end
 function H.Boot()
  for line in io.lines('Nexus.toc') do
   line=line:gsub('\r','')
@@ -290,6 +311,7 @@ function H.Boot()
  end
  H.Fire('ADDON_LOADED','Nexus');H.Fire('PLAYER_ENTERING_WORLD')
  H.Advance(20,.05)
+ if not H.keepOverwriteWarningPrompts then H.AcknowledgeOverwriteWarnings()end
  return Nexus
 end
 return H

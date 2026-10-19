@@ -67,6 +67,72 @@ StaticPopupDialogs["NEXUS_UPDATE_RELEASES"] = {
 
 local function SafeText(v) return v ~= nil and tostring(v) or "" end
 
+-- M4 (UX-04): the destination this panel's run belongs to, as lines, from the
+-- facts the shown model already carries: the verified active Saved Build
+-- (progress.activeSlot / activeSlotName), the run's Wishlist and the saved
+-- assignment state and note. Pure: it reads only the model it is given and
+-- calls no adapter, service or request (UserText.DestinationLines words it).
+function M.DestinationLines(model)
+    local text = Nexus.UserText
+    if type(model) ~= "table" or not (text and type(text.DestinationLines) == "function") then
+        return {}
+    end
+    local pr = type(model.progress) == "table" and model.progress or {}
+    local assignment = type(model.assignment) == "table" and model.assignment or {}
+    local slot = tonumber(pr.activeSlot) or 0
+    local state = assignment.state
+    local d = {wishlist = pr.wishlistName or assignment.name}
+    -- The HUD always shows the logged-in character's run (J3: the destination
+    -- names its character). A client read at hover time; no service or state.
+    if type(UnitName) == "function" then
+        local ok, name = pcall(UnitName, "player")
+        if ok and type(name) == "string" and name ~= "" then d.character = name end
+    end
+    -- The adapter's own first-run facts (GameAdapter A.Wishlist: its first-run
+    -- return and its unavailable first-run mirror), copied by Main into the
+    -- HUD model as assignment.note. A missing verified active row is not
+    -- evidence of first-run (M4 final review B1).
+    local note = type(assignment.note) == "string" and assignment.note or ""
+    local unavailableFirstRun = "First-run wishlist data is temporarily unavailable"
+    local firstRun = note == "First-run wishlist target"
+        or note:sub(1, #unavailableFirstRun) == unavailableFirstRun
+    if state == "loading" then
+        d.kind = "unknown"
+    elseif assignment.emptySlot == true then
+        -- The selected numbered Saved Build holds no Echoes (named when the
+        -- verified active row is known).
+        d.kind, d.empty = "savedBuild", true
+        if slot > 0 then d.slot, d.name = slot, pr.activeSlotName end
+    elseif slot > 0 then
+        d.kind, d.slot, d.name, d.active = "savedBuild", slot, pr.activeSlotName, true
+    elseif firstRun then
+        d.kind = "firstRun"
+    elseif state == "restoring" then
+        -- Unknown is said as unknown, not as nothing captured (review NB2).
+        d.kind, d.reason = "unknown", "restoring"
+    elseif state == "ready" or note:find("^Loadout %d+ ") then
+        -- A Saved Build's plan with no verified active row: a kept Saved
+        -- Build while a native Wishlist slot is active, or a slot payload
+        -- without the verified field. Which Saved Build, and whether it is
+        -- active, is not in this model, so neither is claimed (review B1).
+        d.kind, d.unconfirmed = "savedBuild", true
+    elseif state == "unavailable" or pr.wishlistName then
+        -- The model does not say whether this plan is the first-run target
+        -- or a Saved Build's: neither is claimed.
+        d.kind = "unconfirmed"
+    else
+        d.kind = "none"
+    end
+    d.wishlistState = (state == "ready" and "assigned") or (state == "unassigned" and "unassigned")
+        or (state == "unavailable" and "unavailable")
+        or ((state == "restoring" or state == "loading") and "restoring") or nil
+    -- An empty Saved Build holds no Wishlist of its own (assigning to it is
+    -- refused); a name beside it would be the first-run Wishlist, so none is
+    -- presented as its assignment.
+    if d.empty then d.wishlist, d.wishlistState = nil, nil end
+    return text.DestinationLines(d)
+end
+
 -- Read-only. Opening it marks the shown target as seen, so its chat notice is
 -- not repeated. It changes nothing else.
 function M.ShowUpdateStatus()
@@ -156,6 +222,14 @@ local function ModelSignatures(model)
                 and (model.effective.state == "waiting"
                     or model.effective.state == "rechecking")
                 and model.effective.state or nil,
+            -- With roll content shown, the Auto OFF heading and the card
+            -- marker follow the selection; between boards it changes nothing.
+            autoOff=model.auto == false and ((type(model.cards) == "table" and #model.cards > 0)
+                or SafeText(model.recommendation) ~= "") or nil,
+            -- The compact charges line follows the charge facts the model carries.
+            charges=model.charges,
+            -- The inline Auto line (M.AutoNoteFor) is roll content too.
+            autoNote=model.autoNote,
         }),
         performance = Signature({
             performance=type(model.progress) == "table" and model.progress.performance or nil,
@@ -412,6 +486,45 @@ function AUTO_LABEL.Fit(force)
     return autoBtn._nexusFit
 end
 
+-- Only the new compact navigation label needs to share the existing Orb row.
+-- Cache its private font fit by base font, label and width; shared fonts and
+-- the Open Orbs control are unchanged. No measurement on an unchanged render.
+function M.FitOrbMiniButton(button)
+    local layout = Nexus.LayoutMetrics
+    local base = layout and _G[layout.FontObject("small")]
+    if not (button and base and type(base.GetFont) == "function") then return end
+    local ok, path, size, flags = pcall(base.GetFont, base)
+    size = ok and tonumber(size) or nil
+    if not (path and size) then return end
+    local budget = button:GetWidth() - 20
+    local label = button:GetText() or ""
+    local key = table.concat({path,tostring(size),flags or "",label,tostring(budget)}, "|")
+    if button._nexusMiniFitKey == key then return button._nexusMiniFit end
+    local font = button._nexusMiniFont
+    if not font and type(CreateFont) == "function" then
+        local made, value = pcall(CreateFont, "NexusHudOrbMiniFont")
+        if made and value then font = value; button._nexusMiniFont = font end
+    end
+    if not font then return end
+    local probe = button._nexusMiniProbe
+    if not probe then
+        probe = button:CreateFontString(nil, "OVERLAY")
+        probe:Hide(); button._nexusMiniProbe = probe
+    end
+    local fitSize, measured = size, 0
+    for _ = 1, 8 do
+        pcall(font.SetFont, font, path, fitSize, flags or "")
+        probe:SetFontObject(font); probe:SetText(label)
+        measured = tonumber(probe:GetStringWidth()) or 0
+        if measured <= budget or fitSize <= 8 then break end
+        fitSize = math.max(8, math.floor(fitSize * budget / measured))
+    end
+    SetOwnedButtonFont(button, font)
+    button._nexusMiniFitKey = key
+    button._nexusMiniFit = {width=measured,budget=budget,size=fitSize,fits=measured<=budget}
+    return button._nexusMiniFit
+end
+
 function M.ApplyOwnedFonts()
     local layout = Nexus.LayoutMetrics
     if not (layout and frame) then return false end
@@ -438,6 +551,7 @@ function M.ApplyOwnedFonts()
             leaderboardBtn,menuBtn,
         }) do SetOwnedButtonFont(widget, normal) end
         SetOwnedButtonFont(frame._orbsBtn, small)
+        SetOwnedButtonFont(frame._orbMiniBtn, small)
         -- The Auto button then takes its own fitted font (AUTO_LABEL.Fit);
         -- if none can be made it keeps the owned normal font above.
         AUTO_LABEL.Fit(true)
@@ -460,14 +574,24 @@ local function AddDpsTooltip(widget, title, personal, global)
         else
             GameTooltip:AddLine("No personal record for this exact loadout.", 0.65, 0.65, 0.65, true)
         end
+        local text = Nexus.UserText
         if global then
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("Best known shared result: " .. FmtDps(global.dps), 1, 0.82, 0)
             local player = global.displayPlayer
                 or ShortName(global.player or "Unknown", 80)
             GameTooltip:AddLine("Held by " .. player, 0.8, 0.8, 0.8)
+            -- M4 (UX-14): only the facts the record carries (duration,
+            -- level, date) and its own owner flag; unknown stays unsaid.
+            local parts = text and text.RecordDetailParts and text.RecordDetailParts(global) or {}
+            if #parts > 0 then GameTooltip:AddLine(table.concat(parts, " - "), 0.75, 0.75, 0.75, true) end
+            local ownerLine = text and text.OwnerLine and text.OwnerLine(global)
+            if ownerLine then GameTooltip:AddLine(ownerLine, 0.75, 0.75, 0.75) end
+        else
+            GameTooltip:AddLine("No shared record for this exact loadout is known to this client.", 0.65, 0.65, 0.65, true)
         end
         GameTooltip:AddLine(" ")
+        if text and text.RECORD_SCOPE then GameTooltip:AddLine(text.RECORD_SCOPE, 0.45, 0.75, 1, true) end
         GameTooltip:AddLine("Records only match identical Echo IDs and stack quantities.", 0.45, 0.75, 1, true)
         GameTooltip:Show()
     end)
@@ -633,6 +757,13 @@ local function EnsureFrame()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Open My Builds", 1, 1, 1)
         GameTooltip:AddLine("Open the server My Builds page. Choosing a different Saved Build there changes the active loadout.", 0.75, 0.75, 0.75, true)
+        -- M4 (UX-04): what this panel's run belongs to, from the facts the
+        -- shown model already carries (M.DestinationLines). Read-only.
+        local lines = M.DestinationLines(M._lastModel)
+        if #lines > 0 then
+            GameTooltip:AddLine(" ")
+            for _, line in ipairs(lines) do GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true) end
+        end
         GameTooltip:Show()
     end)
     switchBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -642,6 +773,8 @@ local function EnsureFrame()
     -- expand this into the primary status card so the familiar server metrics
     -- remain the most visible information.
     worldStatusBox = CreateFrame("Frame", nil, frame)
+    -- Protected card: no style or colour choice repaints it (Theme.Exempt).
+    worldStatusBox._nexusThemeExempt = true
     worldStatusBox:SetFrameLevel(frame:GetFrameLevel() + 3)
     pcall(function()
         worldStatusBox:SetBackdrop({
@@ -764,6 +897,30 @@ local function EnsureFrame()
     statusText:SetSize(276, 14)
     statusText:SetJustifyH("LEFT")
     frame._rollStatus = statusText
+    -- Compact charges (Readout.ChargesLine), right-aligned in the heading
+    -- row; shown only while the model itself carries charge facts.
+    frame._chargesText = rollArea:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    frame._chargesText:SetPoint("TOPRIGHT", -2, -1)
+    frame._chargesText:SetSize(72, 14)
+    frame._chargesText:SetJustifyH("RIGHT")
+    frame._chargesText:Hide()
+    -- Its legend on hover (Readout.ChargesLegend): what B/R/F, "?" and "~"
+    -- mean. Shown and hidden with the line; reading it changes nothing.
+    -- A frame field, not a local (EnsureFrame is near the Lua limits).
+    frame._chargesHover = CreateFrame("Frame", nil, rollArea)
+    frame._chargesHover:SetPoint("TOPLEFT", frame._chargesText, "TOPLEFT", 0, 0)
+    frame._chargesHover:SetPoint("BOTTOMRIGHT", frame._chargesText, "BOTTOMRIGHT", 0, 0)
+    frame._chargesHover:EnableMouse(true)
+    frame._chargesHover:SetScript("OnEnter", function(self)
+        local readout = Nexus.Readout
+        if not (GameTooltip and readout and type(readout.ChargesLegend) == "function") then return end
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Charges", 1, 1, 1)
+        for _, line in ipairs(readout.ChargesLegend()) do GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true) end
+        GameTooltip:Show()
+    end)
+    frame._chargesHover:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    frame._chargesHover:Hide()
 
     for i = 1, 3 do
         local fs = rollArea:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -796,6 +953,23 @@ local function EnsureFrame()
     orbsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     orbsBtn:Hide()
     frame._orbsBtn = orbsBtn
+
+    local orbMiniBtn = CreateFrame("Button", nil, rollArea, "UIPanelButtonTemplate")
+    orbMiniBtn:SetSize(118, 17)
+    orbMiniBtn:SetPoint("RIGHT", orbsBtn, "LEFT", -6, 0)
+    orbMiniBtn:SetText("Orb mini panel")
+    orbMiniBtn:SetScript("OnClick", function()
+        if Nexus.OrbPanel and Nexus.OrbPanel.ShowMini then Nexus.OrbPanel.ShowMini() end
+    end)
+    orbMiniBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Orb mini panel", 1, 0.82, 0)
+        GameTooltip:AddLine("Opens compact Orb run status. It starts or spends nothing.", 0.85, 0.85, 0.85, true)
+        GameTooltip:Show()
+    end)
+    orbMiniBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    orbMiniBtn:Hide()
+    frame._orbMiniBtn = orbMiniBtn
 
     recText = rollArea:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     recText:SetPoint("TOPLEFT", 2, -64)
@@ -832,11 +1006,12 @@ local function EnsureFrame()
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Missing Tomes", 1, 0.82, 0)
         GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("These Wishlist targets are reported as unavailable", 0.9, 0.9, 0.9, true)
-        GameTooltip:AddLine("for your current character. Check the game's", 0.9, 0.9, 0.9, true)
+        GameTooltip:AddLine("These Wishlist tome requirements are undiscovered", 0.9, 0.9, 0.9, true)
+        GameTooltip:AddLine("in the client mirror. Check the game's", 0.9, 0.9, 0.9, true)
         GameTooltip:AddLine("unlock/tome requirements before spending resources.", 0.9, 0.9, 0.9, true)
         GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("The server currently reports these Echoes as unavailable.", 0.6, 1, 0.6, true)
+        GameTooltip:AddLine("This is separate from disabled tomes or pending requests.", 0.6, 1, 0.6, true)
+        GameTooltip:AddLine("Tome states: Echo Journal > Nexus Progress > Show details.", 0.9, 0.9, 0.9, true)
         GameTooltip:AddLine("Check each Echo's unlock or tome requirement in the game.", 0.9, 0.9, 0.9, true)
         GameTooltip:AddLine("This message does not establish a drop location or vendor.", 0.9, 0.9, 0.9, true)
         GameTooltip:AddLine(" ")
@@ -995,10 +1170,21 @@ local function EnsureFrame()
     setupGetStartedBtn:SetSize(126, 24)
     setupGetStartedBtn:SetText("Assign Wishlist")
     setupGetStartedBtn:SetScript("OnClick", function()
-        CloseOtherNexusWindows()
-        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then
-            Nexus.JournalTab.OpenBuilds()
+        local journal = Nexus.JournalTab
+        if journal and journal.OpenBuilds then
+            -- The present helper is the route: the Echo Journal with the
+            -- Wishlist chooser opened for the Saved Build the Journal targets
+            -- (nothing is assigned until one is chosen). It closes the other
+            -- Nexus windows only once the game's Character Progression entry
+            -- is there, so a refusal loses nothing and is said here.
+            local opened, why = journal.OpenBuilds(true, CloseOtherNexusWindows)
+            if opened == false and why == "unavailable" then
+                print("|cffff6060Nexus:|r Could not find the game's Character Progression button, so nothing "
+                    .. "was opened or assigned. Open Character Progression → Echoes yourself and use the Nexus "
+                    .. "Wishlist selector at its top.")
+            end
         else
+            CloseOtherNexusWindows()
             -- Show(tab) is a dot-call taking a tab index; no tab is passed
             -- (the journal opens its current tab).
             local pe = _G["ProjectEbonhold"]
@@ -1010,7 +1196,7 @@ local function EnsureFrame()
     setupGetStartedBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Assign Wishlist", 1, 1, 1)
-        GameTooltip:AddLine("Choose an existing server wishlist and associate it with this loadout.", 0.9, 0.9, 0.9, true)
+        GameTooltip:AddLine("Opens the Echo Journal with its Wishlist chooser for this loadout. Nothing is assigned until you choose a Wishlist there.", 0.9, 0.9, 0.9, true)
         GameTooltip:Show()
     end)
     setupGetStartedBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1026,6 +1212,9 @@ local function EnsureFrame()
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Import or create a wishlist", 1, 1, 1)
         GameTooltip:AddLine("Paste a wishlist string or build one directly in Nexus.", 0.9, 0.9, 0.9, true)
+        -- M4 (M2 O1): this button only opens the editor. The editor's own
+        -- Create & assign / Create unassigned actions are what save.
+        GameTooltip:AddLine("This opens the Wishlist editor with a draft. Nothing is saved or assigned until you press Create & assign or Create unassigned there.", 0.75, 0.75, 0.75, true)
         GameTooltip:Show()
     end)
     setupImportBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1037,9 +1226,12 @@ local function EnsureFrame()
     autoBtn:SetText(AutoLabel(nil))
     autoBtn:SetScript("OnClick", function()
         if callbacks and type(callbacks.ToggleAuto) == "function" then
+            local before = M.AutoSelectedNow()
             local ok, state = pcall(callbacks.ToggleAuto)
             -- The label, and at Auto OFF the release of a reserved roll block.
             if ok and state ~= nil then M.SetAuto(state and true or false) end
+            -- A click that left Auto OFF says why in the roll block (UX-09).
+            M.NoteAutoClick(before, ok, state)
         end
     end)
     autoBtn:SetScript("OnEnter", function(self)
@@ -1052,6 +1244,32 @@ local function EnsureFrame()
         GameTooltip:AddLine("OFF keeps recommendations visible; it does not turn off Sync.", 0.75, 0.75, 0.75, true)
         GameTooltip:AddLine("An off-Wishlist pick may occur when no eligible target or", 0.75, 0.75, 0.75, true)
         GameTooltip:AddLine("search action is available. Later improvement is not guaranteed.", 0.75, 0.75, 0.75, true)
+        -- What Auto may do (Readout.AutomationScopeLines): the session
+        -- selection, why it is not acting, and each permission the runtime
+        -- gates on with the existing control that changes it. Read from the
+        -- last committed model and Store.Settings only: hovering calls no gate,
+        -- requests, sends or writes nothing. Through the Nexus global (no new
+        -- upvalue: EnsureFrame is at the ceiling).
+        local readout = Nexus.Readout
+        if readout and type(readout.AutomationScopeLines) == "function" then
+            local model = type(M._lastModel) == "table" and M._lastModel or {}
+            local store = Nexus.Store
+            local okSettings, settings = false, nil
+            if store and type(store.Settings) == "function" then okSettings, settings = pcall(store.Settings) end
+            local internals = Nexus.MainInternals
+            local okRead, readOnly = false, nil
+            if internals and type(internals.SavedRootReadOnlyV1) == "function" then
+                okRead, readOnly = pcall(internals.SavedRootReadOnlyV1)
+            end
+            local held = model.auto and (type(model.paused) == "string" and model.paused
+                or (type(model.effective) == "table" and model.effective.hold and model.effective.reason)) or nil
+            GameTooltip:AddLine(" ")
+            for _, line in ipairs(readout.AutomationScopeLines({selected = model.auto == true,
+                held = held, settings = okSettings and settings or nil,
+                readOnly = okRead and readOnly ~= nil and readOnly ~= false})) do
+                GameTooltip:AddLine(line, 0.85, 0.85, 0.85, true)
+            end
+        end
         -- The button is the selection; this is what it is doing now, from
         -- the last committed model (memory only: waiting, rechecking,
         -- paused or ready, with the reason). The reason is in the player's
@@ -1085,7 +1303,8 @@ local function EnsureFrame()
     buildsBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:AddLine("Build Library", 1, 1, 1)
-        GameTooltip:AddLine("Open My Builds and browse shared community builds.", 0.8, 0.8, 0.8, true)
+        -- M4 (UX-15): "My Builds" is the game's page; the library scope is Mine.
+        GameTooltip:AddLine("Browse shared community builds, and under Mine your Saved Builds and shared listings.", 0.8, 0.8, 0.8, true)
         GameTooltip:Show()
     end)
     buildsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1126,9 +1345,35 @@ local function EnsureFrame()
         end
         local items = {
             { text = "Help / Getting Started", notCheckable = true,
-              func = MenuAction(function() if Nexus.Help then Nexus.Help.Show() end end) },
+              func = MenuAction(function() if Nexus.Help then Nexus.Help.Show("start") end end) },
+            -- Information only: reopens the first-launch guide (QuickStart
+            -- ShowSetup); it records nothing and never turns Auto ON.
+            { text = "Setup / Welcome", notCheckable = true,
+              func = MenuAction(function()
+                  local quick = Nexus.QuickStart
+                  local shown, why
+                  if quick and quick.ShowSetup then shown, why = quick.ShowSetup() end
+                  if not shown then
+                      print("|cffffd200Nexus:|r " .. (why == "warning-open"
+                          and "Answer the open Auto warning first (Yes or No); Setup / Welcome opens after it."
+                          or "Setup / Welcome is not available right now."))
+                  end
+              end) },
             { text = "Orbs / Lost Memories", notCheckable = true,
               func = MenuAction(function() if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end) },
+            -- What Auto may do, with each permission's current value; only
+            -- the existing setters change one (M.AutomationMenuItems).
+            { text = "Automation settings", notCheckable = true, hasArrow = true,
+              menuList = M.AutomationMenuItems(MenuAction) },
+            {
+                -- Opens the style and colour choices as their own menu.
+                text = "Appearance: " .. ((Nexus.Theme and Nexus.Theme.Summary)
+                    and Nexus.Theme.Summary() or "default") .. "...",
+                notCheckable = true,
+                func = MenuAction(function()
+                    if Nexus.Theme and Nexus.Theme.ShowMenu then Nexus.Theme.ShowMenu(self) end
+                end),
+            },
             {
                 -- Never disabled: the Releases page and the installed build are
                 -- available with no report, no peer and no Community catalog.
@@ -1207,8 +1452,9 @@ local function EnsureFrame()
     end)
     menuBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
-        GameTooltip:AddLine("Nexus Settings", 1, 1, 1)
-        GameTooltip:AddLine("Performance display, wishlist tools, HUD mode, and panel settings.", 0.8, 0.8, 0.8, true)
+        -- M4 (UX-15, M3 NB9): one name for this button everywhere.
+        GameTooltip:AddLine("Menu and status", 1, 1, 1)
+        GameTooltip:AddLine("Performance display, wishlist tools, HUD mode, appearance, and panel settings.", 0.8, 0.8, 0.8, true)
         -- model.status (Main.lua's statusLine, including "error (see /nexus
         -- err)") was set on every render but never read anywhere in this file --
         -- surfaced here so a real error is visible without knowing the slash
@@ -1242,7 +1488,7 @@ local function EnsureFrame()
     bestDpsText:SetPoint("BOTTOM", frame, "BOTTOM", 0, 33)
     bestDpsText:SetSize(280, 14)
     bestDpsText:SetJustifyH("CENTER")
-    bestDpsText:SetText("|cff888888Best DPS: hit a training dummy to record|r")
+    bestDpsText:SetText("|cff888888Your best DPS: hit a training dummy to record|r")
     bestDpsHit = HitFrame(frame, bestDpsText)
     bestDpsHit:SetScript("OnEnter", function(self)
         local info = M._lastModel and M._lastModel.bestDps
@@ -1282,6 +1528,10 @@ local function EnsureFrame()
         frame:SetBackdropColor(0.035, 0.035, 0.05, 0.94)
         frame:SetBackdropBorderColor(0.28, 0.28, 0.34, 0.9)
     end)
+
+    -- The HUD shares appearance with the Orb windows. Its marked difficulty /
+    -- Soul Ash child keeps its own backdrop and never joins the theme registry.
+    if Nexus.Theme and Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(frame, 0.94) end
 
     frame._footerButtons = {
         auto=autoBtn,builds=buildsBtn,leaderboard=leaderboardBtn,
@@ -1431,17 +1681,22 @@ local function RenderPerformance(pr, completed)
     local topDummy, topLK = dummy.global, lk.global
 
     local count = tonumber(pr.total) or 0
+    -- M4 (UX-14): the shared column is the best record this client knows for
+    -- these exact Echoes, not a global ranking (UserText.BEST_KNOWN).
+    local text = Nexus.UserText
+    local bestKnown = text and text.BEST_KNOWN or "Best known"
     if completed then
         performanceLabel:SetText("TRAINING DUMMY")
         setLabelText:SetText("")
         dummyLabel:SetText("Your Best")
-        dummyGlobal:SetText("Global Best")
+        dummyGlobal:SetText(bestKnown)
         lkPersonalLabel:SetText("LICH KING")
         lkLabel:SetText("Your Best")
-        lkGlobal:SetText("Global Best")
+        lkGlobal:SetText(bestKnown)
     else
         performanceLabel:SetText("DPS RECORDS")
-        setLabelText:SetText("Target build · " .. count .. " Echoes")
+        -- M4 (UX-13): the plan's rolled copies, not Echo rows or names.
+        setLabelText:SetText("Target build · " .. count .. " rolled copies")
         dummyLabel:SetText("Your Dummy")
         lkLabel:SetText("Your Lich King")
     end
@@ -1451,8 +1706,8 @@ local function RenderPerformance(pr, completed)
         dummyGlobalValue:SetText(topDummy and ("|cffffd200" .. FmtDps(topDummy.dps) .. "|r") or "|cff777777—|r")
         lkGlobalValue:SetText(topLK and ("|cffffd200" .. FmtDps(topLK.dps) .. "|r") or "|cff777777—|r")
     else
-        dummyGlobal:SetText(topDummy and ("Global  |cffffd200" .. FmtDps(topDummy.dps) .. "|r") or "Global  —")
-        lkGlobal:SetText(topLK and ("Global  |cffffd200" .. FmtDps(topLK.dps) .. "|r") or "Global  —")
+        dummyGlobal:SetText(topDummy and (bestKnown .. "  |cffffd200" .. FmtDps(topDummy.dps) .. "|r") or (bestKnown .. "  —"))
+        lkGlobal:SetText(topLK and (bestKnown .. "  |cffffd200" .. FmtDps(topLK.dps) .. "|r") or (bestKnown .. "  —"))
     end
 
     AddDpsTooltip(dummyHit, "Training Dummy", myDummy, topDummy)
@@ -1488,6 +1743,8 @@ function M.Init(cb)
 end
 
 function M.SetAuto(auto)
+    -- Auto ON ends the line of an earlier refused click.
+    if auto then M._autoRefusal = nil end
     if autoBtn then autoBtn:SetText(AutoLabel(auto and true or false)) end
     ReleaseRollOnAutoOff(auto and true or false)
 end
@@ -1636,6 +1893,14 @@ local function ApplyPanelLayout(layout, completed)
         statusText:ClearAllPoints()
         statusText:SetPoint("TOPLEFT", rollArea, "TOPLEFT", inset, -y)
         statusText:SetSize(boxes.roll.w-inset*2, layout.small)
+        local charges = frame._chargesText
+        if charges then
+            charges:ClearAllPoints()
+            charges:SetPoint("TOPRIGHT", rollArea, "TOPRIGHT", -inset, -y)
+            charges:SetSize(72, layout.small)
+            -- The heading keeps the rest of its row while charges are shown.
+            if charges:IsShown() then statusText:SetWidth(boxes.roll.w-inset*2-76) end
+        end
         y = y + layout.small + math.max(3,math.floor(layout.gap/2))
         for index = 1, 3 do
             local text = cardTexts[index]
@@ -1661,6 +1926,14 @@ local function ApplyPanelLayout(layout, completed)
             button:ClearAllPoints()
             button:SetPoint("BOTTOMRIGHT", rollArea, "BOTTOMRIGHT", -inset, math.ceil(layout.gap/2))
             button:SetSize(layout.orbButtonW, layout.orbButtonH)
+            local miniButton = frame._orbMiniBtn
+            if miniButton then
+                miniButton:ClearAllPoints()
+                miniButton:SetPoint("RIGHT", button, "LEFT", -layout.orbMiniButtonGap, 0)
+                miniButton:SetSize(layout.orbMiniButtonW, layout.orbButtonH)
+                miniButton:SetText(layout.orbMiniButtonLabel)
+                M.FitOrbMiniButton(miniButton)
+            end
         end
         recText:ClearAllPoints()
         recText:SetPoint("TOPLEFT", rollArea, "TOPLEFT", inset, -recY)
@@ -1726,9 +1999,10 @@ local function RenderBestDps(model, complete, noBuild, activeRoll, statusVisible
     if dummyBest or lkBest then
         local dummyText = dummyBest and ("|cff4dff80" .. FmtDps(dummyBest.dps) .. "|r") or "|cff777777—|r"
         local lkText = lkBest and ("|cff4dff80" .. FmtDps(lkBest.dps) .. "|r") or "|cff777777—|r"
-        bestDpsText:SetText("|cffb8b8b8Best DPS:|r  Dummy " .. dummyText .. "  |cff666666•|r  Lich King " .. lkText)
+        -- M4 (UX-14): the character's own records, not a shared ranking.
+        bestDpsText:SetText("|cffb8b8b8Your best DPS:|r  Dummy " .. dummyText .. "  |cff666666•|r  Lich King " .. lkText)
     else
-        bestDpsText:SetText("|cff888888Best DPS: hit a training dummy to record|r")
+        bestDpsText:SetText("|cff888888Your best DPS: hit a training dummy to record|r")
     end
     if not noBuild then
         bestDpsText:Show()
@@ -1756,7 +2030,7 @@ local function ApplyModel(model, signatures, roll)
             local cards = type(model.cards) == "table" and model.cards or {}
             local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
             local activeRoll = #cards > 0 or SafeText(model.recommendation) ~= ""
-                or (guide and SafeText(guide.text) ~= "") or false
+                or (guide and SafeText(guide.text) ~= "") or SafeText(model.autoNote) ~= "" or false
             local noBuild = total <= 0 or not pr.wishlistName
             local ss = type(model.serverStatus) == "table" and model.serverStatus or nil
             local statusVisible = ss and (ss.tier or ss.mode or ss.ash
@@ -1797,7 +2071,10 @@ local function ApplyModel(model, signatures, roll)
     local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
     -- With no build, the setup view already names the missing Wishlist.
     local guideText = (guide and total > 0 and name) and SafeText(guide.text) or ""
-    local activeRoll = #cards > 0 or recommendation ~= "" or guideText ~= ""
+    -- The inline Auto line (M.AutoNoteFor): why a selected Auto is not acting,
+    -- or why the last Auto click left it OFF. It shows the roll block too.
+    local autoNote = SafeText(model.autoNote)
+    local activeRoll = #cards > 0 or recommendation ~= "" or guideText ~= "" or autoNote ~= ""
     -- The roll block's space: current content, or a reservation through an
     -- ordinary gap between choices (RollPresentation). Content and actions
     -- still come only from the current model.
@@ -1833,8 +2110,13 @@ local function ApplyModel(model, signatures, roll)
                 orbButton=(activeRoll and guide and guide.openOrbs
                     and total > 0 and name) and true or false,
                 -- Rows for the body while it shows the Orb guidance or,
-                -- with the Open Orbs button, the Orb pause reason.
-                guidanceRows=(guideText ~= "" and (bodyText == guideText
+                -- with the Open Orbs button, the Orb pause reason; or, below
+                -- the cards, the recommendation with the inline Auto line
+                -- (without cards the body already has the card rows' space).
+                guidanceRows=(autoNote ~= "" and #cards > 0)
+                    and Nexus.LayoutMetrics.TextRows((bodyText ~= "" and (bodyText .. "\n") or "")
+                        .. autoNote, 248, fontScale)
+                    or (guideText ~= "" and (bodyText == guideText
                     or guide.openOrbs))
                     and Nexus.LayoutMetrics.TextRows(bodyText, 248, fontScale)
                     or 0,
@@ -1874,18 +2156,52 @@ local function ApplyModel(model, signatures, roll)
             -- With the Orb guidance and its button: the short form, which
             -- stays one line at every font scale.
             statusText:SetText(activeSlot > 0 and ("|cff4dff80Active:|r Slot " .. activeSlot) or "|cff888888Preview|r")
+        elseif model.auto == false then
+            -- The Auto selection is OFF (not merely held): Nexus only
+            -- recommends, and the player chooses in the game's window.
+            statusText:SetText("|cff7fd5ffAuto OFF — you choose|r"
+                .. (activeSlot > 0 and (" · Slot " .. activeSlot) or " · Preview"))
         else
             statusText:SetText(activeSlot > 0 and ("|cff4dff80Active:|r Roll recommendations active — Slot " .. activeSlot) or "|cff888888Preview: Roll recommendation preview|r")
         end
+        -- With Auto OFF, the one card the runtime marked as its Take target
+        -- (Readout.MarkedCard: exactly one, else none) carries a marker, and
+        -- an unstepped recommendation names it. Only the current model is
+        -- read, so no older marker survives a new board.
+        local marked = model.auto == false and Nexus.Readout and Nexus.Readout.MarkedCard
+            and Nexus.Readout.MarkedCard(cards) or nil
         for i = 1, 3 do
             local c = cards[i]
-            cardTexts[i]:SetText(type(c) == "table" and SafeText(c.text) or "")
+            local line = type(c) == "table" and SafeText(c.text) or ""
+            if marked == i and line ~= "" then line = "|cff4dff80>>|r " .. line end
+            cardTexts[i]:SetText(line)
         end
         -- An unresolved Orb action's own reason is more specific than the
         -- general pause text; otherwise the recommendation stays first. A
         -- reserved block has no current choice: it says so, and no more.
-        recText:SetText(activeRoll and bodyText
-            or "|cff888888No Echo choice is showing.|r")
+        local body = activeRoll and bodyText or "|cff888888No Echo choice is showing.|r"
+        if marked and activeRoll and bodyText == recommendation
+            and not (guide and guide.openOrbs) and type(cards[marked]) == "table" then
+            body = Nexus.Readout.RecommendationWithTarget(recommendation, SafeText(cards[marked].text))
+        end
+        -- The inline Auto line follows whatever the body shows, on its own line.
+        if autoNote ~= "" then body = (body ~= "" and (body .. "\n") or "") .. autoNote end
+        recText:SetText(body)
+        -- Compact charges, only from charge facts the model itself carries
+        -- (Readout.ChargesLine; unknown is "?", never 0).
+        local chargesText = frame._chargesText
+        if chargesText then
+            local line = type(model.charges) == "table" and Nexus.Readout
+                and Nexus.Readout.ChargesLine and Nexus.Readout.ChargesLine(model.charges) or ""
+            chargesText:SetText(line)
+            if line ~= "" then chargesText:Show() else chargesText:Hide() end
+            if frame._chargesHover then
+                if line ~= "" then frame._chargesHover:Show() else frame._chargesHover:Hide() end
+            end
+        end
+    elseif frame._chargesText then
+        frame._chargesText:Hide()
+        if frame._chargesHover then frame._chargesHover:Hide() end
     end
     if frame._orbsBtn then
         frame._orbsBtn.blockers = guide and guide.blockers or nil
@@ -1895,6 +2211,7 @@ local function ApplyModel(model, signatures, roll)
             frame._orbsBtn:Hide()
         end
     end
+    SetVisible(frame._orbMiniBtn, frame._orbsBtn and frame._orbsBtn:IsShown())
 
     missingNamesCache = type(pr.missing) == "table" and pr.missing or {}
     shedNamesCache = type(pr.shed) == "table" and pr.shed or {}
@@ -1997,7 +2314,13 @@ local function ApplyModel(model, signatures, roll)
         frame:SetHeight((showPerformance and (rollBlock and 448 or 325) or (rollBlock and 388 or 267)) - statusHeightReduction + toLockExtra)
         SetPoint(progressLabel, "TOPLEFT", frame, "TOPLEFT", 12, contentTop)
         SetPoint(progressValue, "TOPLEFT", frame, "TOPLEFT", 12, contentTop - 17)
-        progressValue:SetText(string.format("%d / %d complete", owned, total))
+        -- M4 (UX-13): rolled copies this run, with the locked targets still to
+        -- lock; never "complete" while a locked target is outstanding. The
+        -- short form keeps clear of the MISSING TOMES box on the same row.
+        local text = Nexus.UserText
+        progressValue:SetText(text and text.RunProgressText
+            and text.RunProgressText(owned, total, #toLockNamesCache, #unknownTomesCache > 0)
+            or string.format("%d / %d rolled copies this run", owned, total))
 
         SetPoint(needLabel, "TOPLEFT", frame, "TOPLEFT", 12, contentTop - 42)
         needLabel:SetText("STILL NEEDED")
@@ -2158,6 +2481,9 @@ function M.Render(model)
         candidate.recommendation=Nexus.UserText.Message(candidate.recommendation)
         candidate.status=Nexus.UserText.Message(candidate.status)
     end
+    -- The inline Auto line, from this model and the last refused Auto click
+    -- (memory only); recomputed on every render, so an old one never stays.
+    candidate.autoNote = M.AutoNoteFor(candidate)
     local signatures = ModelSignatures(candidate)
     -- The reservation changes the layout, so it is part of its signature.
     local roll = RollPresentation(candidate)
@@ -2217,6 +2543,141 @@ function M.Refresh()
     if M._lastModel then return M.Render(M._lastModel) end
     return false
 end
+-- The inline Auto line of the roll block (UX-09), from the model and the last
+-- refused Auto click only: why a selected Auto is not acting, in plain words
+-- with what helps (not for a wait for a sent action, whose heading and line
+-- already say it, and not when the Orb guidance is itself the pause reason:
+-- an Orb run or the Orb-state gate, shown with Open Orbs); or why the last
+-- Auto click left Auto OFF. Other guidance (for example "An Echo choice is
+-- open", which every board carries and the body does not show beside a
+-- recommendation) does not explain a pause and does not hide it. Passive:
+-- memory only, no gate, request or action; nil when there is nothing to say.
+function M.AutoNoteFor(model)
+    if type(model) ~= "table" or not Nexus.Readout then return nil end
+    local pr = type(model.progress) == "table" and model.progress or {}
+    local total, owned = tonumber(pr.total) or 0, tonumber(pr.owned) or 0
+    -- Without a build the setup view stands in this space (M.NoteAutoClick prints).
+    if total <= 0 or not pr.wishlistName then return nil end
+    local refusal = M._autoRefusal
+    if model.auto == false and type(refusal) == "table" and type(refusal.text) == "string"
+        and (tonumber(GetTime()) or 0) - (tonumber(refusal.at) or 0) <= 60 then
+        return refusal.text
+    end
+    if not (model.auto and type(model.paused) == "string" and model.paused ~= "") then return nil end
+    local complete = owned >= total and #(type(pr.toLock) == "table" and pr.toLock or {}) == 0
+    local effective = type(model.effective) == "table" and model.effective.state or nil
+    local guide = type(model.orbGuidance) == "table" and model.orbGuidance or nil
+    local orbPause = guide and (guide.state == "orb-run" or guide.state == "orb-state")
+        and SafeText(guide.text) ~= ""
+    if complete or effective == "waiting" or effective == "rechecking" or orbPause then
+        return nil
+    end
+    return Nexus.Readout.AutoHoldNote and Nexus.Readout.AutoHoldNote(model.paused) or nil
+end
+
+-- The "Automation settings" submenu of the ... menu (UX-10): every permission
+-- Auto gates on, with its current value (Readout.AutomationSettingsRows), read
+-- from Store.Settings and the runtime's counters when the menu opens. Opening,
+-- hovering or closing it changes nothing. Only the Reroll and Freeze rows act,
+-- through their existing setter (/nexus reroll|freeze on|off: MainCommands to
+-- Main's rollingOption); Lock Wishlist Echoes opens the Wishlist Editor, whose
+-- own control is its setter; the last row opens Help. `action` wraps a click
+-- (the menu's MenuAction: it closes the menu first).
+function M.AutomationMenuItems(action)
+    local readout = Nexus.Readout
+    if not (readout and type(readout.AutomationSettingsRows) == "function") then
+        return {{text = "Automation settings are not available yet", notCheckable = true, disabled = true}}
+    end
+    local store = Nexus.Store
+    local okSettings, settings = false, nil
+    if store and type(store.Settings) == "function" then okSettings, settings = pcall(store.Settings) end
+    local internals = Nexus.MainInternals
+    local okRead, readOnly = false, nil
+    if internals and type(internals.SavedRootReadOnlyV1) == "function" then
+        okRead, readOnly = pcall(internals.SavedRootReadOnlyV1)
+    end
+    local rows = readout.AutomationSettingsRows({selected = M.AutoSelectedNow() == true,
+        settings = okSettings and settings or nil,
+        readOnly = okRead and readOnly ~= nil and readOnly ~= false})
+    local items = {}
+    for _, row in ipairs(rows) do
+        local item = {text = row.text}
+        if row.kind == "title" then
+            item.isTitle, item.notCheckable = true, true
+        elseif row.kind == "toggle" then
+            local command = row.command
+            item.checked = row.checked == true
+            item.func = action(function()
+                local slash = SlashCmdList and SlashCmdList.NEXUS
+                if type(slash) == "function" then slash(command) end
+            end)
+        elseif row.kind == "editor" then
+            item.notCheckable = true
+            item.func = action(function()
+                local help = Nexus.Help
+                if help and type(help.OpenEditor) == "function" then help.OpenEditor() end
+            end)
+        elseif row.kind == "help" then
+            item.notCheckable = true
+            item.func = action(function() if Nexus.Help then Nexus.Help.Show("rolling") end end)
+        else
+            item.notCheckable, item.disabled = true, true
+        end
+        items[#items + 1] = item
+    end
+    return items
+end
+
+-- Whether Auto is selected now, from the runtime's counters (memory only).
+function M.AutoSelectedNow()
+    if type(Nexus.RecomputeStats) ~= "function" then return nil end
+    local ok, stats = pcall(Nexus.RecomputeStats)
+    if not ok or type(stats) ~= "table" then return nil end
+    return stats.autoEnabled == true
+end
+
+-- After an Auto button click: when Auto was OFF, stayed OFF and no warning
+-- opened (the warning is its own next step), remember why for the roll block
+-- and render the last model again. Any other outcome forgets an earlier one.
+-- Reads only; it never toggles, retries or requests.
+function M.NoteAutoClick(before, ok, state)
+    local warning = Nexus.OverwriteWarning
+    local open = warning and type(warning.IsOpen) == "function" and warning.IsOpen()
+    if before ~= false or not ok or state ~= false or open then
+        M._autoRefusal = nil
+        return false
+    end
+    local orb = Nexus.OrbRuntime
+    local blocked = false
+    if orb and type(orb.BlocksOrdinary) == "function" then
+        local okOrb, value = pcall(orb.BlocksOrdinary)
+        blocked = okOrb and value == true
+    end
+    local model = type(M._lastModel) == "table" and M._lastModel or nil
+    local status = model and SafeText(model.status) or ""
+    local kind = blocked and "orb"
+        or ((not warning or type(warning.RequestAuto) ~= "function") and "warning") or nil
+    local text = Nexus.Readout and Nexus.Readout.AutoRefusalText
+        and Nexus.Readout.AutoRefusalText(kind, status) or ("Auto stayed OFF. " .. status)
+    M._autoRefusal = {text = text, at = tonumber(GetTime()) or 0}
+    local pr = model and type(model.progress) == "table" and model.progress or {}
+    if not model or (tonumber(pr.total) or 0) <= 0 or not pr.wishlistName then
+        -- No roll block to show it in: said once in chat instead.
+        print("|cffffd200Nexus:|r " .. text)
+        return true
+    end
+    -- The ordinary render transaction of the last committed model with its
+    -- own raw text (as ReleaseRollOnAutoOff); nothing else changes.
+    local copy = DefensiveCopy(model)
+    local rawText = renderState.rawText or {}
+    copy.status, copy.recommendation = rawText.status, rawText.recommendation
+    local rendered, why = pcall(M.Render, copy)
+    if not rendered and Nexus.Errors and type(Nexus.Errors.Record) == "function" then
+        pcall(Nexus.Errors.Record, "Panel.NoteAutoClick", why)
+    end
+    return true
+end
+
 function M.SetStatus(status)
     if not M._lastModel then return false end
     local nextStatus = SafeText(Nexus.UserText and Nexus.UserText.Message(status) or status)

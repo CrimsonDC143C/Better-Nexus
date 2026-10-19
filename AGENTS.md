@@ -8,6 +8,12 @@ Use an isolated checkout for overlapping work. Coordinate candidate ownership an
 
 ## Agent skills
 
+### Engineering workflow
+
+Use the installed Matt `implement`, `tdd` and `code-review` flows when relevant; their availability does not prove that a worker read or followed them. Start from the current issue or spec and keep one small vertical slice in scope. For behavioral changes, establish a meaningful failing test before the repair where practical, then run focused checks and the required full suite against the final source pin. Do not invent a behavioral red test for documentation-only work or weaken an assertion to obtain green.
+
+Review from a pinned base along independent **Spec** and **Standards** axes before acceptance. Cite the originating requirements and documented repository rules separately; keep heuristic design advice distinct from hard violations. Preserve failed checks and report unavailable validation honestly. Existing merge, native and release authority still governs the next action.
+
 ### Issue tracker
 
 Durable public work is tracked in GitHub Issues for `Viscerals/Better-Nexus`. Read `docs/agents/issue-tracker.md` before tracker work.

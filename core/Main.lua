@@ -111,6 +111,9 @@ end
 function Nexus.DisableOrdinaryAutomation()
     local runtime=Automation()
     if not runtime then return false,"Ordinary automation owner is not ready." end
+    if Nexus.OverwriteWarning and Nexus.OverwriteWarning.CancelAuto then
+        Nexus.OverwriteWarning.CancelAuto(runtime)
+    end
     if runtime.AutoEnabled() then runtime.ToggleAuto() end
     if Panel and Panel.SetAuto then Panel.SetAuto(false) end
     return runtime.AutoEnabled()==false

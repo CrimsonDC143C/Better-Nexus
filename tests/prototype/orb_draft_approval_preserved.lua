@@ -35,7 +35,10 @@ local function Up(fn,name)
  for i=1,300 do local n,v=debug.getupvalue(fn,i);if n==nil then return nil end;if n==name then return v end end
 end
 local function Locals(M)
- return {config=Up(M.Status,'config') or Up(M.SetLimit,'config'),run=Up(M.Status,'run'),approval=Up(M.Confirm,'approval')}
+ -- Status may be decorated by the optional timing dispatcher. Inspect its
+ -- original body without calling it, so observation is still non-advancing.
+ local status=Up(M.Status,'status') or M.Status
+ return {config=Up(status,'config') or Up(M.SetLimit,'config'),run=Up(status,'run'),approval=Up(M.Confirm,'approval')}
 end
 local function Stored() local st=Nexus.Store.State();return Ser(st and st.orbRefinement) end
 local function Prefs(c) return Ser({maxOrbs=c.maxOrbs,recycle=c.recycle,excluded=c.excluded,name=c.name}) end

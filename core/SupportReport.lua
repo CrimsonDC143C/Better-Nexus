@@ -811,6 +811,170 @@ function M.OrbLines()
     return unavailable
 end
 
+-- Targeted diagnostics are read only when the player builds/copies a report.
+-- Fixed fields and labels only: no game refresh, timers, heap sampling, names,
+-- arbitrary payloads, or writes are performed by these accessors/formatters.
+local DIAG_PATHS = {['orb.status']=true,['orb.read']=true,['orb.panel']=true,
+    ['echo.reconcile']=true,['hud.prepare']=true,['lifecycle.update']=true,
+    ['sync.update']=true,['gameadapter.poll']=true,['dps.update']=true,
+    ['lifecycle.phase.catalog']=true}
+local ASSIGN_PATHS = {['assignment.read']=true,['assignment.slots']=true,
+    ['assignment.discovery']=true,['assignment.candidates']=true,
+    ['assignment.state']=true,['assignment.wishlist']=true,['assignment.projection']=true}
+local ASSIGN_BRANCHES = {legacy=true,table=true,first_run=true,unassigned=true,
+    loading=true,discovery=true,unclassified=true}
+local ASSIGN_COUNTS = {slots_reads=true,candidate_builds=true,candidate_rows=true,
+    discovery_rows=true,projection_rows=true}
+local function diagRead(owner,method)
+    local fn=type(owner)=='table' and rawget(owner,method)
+    if type(fn)~='function' then return nil end
+    local ok,value=pcall(fn)
+    return ok and type(value)=='table' and value or nil
+end
+local function dg(t,k) if type(t)=='table' then return rawget(t,k) end return nil end
+local function dn(v)
+    if type(v)~='number' or v~=v or v==math.huge or v==-math.huge or math.abs(v)>9007199254740991 then return 'unknown' end
+    return string.format('%.17g',v==0 and 0 or v)
+end
+local function db(v) return v==true and 'yes' or v==false and 'no' or 'unknown' end
+local DIAG_CODES={unknown=true,available=true,unavailable=true,failed=true,
+    frozen_or_zero_window=true,unavailable_or_changed=true,durable=true,
+    session_only=true,retained=true,receipt_budget=true,archive_shape=true,
+    archive_budget=true,foreign_journal=true,restored_receipt=true,older_receipt=true,
+    no_receipt=true,capture_failed=true,invalid_journal=true,equal=true,one_below=true,lower=true,higher=true,
+    before=true,source_removed=true,neither=true,l=true,r=true,w=true,
+    receipt=true,pre_call=true,spend_submitted=true,spend_ambiguous=true,spend_rejected=true,
+    host_call=true,host_true=true,host_false=true,host_error=true,host_other=true,
+    pick_call=true,pick_true=true,pick_false=true,pick_unknown=true,write_refused=true,
+    select_submitted=true,select_ambiguous=true,select_rejected=true,pick=true,read=true,
+    leave=true,enter=true,logout=true}
+local function dc(v)
+    if type(v)=='string' and DIAG_CODES[v] then return v end
+    return 'unknown'
+end
+local function diagAggregate(out,row,kind)
+    local available=dg(row,'available')==true
+    out[#out+1]=kind..' '..dg(row,'name')..': invocations='..dn(dg(row,'invocations'))
+        ..'; timed='..dn(dg(row,'count'))..'; observed='..db(dg(row,'available'))
+        ..'; inclusive_ms='..(available and dg(row,'totalAvailable')==true and dn(dg(row,'totalMs')) or 'unknown')
+        ..'; total_valid='..db(dg(row,'totalAvailable'))..'; max_ms='..(available and dn(dg(row,'maximumMs')) or 'unknown')
+        ..'; failed='..dn(dg(row,'failed'))..'; unavailable='..dn(dg(row,'unavailable'))
+end
+function M.TargetedDiagnosticLines(summary)
+    local out={}
+    local performance=type(Nexus)=='table' and rawget(Nexus,'Performance') or nil
+    local orb=type(Nexus)=='table' and rawget(Nexus,'OrbRuntime') or nil
+    local detail=diagRead(performance,'SnapshotDiagnostics')
+    local assignment=diagRead(performance,'SnapshotAssignmentDetail')
+    local boundary=diagRead(orb,'BoundaryDiagnostics')
+    out[#out+1]='Targeted stutter diagnostics: configured='..db(dg(detail,'enabled'))
+        ..'; clock='..dc(dg(detail,'clockState'))..'; memory='..dc(dg(detail,'memoryState'))
+        ..'; retained_spans='..dn(type(dg(detail,'spans'))=='table' and #dg(detail,'spans') or nil)
+        ..'; reset='..dn(dg(detail,'resetGeneration'))..'; last_id='..dn(dg(detail,'lastSpanId'))
+    out[#out+1]='Assignment detail: configured='..db(dg(assignment,'enabled'))
+        ..'; ordinary_enabled='..db(dg(assignment,'ordinaryEnabled'))..'; clock='..dc(dg(assignment,'clockState'))
+        ..'; reads='..dn(dg(assignment,'observedReadInvocations'))..'; window_available='..db(dg(assignment,'windowAvailable'))
+    local snap=dg(boundary,'snapshot')
+    out[#out+1]='Orb boundary diagnostics: observed='..db(dg(boundary,'observed'))
+        ..'; receipt_present='..db(dg(boundary,'receiptPresent'))
+        ..'; mode='..dc(dg(boundary,'mode'))..'; reason='..dc(dg(boundary,'reason'))
+        ..'; receipt_entries='..dn(dg(boundary,'retained'))..'; durable_written_entries='..dn(dg(boundary,'durableRetained'))
+        ..'; session_entries='..dn(type(dg(boundary,'sessionJournal'))=='table' and #dg(boundary,'sessionJournal') or nil)
+        ..'; prior_written_omitted='..dn(dg(boundary,'priorWrittenOmitted'))
+        ..'; dropped='..dn(dg(boundary,'dropped'))
+        ..'; capture_failures='..dn(dg(boundary,'captureFailures'))..'; unsaved='..db(dg(boundary,'unsaved'))
+        ..'; current_epoch='..dn(dg(boundary,'epoch'))..'; current_phase='..dc(dg(boundary,'phase'))
+    out[#out+1]='Orb comparisons: before='..dn(dg(snap,'chargesBefore'))..'; now='..dn(dg(snap,'chargesNow'))
+        ..'; charge_relation='..dc(dg(snap,'chargeRelation'))..'; owned_relation='..dc(dg(snap,'ownedRelation'))
+        ..'; offer='..db(dg(snap,'offerPresent'))..'; pick='..db(dg(snap,'pickInFlight'))
+        ..'; host='..db(dg(snap,'hostPending'))..'; epoch='..dn(dg(snap,'epoch'))..'; phase='..dc(dg(snap,'phase'))
+    if summary then return out end
+    out[#out+1]='Diagnostic durations are inclusive elapsed milliseconds; direct-child residuals are not exclusive addon CPU.'
+    out[#out+1]='Heap fields are GLOBAL NET Lua heap KB, not bytes allocated or GC duration. Session and millisecond clocks are separate; frozen/unavailable windows do not establish hitch correlation.'
+    out[#out+1]='Row heap totals sum invocation net changes and can overlap nested spans; do not add rows as whole-window memory. Instrumentation itself is included.'
+    out[#out+1]='Diagnostic collection is opt-in/default OFF and adds measured overhead while ON; report formatting is outside its measured intervals.'
+    local sources={['debugprofilestop']=true,['GetTime milliseconds']=true,
+        ['injected millisecond clock']=true,['GetTime']=true,['injected session clock']=true,
+        ['collectgarbage count; global Lua heap']=true,['injected global Lua heap reader']=true}
+    local function sourceLabel(v) return sources[v] and v or 'unknown' end
+    out[#out+1]='Diagnostic sources: elapsed='..sourceLabel(dg(detail,'elapsedClock'))
+        ..'; session='..sourceLabel(dg(detail,'sessionClock'))..'; heap='..sourceLabel(dg(detail,'heapMetric'))
+    out[#out+1]='A GetTime millisecond fallback is a coarse frame clock; zero elapsed does not prove free execution.'
+    out[#out+1]='Diagnostic clocks: generation='..dn(dg(detail,'clockGeneration'))..'; failures='..dn(dg(detail,'clockFailures'))
+        ..'; session_state='..dc(dg(detail,'sessionClockState'))..'; session_generation='..dn(dg(detail,'sessionClockGeneration'))
+        ..'; session_failures='..dn(dg(detail,'sessionClockFailures'))..'; memory_failures='..dn(dg(detail,'memoryFailures'))
+        ..'; depth_bypasses='..dn(dg(detail,'depthBypasses'))..'; id_bypasses='..dn(dg(detail,'idBypasses'))
+        ..'; rejected_labels='..dn(dg(detail,'rejectedLabels'))
+    for i=1,10 do
+        local row=dg(dg(detail,'rows'),i)
+        if type(row)=='table' and DIAG_PATHS[dg(row,'name')] then
+            diagAggregate(out,row,'Diagnostic row')
+            out[#out+1]='  residual_ms='..(dg(row,'residualAvailable')==true and dg(row,'residualTotalAvailable')==true and dn(dg(row,'residualTotalMs')) or 'unknown')
+                ..'; residual_count='..dn(dg(row,'residualCount'))..'; residual_available='..db(dg(row,'residualAvailable'))
+                ..'; residual_total_valid='..db(dg(row,'residualTotalAvailable'))
+                ..'; heap_net_KB='..(dg(row,'heapAvailable')==true and dg(row,'heapNetAvailable')==true and dn(dg(row,'heapNetKB')) or 'unknown')
+                ..'; heap_count='..dn(dg(row,'heapCount'))..'; heap_available='..db(dg(row,'heapAvailable'))
+                ..'; heap_total_valid='..db(dg(row,'heapNetAvailable'))
+        end
+    end
+    for i=1,32 do
+        local span=dg(dg(detail,'spans'),i)
+        if type(span)=='table' and DIAG_PATHS[dg(span,'name')] then
+            out[#out+1]='Diagnostic span '..dn(dg(span,'id'))..': '..dg(span,'name')..'; parent='..dn(dg(span,'parentId'))
+                ..'; depth='..dn(dg(span,'depth'))..'; reset='..dn(dg(span,'resetGeneration'))
+                ..'; clock_generation='..dn(dg(span,'clockGeneration'))..'; start_ms='..dn(dg(span,'startedMs'))..'; end_ms='..dn(dg(span,'endedMs'))
+                ..'; elapsed_available='..db(dg(span,'elapsedAvailable'))..'; elapsed_ms='..dn(dg(span,'elapsedMs'))
+                ..'; child_ms='..dn(dg(span,'childElapsedMs'))..'; child_coverage='..db(dg(span,'childCoverageAvailable'))
+                ..'; residual_available='..db(dg(span,'residualAvailable'))..'; residual_ms='..dn(dg(span,'residualMs'))
+            out[#out+1]='  session_generation='..dn(dg(span,'sessionClockGeneration'))..'; session_start='..dn(dg(span,'sessionStart'))
+                ..'; session_end='..dn(dg(span,'sessionEnd'))..'; session_available='..db(dg(span,'sessionWindowAvailable'))
+                ..'; session_reason='..dc(dg(span,'sessionWindowReason'))..'; heap_before_KB='..dn(dg(span,'heapBeforeKB'))
+                ..'; heap_after_KB='..dn(dg(span,'heapAfterKB'))..'; heap_net_KB='..dn(dg(span,'heapNetKB'))
+                ..'; heap_available='..db(dg(span,'heapAvailable'))..'; succeeded='..db(dg(span,'succeeded'))
+        end
+    end
+    out[#out+1]='Assignment window: start_ms='..dn(dg(assignment,'windowStartMs'))..'; end_ms='..dn(dg(assignment,'windowEndMs'))
+        ..'; unavailable_reads='..dn(dg(assignment,'unavailableReads'))..'; rejected_labels='..dn(dg(assignment,'rejectedLabels'))
+    for i=1,7 do
+        local row=dg(dg(assignment,'rows'),i)
+        if type(row)=='table' and ASSIGN_PATHS[dg(row,'name')] then diagAggregate(out,row,'Assignment row') end
+        local branch=dg(dg(assignment,'branches'),i)
+        if type(branch)=='table' and ASSIGN_BRANCHES[dg(branch,'name')] then
+            diagAggregate(out,branch,'Assignment branch')
+            for j=1,5 do
+                local work=dg(dg(branch,'work'),j)
+                if type(work)=='table' and ASSIGN_COUNTS[dg(work,'name')] then
+                    out[#out+1]='  '..dg(work,'name')..'='..dn(dg(work,'value'))
+                end
+            end
+        end
+    end
+    for i=1,49 do
+        local edge=dg(dg(assignment,'edges'),i)
+        if type(edge)=='table' and ASSIGN_PATHS[dg(edge,'parent')] and ASSIGN_PATHS[dg(edge,'child')] and dg(edge,'count')~=0 then
+            out[#out+1]='Assignment edge '..dg(edge,'parent')..' -> '..dg(edge,'child')..': count='..dn(dg(edge,'count'))
+        end
+    end
+    out[#out+1]='Orb journal is local observation/provenance only; a local epoch/entry is not a server transaction token. Missing history remains unknown.'
+    out[#out+1]='Orb comparisons and journal entries are last-observed facts; if receipt_present=no they are not a current saved pending receipt.'
+    local fields={'event','epoch','phase','charge','relation','owned','offer','pick','host'}
+    for _,kind in ipairs({'receiptJournal','sessionJournal'}) do
+        local list=dg(boundary,kind)
+        for i=1,8 do
+            local entry=dg(list,i)
+            if type(entry)=='table' then
+                local parts={kind..' '..i}
+                for _,key in ipairs(fields) do
+                    local v=dg(entry,key)
+                    parts[#parts+1]=key..'='..(type(v)=='number' and dn(v) or type(v)=='boolean' and db(v) or dc(v))
+                end
+                out[#out+1]=table.concat(parts,'; ')
+            end
+        end
+    end
+    return out
+end
+
 function M.Summary(selection)
     local support = Nexus and Nexus.SupportIncidents
     -- Protected like every other owner read here: an incident owner that
@@ -898,6 +1062,7 @@ function M.Summary(selection)
     end
     -- After the Lua error line, so a nearly full summary keeps that first.
     for _, line in ipairs(M.OrbLines()) do context[#context + 1] = line end
+    for _, line in ipairs(M.TargetedDiagnosticLines(true)) do context[#context + 1] = line end
     local omitted = 0
     for _, line in ipairs(context) do
         local size = #escape(line) + 1
@@ -979,6 +1144,24 @@ local function factFlag(value)
     if value == false then return "no" end
     return "unknown"
 end
+
+-- This is the runtime's effective session setting, not a reconstruction of a
+-- switch or the saved preference. In a read-only profile Store.Settings may
+-- return a validated session view. Copy only this boolean; never enumerate or
+-- serialize the settings table. A failed owner leaves the rest of the report.
+local function tomePermissionLine()
+    local ok, permission = pcall(function()
+        local owner = Nexus and Nexus.Store
+        if type(owner) ~= "table" or type(owner.Settings) ~= "function" then return nil end
+        local settings = owner.Settings()
+        if type(settings) ~= "table" then return nil end
+        return rawget(settings, "autoDisable")
+    end)
+    if not ok then permission = nil end
+    return "Tome management at capture: permission=" .. factFlag(permission)
+        .. " (autoDisable; effective session setting, not earlier switch history)"
+end
+
 local function factCount(value)
     if type(value) == "number" and value == math.floor(value)
         and value >= 0 and value <= 9999999 then
@@ -1237,6 +1420,85 @@ local function selectRow(label, row)
         .. " rechecks requested for it=" .. factCount(row.rechecks)
         .. (row.resolvedAt ~= nil and " resolved after=" or " age at last poll=") .. age
         .. (row.outcome ~= nil and (" outcome=" .. factCode(row.outcome, SELECT_OUTCOMES)) or "")
+end
+
+-- Detached session observations, never an action/read refresh. Gate bit masks
+-- distinguish an evaluated refusal from branches the normal loop never visited.
+function M.TomeObservationLines()
+    local out={"-- tome observations (memory only; normal reads/calls, not refreshed) --"}
+    local view=accessorFacts("GameAdapter","TomeObservationFacts",{
+        "schema","cap","revision","retained","dropped","armObserved","armInProgress",
+        "attempts","accepted","arm","assignment","transaction","tracked","resolution","pause","events"})
+    if not view then out[#out+1]="Tome observations: unavailable (no observational owner)";return out end
+    local codes={not_observed=true,auto=true,permission=true,plan=true,advisor=true,
+        discovery=true,pause=true,spacing=true,eligible=true,opt_out=true,disabled=true,
+        visit_done=true,candidate=true,no_known_member=true,accepted=true,refused=true,
+        passive=true,["no api"]=true,["unknown lever"]=true,["non-conformant lever"]=true,
+        ["not level 1"]=true,pending=true,already=true,mirror_match=true,
+        catalog_missing=true,expired=true,first=true,loadout=true,unknown=true}
+    local kinds={boolean=true,["nil"]=true,number=true,string=true,table=true,
+        ["function"]=true,userdata=true,thread=true,mixed=true,not_evaluated=true,unknown=true}
+    out[#out+1]="Tome observations: schema="..factCount(view.schema)
+        .."; arm_observed="..factFlag(view.armObserved).."; in_progress="..factFlag(view.armInProgress)
+        .."; retained="..factCount(view.retained).."/"..factCount(view.cap)
+        .."; evicted="..factCount(view.dropped).."; revision="..factCount(view.revision)
+    out[#out+1]="Tome gate bits: AutoAllowed aggregate 1, permission 2, plan 4, not-advisor 8, discovery 16, not-paused 32, spacing 64; unvisited = not evaluated/unknown. An auto gate hold is not proof of master Auto OFF; selected/master state is reported separately."
+    local arm=type(view.arm)=="table" and view.arm or {}
+    out[#out+1]="Tome arm: gate="..factCode(arm.gate,codes).."; level="..factCount(arm.level)
+        .."; visited="..factCount(arm.visited).."; passed="..factCount(arm.passed)
+        .."; keep="..factCount(arm.keep).."; disable="..factCount(arm.disable)
+        .."; checked="..factCount(arm.checked).."; no_known="..factCount(arm.noKnown)
+        .."; opt_out="..factCount(arm.optOut).."; already_disabled="..factCount(arm.disabled)
+        .."; visit_done="..factCount(arm.done).."; last_lever="..factCount(arm.lastLever)
+        .."; known_kind="..factCode(arm.knownKind,kinds).."; known="..factFlag(arm.known)
+        .."; known_member="..factCount(arm.knownMember)
+        .."; completed_association_sequence="..factCount(arm.assignmentSequence)
+    local pause=type(view.pause)=="table" and view.pause or {}
+    local pauseSources={bag=true,popup=true,settling=true,clear=true,unknown=true}
+    out[#out+1]="Tome pause at last normal guard read: observed="..factFlag(pause.observed)
+        .."; source="..factCode(pause.source,pauseSources)
+        .."; last_positive="..factCode(pause.lastPositive,pauseSources)
+        .."; remaining_seconds_at_read_rounded_up="..factCount(pause.remainingSeconds)
+        .." (not refreshed; bag short-circuits popup inspection; no current-state or duration proof)"
+    local assignment=type(view.assignment)=="table" and view.assignment or {}
+    out[#out+1]="Tome association: observed="..factFlag(assignment.observed)
+        .."; kind="..factCode(assignment.kind,codes).."; destination="..factCount(assignment.loadout)
+        .."; wishlist_slot="..factCount(assignment.wishlist).."; local_sequence="..factCount(assignment.sequence)
+    out[#out+1]="Tome calls: attempts="..factCount(view.attempts).."; accepted="..factCount(view.accepted)
+        .." (adapter return interpretation, not server acceptance)"
+    local transaction=type(view.transaction)=="table" and view.transaction or {}
+    out[#out+1]="Tome last attempt: observed="..factFlag(transaction.observed)
+        .."; lever="..factCount(transaction.lever).."; member="..factCount(transaction.member)
+        .."; want_disabled="..factFlag(transaction.want).."; admission="..factCode(transaction.admission,codes)
+        .."; return_kind="..factCode(transaction.rawKind,kinds).."; interpreted_prior_disabled="..factFlag(transaction.cur)
+    local tracked=type(view.tracked)=="table" and view.tracked or {}
+    out[#out+1]="Tome last accepted/tracked request: observed="..factFlag(tracked.observed)
+        .."; lever="..factCount(tracked.lever).."; member="..factCount(tracked.member)
+        .."; want_disabled="..factFlag(tracked.want).."; local_accepted_ordinal="..factCount(tracked.acceptedOrdinal)
+        .."; pending="..factFlag(tracked.pending).." (this request only, not all pending requests)"
+    local resolution=type(view.resolution)=="table" and view.resolution or {}
+    local interpretedResolution
+    if resolution.rawKind=="boolean" then interpretedResolution=resolution.cur end
+    out[#out+1]="Tome last resolution: observed="..factFlag(resolution.observed)
+        .."; lever="..factCount(resolution.lever).."; want_disabled="..factFlag(resolution.want)
+        .."; outcome="..factCode(resolution.outcome,codes).."; interpreted_disabled="..factFlag(interpretedResolution)
+        .."; mirror_kind="..factCode(resolution.rawKind,kinds)
+        .."; age_at_poll="..factAge(type(resolution.age)=="number" and math.floor(resolution.age) or nil)
+    out[#out+1]="A mirror_match is the existing normal poll's matching interpretation, not server authenticity. nil/mixed cannot distinguish missing values from swallowed errors; expired is not a refusal. Resolution mirror_kind (and resolution-event raw_kind) not_evaluated/mixed means the actual mirror is UNKNOWN; interpreted predicates are not individual raw answers. Local sequences are not server tokens. No prior session is reconstructed."
+    local events=type(view.events)=="table" and view.events or {}
+    local eventKinds={arm=true,assignment=true,attempt=true,resolution=true}
+    for i=1,math.min(#events,16) do
+        local row=type(events[i])=="table" and events[i] or {}
+        local interpretedEvent=row.cur
+        if row.kind=="resolution" and row.rawKind~="boolean" then interpretedEvent=nil end
+        out[#out+1]="Tome event #"..factCount(row.seq)..": kind="..factCode(row.kind,eventKinds)
+            .."; code="..factCode(row.code,codes).."; lever="..factCount(row.lever)
+            .."; want_disabled="..factFlag(row.want).."; member="..factCount(row.member)
+            .."; raw_kind="..factCode(row.rawKind,kinds).."; interpreted_disabled="..factFlag(interpretedEvent)
+            .."; age_at_poll="..factAge(type(row.age)=="number" and math.floor(row.age) or nil)
+            .."; visited="..factCount(row.visited).."; passed="..factCount(row.passed)
+    end
+    return out
 end
 
 local function selectRecoveryLines()
@@ -1537,11 +1799,21 @@ function M.Step(job)
                 for _, line in ipairs(lockedShapeLines()) do out[#out + 1] = line end
                 return out
             end},
+            {name = "targeted diagnostics", build = function()
+                local out = {"-- targeted diagnostics (bounded observations; no automatic refresh) --"}
+                for _, line in ipairs(M.TargetedDiagnosticLines(false)) do out[#out + 1] = line end
+                return out
+            end},
             {name = "select recovery", build = function()
                 local out = {"-- ordinary Select recovery (memory only; facts as observed, not refreshed) --"}
                 for _, line in ipairs(selectRecoveryLines()) do out[#out + 1] = line end
                 return out
             end},
+            {name = "tome permission", build = function()
+                return {"-- tome management permission (capture only; no action or refresh) --",
+                    tomePermissionLine()}
+            end},
+            {name = "tome observations", build = M.TomeObservationLines},
         }
         -- The local roll record (core/RollRecorder.lua), so a tester sends one
         -- private file. Bounded: at most 256 records of at most 2 KiB each.

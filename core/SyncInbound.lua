@@ -93,8 +93,11 @@ function Inbound.New(options)
         "DPS relay validation callback required")
     local commitBuild = assert(options.commitBuild,
         "build commit callback required")
-    local observe = type(options.observe) == "function"
-        and options.observe or function() end
+    local function observe(kind, fields)
+        if type(options.observe) == "function" then
+            pcall(options.observe, kind, fields)
+        end
+    end
 
     local buildInflight, dpsInflight = {}, {}
     local blockedTransfers, blockedTransferCount = {}, 0
@@ -414,12 +417,18 @@ function Inbound.New(options)
             noteInbound({kind="dps_chunk",sender=sender,
                 transferId=transferId,duplicate=false,
                 requester=context and context.requester or nil,
-                requestId=context and context.requestId or nil})
+                requestId=context and context.requestId or nil,
+                channelOwnerSender=entry.channelOwnerSender})
             return false
         end
         dpsInflight[key] = nil
         observe("dps_transfer_complete", {peer=sender,chunks=total,
-            bytes=entry.bytes,outcome="complete"})
+            bytes=entry.bytes,outcome="complete",dataKind="D",
+            senderForm=sender:find("-", 1, true) and "qualified" or "bare",
+            nativeOwnerContext=entry.channelOwnerSender ~= nil,
+            requester=context and context.requester,
+            requestId=context and context.requestId,
+            bucket=context and context.bucket,transferId=transferId})
         local raw = base64Decode(table.concat(entry.chunks, "", 1, total))
         local record = raw and jsonDecode(raw)
         local schemaReason
@@ -430,23 +439,34 @@ function Inbound.New(options)
         -- ordinary schema rejection.
         if type(record) ~= "table" then record = nil end
         if not record then
+            observe("dps_validation", {peer=sender,outcome="rejected",
+                reason=schemaReason or "schema",dataKind="D",transferId=transferId,
+                requester=context and context.requester,
+                requestId=context and context.requestId,bucket=context and context.bucket})
             noteDpsRejection(schemaReason or "schema")
             noteMalformed()
             noteOutcome(context, "rejected",
-                schemaReason == "integrity" and "integrity" or "schema")
+                schemaReason == "integrity" and "integrity" or "schema",
+                entry.channelOwnerSender)
             return false
         end
         local directOwner = samePeer(record.p or record.player, sender)
         local relayed = not directOwner
         if directOwner and record.x ~= nil then
+            observe("dps_validation", {peer=sender,outcome="rejected",
+                reason="relay_authorization",dataKind="D",transferId=transferId,
+                requester=context and context.requester,
+                requestId=context and context.requestId,bucket=context and context.bucket})
             noteDpsRejection("relay_authorization")
-            noteOutcome(context, "rejected", "ownership")
+            noteOutcome(context, "rejected", "ownership",
+                entry.channelOwnerSender)
             log("RX", "DROP DPS owner payload with relay context from %s",
                 tostring(sender))
             return false
         end
         if (relayed or context ~= nil)
-            and not validateDpsRelay(record, sender, context) then
+            and not validateDpsRelay(record, sender, context, transferId,
+                entry.channelOwnerSender) then
             log("RX", "DROP DPS response outside requested bucket context from %s",
                 tostring(sender))
             return false
@@ -455,12 +475,13 @@ function Inbound.New(options)
         -- the admitted native realm-local channel route supplies this owner
         -- context; every chunk must agree before it can reach durable storage.
         local committed = commitDps(record, sender, relayed, context,
-            entry.channelOwnerSender)
+            entry.channelOwnerSender, transferId)
         if committed then
             noteInbound({kind="dps_commit",sender=sender,
                 transferId=transferId,
                 requester=context and context.requester or nil,
-                requestId=context and context.requestId or nil})
+                requestId=context and context.requestId or nil,
+                channelOwnerSender=entry.channelOwnerSender})
         end
         return committed
     end

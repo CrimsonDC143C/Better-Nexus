@@ -25,9 +25,10 @@ local RECOVERY_FAST_WINDOW,RECOVERY_SLOW_INTERVAL=60,5
 -- choice before the status says so (its reply can still arrive late).
 local HELD_CHOICE_DELAY=5
 local SESSION_INTERRUPTED="Session interrupted. Orb spending will not restart automatically."
--- The record and its spending exposure stay, and the only exit is the player's own Continue (035).
+-- Continue is a bounded class, not an exit for every unresolved receipt.
 local KEPT=" The record and its spending exposure are kept."
-local NO_EXIT=" Besides a matching result, the only exit is the player's explicit Continue in /nexus orbs. It is offered only for an action whose spend the client observed (one Orb fewer with its offer) and no recorded outcome, once its offer is gone, after a read-only check; Nexus never continues by itself."
+local NO_EXIT=" Continue is available only after a reload for a client-observed spend with no usable recorded choice and no open offer, after a read-only check. Open /nexus orbs for this record's eligibility and explanation. Nexus never continues by itself."
+local UNOBSERVED=" This record contains no retained observation of one Orb fewer with this action's offer. That does not prove that the server spent nothing. Continue does not apply to this record. Start, Resume and reload cannot reconstruct the missing history; Recheck can collect current facts but cannot promise to settle it. Preserve the record; do not repeat the spend or clear its exposure."
 -- The game's lifecycle as this owner's frame saw it (local facts only; they say
 -- nothing about the server). epoch counts every loading transition (leave or
 -- enter). phase: "l" between leaving and entering a world, "r" from entering (and
@@ -261,13 +262,168 @@ local function busyReason(subject,default)
     end
     return default
 end
+-- Boundary evidence is never used by action, settlement or Continue gates.
+-- Only a new, small receipt gets a durable journal. Existing/future fields are
+-- kept untouched; restored receipts collect session-only evidence so a check's
+-- receipt and content digest never move because of these diagnostics.
+local JD_MAX=8
+local JD_EVENTS={receipt=true,pre_call=true,spend_submitted=true,spend_ambiguous=true,spend_rejected=true,
+    host_call=true,host_true=true,host_false=true,host_error=true,host_other=true,
+    pick_call=true,pick_true=true,pick_false=true,pick_unknown=true,
+    select_submitted=true,select_ambiguous=true,select_rejected=true,pick=true,read=true,leave=true,enter=true,logout=true}
+local JD_REL={equal=true,one_below=true,lower=true,higher=true,unknown=true}
+local JD_OWN={before=true,source_removed=true,neither=true,unknown=true}
+local JD_KEYS={event=true,epoch=true,phase=true,charge=true,relation=true,owned=true,offer=true,pick=true,host=true}
+local function journalEntry(e)
+    if type(e)~="table" or getmetatable(e) then return nil end
+    local n=0;for k in pairs(e) do n=n+1;if n>9 or not JD_KEYS[k] then return nil end end
+    if not JD_EVENTS[e.event] or not integer(e.epoch,0,65535) or not (e.phase=="l" or e.phase=="r" or e.phase=="w")
+        or not JD_REL[e.relation] or not JD_OWN[e.owned] then return nil end
+    if e.charge~=nil and not integer(e.charge,0) then return nil end
+    for _,k in ipairs({"offer","pick","host"}) do if type(e[k])~="boolean" and e[k]~="unknown" then return nil end end
+    local out={};for k,v in pairs(e) do out[k]=v end;return out
+end
+local function journalList(list)
+    if type(list)~="table" or getmetatable(list) then return nil end
+    local n=0;for k in pairs(list) do n=n+1;if n>JD_MAX or not integer(k,1,JD_MAX) then return nil end end
+    local out={};for i=1,n do local e=journalEntry(rawget(list,i));if not e then return nil end;out[i]=e end
+    return out
+end
+local function journalMeasure(v,depth)
+    depth=depth or 1
+    if type(v)~="table" or getmetatable(v) or depth>5 then return nil end
+    local edges,bytes=0,0
+    for k,x in pairs(v) do
+        edges=edges+1;bytes=bytes+#tostring(k)
+        if type(x)=="table" then
+            local e,b=journalMeasure(x,depth+1);if not e then return nil end;edges=edges+e;bytes=bytes+b
+        elseif type(x)=="string" then bytes=bytes+#x
+        elseif type(x)=="number" or type(x)=="boolean" then bytes=bytes+8
+        else return nil end
+        if edges>1200 or bytes>28672 then return nil end
+    end
+    return edges,bytes
+end
+local function journalBegin(p)
+    run.boundary={mode="session_only",reason="receipt_budget",session={},dropped=0,captureFailures=0}
+    -- Reserve for the journal, all three maximal raw picks, the remaining live
+    -- receipt fields and the complete archive envelope, without raising limits.
+    local e,b=journalMeasure(p)
+    if not e or e+400>1200 or b+4096>6144 then return end
+    local state=Nexus.Store and Nexus.Store.State and Nexus.Store.State()
+    local archive=state and state.orbRecoveryArchive
+    if archive~=nil then
+        if type(archive)~="table" or getmetatable(archive) then run.boundary.reason="archive_shape";return end
+        local n=0
+        for k in pairs(archive) do n=n+1;if n>8 or not integer(k,1,8) then run.boundary.reason="archive_shape";return end end
+        for i=1,n do
+            local item=rawget(archive,i)
+            if type(item)~="table" or getmetatable(item) or item.v~=1 or type(item.id)~="string"
+                or type(item.cd)~="string" or type(item.receipt)~="table" then run.boundary.reason="archive_shape";return end
+        end
+        local ae,ab=journalMeasure(archive)
+        if not ae or #archive>=8 or ab+b+4096>28672 then run.boundary.reason="archive_budget";return end
+    end
+    if p.boundaryJournal~=nil then run.boundary.reason="foreign_journal";return end
+    p.boundaryJournal={};run.boundary.owner=p;run.boundary.journal=p.boundaryJournal;run.boundary.mode="durable";run.boundary.reason=nil
+end
+local function journalRelation(charges,before)
+    if not integer(charges,0) or not integer(before,0) then return "unknown" end
+    if charges==before then return "equal" end
+    if charges==before-1 then return "one_below" end
+    return charges<before-1 and "lower" or "higher"
+end
+local function journalOwned(s,p)
+    if not s or not p or p.guid~=s.context.guid or type(p.before)~="table" or type(p.removed)~="string" then return "unknown" end
+    local before,removed=true,(p.before[p.removed] or 0)>0
+    for k,n in pairs(p.before) do
+        local actual=s.granted[k] or 0
+        if actual~=n then before=false end
+        if actual~=n-(k==p.removed and 1 or 0) then removed=false end
+    end
+    for k,n in pairs(s.granted) do
+        if n~=(p.before[k] or 0) then before=false end
+        if n~=(p.before[k] or 0)-(k==p.removed and 1 or 0) then removed=false end
+    end
+    return before and "before" or removed and "source_removed" or "neither"
+end
+local function journalAppend(list,entry,d)
+    if list[#list] and sameValue(list[#list],entry) then return false end
+    -- The first two provenance entries stay. Only the recent six are evicted.
+    if #list>=JD_MAX then table.remove(list,3);d.dropped=math.min((d.dropped or 0)+1,999) end
+    list[#list+1]=entry;return true
+end
+local function journalFlag(v) if type(v)=="boolean" then return v end;return "unknown" end
+local function journalCapture(event,s,p)
+        local d=run.boundary
+        if not d then
+            local why=p.boundaryJournal~=nil and not journalList(p.boundaryJournal) and "foreign_journal"
+                or p.restored and "restored_receipt" or "older_receipt"
+            d={mode="session_only",reason=why,session={},dropped=0,captureFailures=0}
+            run.boundary=d
+        end
+        if d.owner==p and p.boundaryJournal~=d.journal then
+            d.owner=nil;d.mode="session_only";d.reason="foreign_journal"
+        end
+        local rel=journalRelation(s and s.charges,p.chargesBefore)
+        local own=journalOwned(s,p)
+        local charge=s and integer(s.charges,0) and s.charges or nil
+        local offer,pick,host=journalFlag(s and s.offerPending),journalFlag(s and s.selectInFlight~=nil),journalFlag(s and s.hostPending)
+        local last=d.lastRead
+        -- Stable recovery/live reads do not allocate a diagnostic row, replace
+        -- the snapshot or dirty saved data. Comparisons use the existing read.
+        if event=="read" and last and last.epoch==life.epoch and last.phase==life.phase
+            and last.charge==charge and last.relation==rel and last.owned==own
+            and last.offer==offer and last.pick==pick and last.host==host then return end
+        local entry={event=event,epoch=life.epoch,phase=life.phase,charge=s and integer(s.charges,0) and s.charges or nil,
+            relation=rel,owned=own,offer=offer,pick=pick,host=host}
+        if event=="read" then d.lastRead=entry end
+        if s then d.snapshot={chargesBefore=integer(p.chargesBefore,0) and p.chargesBefore or nil,
+            chargesNow=integer(s.charges,0) and s.charges or nil,chargeRelation=rel,ownedRelation=own,
+            offerPresent=entry.offer,pickInFlight=entry.pick,hostPending=entry.host,epoch=life.epoch,phase=life.phase} end
+        local list=d.owner==p and not p.restored and p.boundaryJournal or d.session
+        if journalAppend(list,entry,d) and d.owner==p and not p.restored then d.unsaved=true end
+end
+local function journalNote(event,s,p)
+    if not p or not JD_EVENTS[event] then return end
+    local ok=pcall(journalCapture,event,s,p)
+    if not ok then
+        if run.boundary then run.boundary.captureFailures=math.min((run.boundary.captureFailures or 0)+1,999) end
+    end
+end
 local function savePending()
     if run.pending then
         local p=copy(run.pending);p.context=nil;p.beforeSnapshot=nil;p.token=nil
         p.spent=run.spent;p.limit=run.limit;p.since=nil;p.baselineStamp=nil;p.recoverySerial=nil;p.recoveryMatched=nil
         config.pending=p
     else config.pending=nil end
-    return write(config)
+    local d=run.boundary
+    local owns=run.pending and d and d.owner==run.pending and run.pending.boundaryJournal==d.journal and not run.pending.restored
+    if not owns then return write(config) end
+    -- The original receipt is the mandatory write, with ONLY our visit-owned
+    -- metadata omitted. A genuine mandatory failure gets no retry and no host
+    -- call. Foreign/restored fields never take this path.
+    local original=copy(config);original.pending.boundaryJournal=nil
+    local priorWritten=d.persistedCount or 0
+    d.persisted=nil;d.persistedCount=0
+    local ok,err=write(original)
+    if not ok then d.captureFailures=math.min((d.captureFailures or 0)+1,999);return ok,err end
+    -- One optional attempt at this existing persistence boundary. A diagnostic
+    -- refusal/error cannot turn a verified original receipt into a no-send gate.
+    -- It never retries a failed mandatory write, and polling still makes no save.
+    local valid=journalList(d.journal)
+    local goodCall,good=false,false
+    if valid then goodCall,good=pcall(write,config) end
+    if goodCall and good then
+        d.unsaved=nil;d.persisted=true;d.persistedCount=#d.journal
+    else
+        d.captureFailures=math.min((d.captureFailures or 0)+1,999)
+        d.priorWrittenOmitted=math.min((d.priorWrittenOmitted or 0)+priorWritten,999)
+        d.mode="session_only";d.reason=valid and "write_refused" or "invalid_journal"
+        d.session=valid or {};d.owner=nil;d.journal=nil;d.unsaved=true
+        run.pending.boundaryJournal=nil;config.pending.boundaryJournal=nil
+    end
+    return true
 end
 -- Raw pick evidence that the store refused when it was seen is kept in memory
 -- (run.pickDirty) and saved at the next pass or lifecycle event. Never fatal, and
@@ -373,7 +529,7 @@ end
 function M.SetLimit(n)
     init();n=tonumber(n)
     if not integer(n,1,10000) then return nil,"Choose a whole-number Orb limit from 1 to 10,000." end
-    if run.running or run.pending or run.state=="PAUSED" or run.state=="LIMIT" then return nil,"Use Increase limit while paused, or finish this run first." end
+    if run.running or run.pending or run.state=="PAUSED" or run.state=="LIMIT" then return nil,"The maximum cannot change during a run. Stop this run, then start a new run with a higher maximum." end
     local before=copy(config);config.maxOrbs=n
     local ok,err=changedConfig(before)
     -- A saved typed maximum is the player's own amount: tracking stops.
@@ -475,11 +631,15 @@ function M.SuggestSources()
     local before=copy(config);config.sources=proposed;return changedConfig(before)
 end
 -- A refusal also returns the stage code of its site (readiness diagnostics only).
-local function inspect()
+-- `display` is true only for M.Status: a display-only read (B.Read("display"),
+-- see OrbAdapter O.Read). Every action path calls inspect() and reads in full.
+local function inspect(display)
     local assignment=assigned()
     if assignment.state~="ready" then return nil,assignment.note or "Assign a Wishlist before starting Orb mode.",assignment,"assignment" end
     local targets,err=P.Normalize(config.entries);if not targets then return nil,err,assignment,"targets" end
-    local s,e,stage=B.Read();if not s then return nil,e,assignment,stage end
+    local s,e,stage
+    if display then s,e,stage=B.Read("display") else s,e,stage=B.Read() end
+    if not s then return nil,e,assignment,stage end
     local prog=P.Progress(targets,s)
     local sources=P.Sources(targets,s,config.excluded)
     return {targets=targets,s=s,progress=prog,sources=sources,assignment=assignment}
@@ -576,6 +736,7 @@ ensureFrame=function()
         init()
         if event=="PLAYER_LEAVING_WORLD" then life.epoch=(life.epoch+1)%65536;life.phase="l"
         elseif event=="PLAYER_ENTERING_WORLD" then life.epoch=(life.epoch+1)%65536;life.phase="r" end
+        journalNote(event=="PLAYER_LEAVING_WORLD" and "leave" or event=="PLAYER_ENTERING_WORLD" and "enter" or "logout",nil,run.pending)
         -- Evidence that could not be saved when it was seen is saved now: a
         -- reload or a logout follows these events.
         flushEvidence()
@@ -782,6 +943,7 @@ local function onPickRaw(raw)
         else p.pickDropped=math.min((tonumber(p.pickDropped) or 0)+1,PICK_COUNT_MAX) end
     end
     p.picks=list
+    journalNote("pick",nil,p)
     -- Saved at once, for a reload or a logout that follows. A refusal, or a store that throws,
     -- keeps it in memory (reported as unsaved) for the next pass and changes nothing else.
     run.pickDirty=true
@@ -1395,7 +1557,7 @@ local RC_REFUSALS={
     no_receipt="There is no unresolved Orb action.",
     not_restored="This action belongs to this session. Continue is offered only after a reload, for an action that has no recorded outcome.",
     running="An Orb run is active. Pause or stop it first.",
-    spend_unconfirmed="This client never observed the spend of the earlier Orb action (one Orb fewer with its offer), so Continue does not apply.",
+    spend_unconfirmed="Continue is not available for this record."..UNOBSERVED,
     choice_recorded="A choice is recorded for the earlier Orb action, so Continue does not apply to it. Nexus can confirm that action only from its matching result.",
     unreadable="The game's current state cannot be read right now. Nothing was changed. Try again in a moment.",
     other_character="The earlier Orb action belongs to another character.",
@@ -1495,7 +1657,7 @@ function M.ContinueView()
     local astate,_,count=RC.archiveInfo()
     local v={eligible=ok,reason=reason,stage=rc and rc.stage or "idle",step=rc and rc.step or nil,
         refusal=rc and rc.refusal or nil,token=rc and rc.stage=="ready" and rc.token or nil,
-        archive={state=astate,count=count,capacity=ARCHIVE_MAX}}
+        archive={state=astate,count=count,capacity=ARCHIVE_MAX},explanation=p~=nil and p.restored==true and not run.running}
     if rc and rc.stage=="ready" then
         v.facts={charges=rc.base.charges,recorded=p and p.chargesBefore,relation=rc.rel,replies=#rc.seen}
     end
@@ -1734,7 +1896,7 @@ local RECOVERY_TEXT={
     PERMANENT_CHANGED="Locked Echoes changed since the earlier Orb action. Nexus cannot confirm that action."..KEPT..NO_EXIT,
     LOADOUT="The original loadout of the earlier Orb action cannot be verified. Nexus cannot confirm that action."..KEPT..NO_EXIT,
     LOADOUT_UNKNOWN="An earlier Orb action is unresolved. The game has not yet sent this character's build-slot data since it loaded, so Nexus cannot check the original loadout yet. Nexus is waiting, read-only, and records nothing until then: if an Orb offer is open, a choice made in it now cannot be recorded for the earlier action. Nothing will be sent.",
-    UNOBSERVABLE="The earlier Orb action ended while Nexus could not observe it. The game gives no record of which choice belonged to it, so Nexus cannot confirm it, and Recheck cannot settle it. The record, its spending exposure, and the block on new Orb runs and ordinary rolling are kept. Nothing is retried, refunded or deleted."..NO_EXIT,
+    UNOBSERVABLE="The earlier Orb action could not be linked to an observed result. The game gives no record of which choice belonged to it, so Nexus cannot confirm it, and Recheck cannot settle it. The record, its spending exposure, and the block on new Orb runs and ordinary rolling are kept. Nothing is retried, refunded or deleted.",
 }
 -- WAIT_RESULT names the settlement requirement that the last read did not
 -- meet (run.settleGate), so the text does not promise that a fresh ownership
@@ -1776,7 +1938,9 @@ local function recoveryReason(kind,observing,s,p,proposed)
         local row=id and s and s.catalog and s.catalog[id]
         return RECOVERY_TEXT.OFFER_OPEN_PROPOSED:format(row and row.name or ("Echo "..tostring(p and p.selectedKey)))
     end
-    return RECOVERY_TEXT[kind] or RECOVERY_TEXT.CHECKING
+    local text=RECOVERY_TEXT[kind] or RECOVERY_TEXT.CHECKING
+    if kind=="UNOBSERVABLE" then return text..(p and p.spendConfirmed==true and NO_EXIT or UNOBSERVED) end
+    return text
 end
 -- Truthful reason for callers that Orb mode blocks (ordinary rolling, build-slot
 -- and permanent-slot changes). subject: what is blocked, e.g. "Ordinary rolling".
@@ -1790,9 +1954,9 @@ function M.BlockReason(subject)
     if p and p.restored and not run.running then
         local r=run.recovery or {}
         if CAN_PROGRESS[r.kind] or (CAN_PROGRESS_OBSERVING[r.kind] and r.observing) then
-            return subject.." is blocked: an earlier Orb action is unresolved after a reload. Nexus only observes it and sends nothing. The block ends when that action is confirmed or, if this client observed its spend and it has no recorded outcome, when you choose Continue. Open /nexus orbs for the current instruction."
+            return subject.." is blocked: an earlier Orb action is unresolved after a reload. Nexus only observes it and sends nothing. The block ends when that action is confirmed or, if this record retains an observation of this spend and has no usable recorded choice, and no offer is open, when Continue's read-only check passes and you confirm it. Open /nexus orbs for the current instruction."
         end
-        return subject.." is blocked: an earlier Orb action cannot be confirmed. If this client observed its spend and it has no recorded outcome, Continue in /nexus orbs ends this block after a read-only check and your confirmation; Nexus does not clear it by itself. Open /nexus orbs for details."
+        return subject.." is blocked: an earlier Orb action cannot be confirmed. If this record retains an observation of this spend and has no usable recorded choice, and no offer is open, Continue in /nexus orbs ends this block after its read-only check passes and your confirmation; Nexus does not clear it by itself. Open /nexus orbs for details."
     end
     if run.running then return subject.." is paused: Orb refinement owns the current action." end
     if p then return subject.." is blocked: a submitted Orb action is unresolved. Finish its offer in the game; Nexus confirms it only from the matching result. If it cannot be confirmed, reload the game: Continue in /nexus orbs may then apply." end
@@ -1840,6 +2004,7 @@ function M.Pump(passive)
         local s,err=B.Read()
         if s and life.phase=="r" then life.phase="w" end
         local p=run.pending
+        if p then journalNote("read",s,p) end
         if not s and p and p.restored and not run.running then
             -- Passive recovery reads from addon load onward. A read that is not
             -- ready yet is not a pause reason that should outlive the loading.
@@ -1911,7 +2076,7 @@ function M.Pump(passive)
             if finishResult(s,p) then return end
             heldChoiceHint(s,p)
             if not run.running or passive then return end
-            if not entriesStillMatch() then pause("The selected Wishlist changed; resolve the pending offer manually.");return end
+            if not entriesStillMatch(a) then pause("The selected Wishlist changed; resolve the pending offer manually.");return end
             if p.selectionAttempted then
                 setState("WAIT_RESULT","Waiting for a fresh server response confirming the selected replacement.")
             elseif s.offerPending and #s.board==3 and p.spendConfirmed and not s.hostPending then
@@ -1943,6 +2108,7 @@ function M.Pump(passive)
                 local accepted,kind,reason=B.Select(run.token,decision.index,s.boardKey,decision.spellId,function()
                     return run.running and entriesStillMatch()
                 end)
+                journalNote(accepted==true and "select_submitted" or kind=="REJECTED" and "select_rejected" or "select_ambiguous",nil,p)
                 -- An attempt rejected by the adapter before SelectPerk is not
                 -- a selection lifecycle. Preserve the receipt, but never use
                 -- its proposed key as proof that a choice was submitted.
@@ -1963,7 +2129,7 @@ function M.Pump(passive)
             return
         end
         if not run.running or passive then return end
-        if not entriesStillMatch() then pause("The assigned Wishlist changed. Review it and Resume without resetting this run's usage.");return end
+        if not entriesStillMatch(a) then pause("The assigned Wishlist changed. Review it and Resume without resetting this run's usage.");return end
         local progress=P.Progress(run.targets,s)
         if progress.rolledMissing==0 then
             terminal(progress.permanentMissing==0 and "COMPLETE" or "ROLLED_COMPLETE",
@@ -1998,6 +2164,11 @@ function M.Pump(passive)
             recycle=source.key==run.recycleKey,state="requested",
             reason="One Orb requested for this source copy."})
         run.pending=p;run.reserved=1
+        -- Only this newly created receipt may own a durable diagnostic field.
+        -- A failed diagnostic preparation cannot prevent the unchanged spend checks.
+        local journalOk=pcall(journalBegin,p)
+        if not journalOk and run.boundary then run.boundary.captureFailures=math.min((run.boundary.captureFailures or 0)+1,999) end
+        journalNote("receipt",s,p);journalNote("pre_call",s,p)
         local previousReceipt=config.pending
         local ok,e=savePending()
         if not ok then
@@ -2014,6 +2185,7 @@ function M.Pump(passive)
             for _,r in ipairs(P.Sources(run.targets,live,run.excluded))do if r.key==source.key and r.excess>0 then return true end end
             return false
         end)
+        journalNote(accepted==true and "spend_submitted" or kind=="REJECTED" and "spend_rejected" or "spend_ambiguous",nil,p)
         if not accepted then
             if kind=="REJECTED" then
                 if not recycle and not run.automatic then run.remaining[source.key]=(run.remaining[source.key] or 0)+1 end
@@ -2087,7 +2259,7 @@ function M.Resume()
         if not run.pending.spendConfirmed then return nil,"The spend outcome remains unknown. No action will be repeated." end
         run.pending.ambiguous=nil
     end
-    if not run.pending and run.spent+run.reserved>=run.limit then return nil,"The approved limit is reached. Confirm an increased limit or stop." end
+    if not run.pending and run.spent+run.reserved>=run.limit then return nil,"The approved maximum is reached. Stop, then start a new run with a higher maximum." end
     if not run.token then return nil,"This run no longer owns the action. Stop and approve a new run after settlement." end
     local off,e=turnAutoOff();if not off then return nil,e end
     run.running=true;setState(run.pending and "WAIT_OFFER" or "READY","Resuming the approved run without resetting its usage.")
@@ -2269,11 +2441,82 @@ function M.ReadinessView()
     v.age=integer(age,0) and age or nil
     return v
 end
+-- Detached, bounded evidence only. No init, game read, write or action is made
+-- for this support view; missing older/reloaded history is explicitly unknown.
+function M.BoundaryDiagnostics()
+    local p=run and run.pending;local d=run and run.boundary
+    local saved=p and journalList(p.boundaryJournal) or nil
+    local reason
+    if d then reason=d.reason
+    elseif p then if not saved then reason=p.boundaryJournal~=nil and "foreign_journal" or "older_receipt" end
+    else reason="no_receipt" end
+    return {observed=d~=nil or saved~=nil,receiptPresent=p~=nil,mode=d and d.mode or saved and "retained" or "unavailable",
+        reason=reason,
+        retained=saved and #saved or 0,durableRetained=p and (p.restored and saved and #saved or d and d.persistedCount) or 0,
+        sessionRetained=d and #d.session or 0,
+        priorWrittenOmitted=d and d.priorWrittenOmitted or 0,
+        dropped=d and d.dropped or 0,captureFailures=d and d.captureFailures or 0,
+        unsaved=p and d and d.unsaved==true or false,persisted=p and d and d.persisted==true or false,
+        epoch=life.epoch,phase=life.phase,receiptJournal=saved or {},sessionJournal=d and copy(d.session) or {},
+        snapshot=d and copy(d.snapshot) or nil}
+end
+-- The exact comparison scalars used by OrbAdapter SameOwner/SameContext,
+-- without reading/reconciling Echoes. OwnershipTrustView exposes the same
+-- ownedGeneration that OrbAdapter.ctx takes from A.Owned().generation.
+-- Only a paused Resume affordance asks for this view; it grants no authority.
+local function resumeDisplayContext()
+    local a=Nexus.GameAdapter;local pe=_G.ProjectEbonhold
+    if type(pe)~="table" or type(pe.PerkService)~="table"
+        or type(pe.OrbService)~="table" or type(pe.Perks)~="table"
+        or type(a.OwnershipTrustView)~="function" or type(a.Level)~="function"
+        or type(UnitGUID)~="function" then return nil end
+    local ok,trust=pcall(a.OwnershipTrustView)
+    local okGuid,guid=pcall(UnitGUID,"player")
+    local okLevel,level=pcall(a.Level)
+    if not ok or type(trust)~="table" or not integer(trust.ownedGeneration,0)
+        or not okGuid or type(guid)~="string" or guid==""
+        or not okLevel or not integer(level,1) then return nil end
+    return {pe=pe,svc=pe.PerkService,orb=pe.OrbService,guid=guid,
+        generation=trust.ownedGeneration,level=level,slot=pe.Perks.serverActiveSlot}
+end
+-- Display-only structural Resume guards: never rebind/adopt targets, turn Auto
+-- off or advance the run. Actual Resume still performs every fresh action check.
+-- Pending work keeps its original assignment/context; a settled run may adopt
+-- a different ready, valid assignment only on the explicit action.
+local function resumeOffered(a,s)
+    if run.state~="PAUSED" or not run.token or not run.context then return false end
+    local p=run.pending
+    if p and (run.targetChanged or p.restored or p.selectionAttempted
+        or (p.ambiguous and not p.spendConfirmed)) then return false end
+    a=a or assigned()
+    if p then
+        if not matches(run.binding,a) then return false end
+    elseif a.state~="ready" or not P.Normalize(a.entries)
+        or run.spent+run.reserved>=run.limit then return false end
+    -- Reuse Status's context; compact-only reads use passive scalars, not the
+    -- adapter read. SameOwner/SameContext do not compare display-only `active`.
+    local context=s and s.context or resumeDisplayContext()
+    if not context or not B.SameOwner(run.context,context) then return false end
+    return not p or B.SameContext(run.context,context)
+end
 -- Display snapshot. One adapter read per call (plus passive balance reads for
 -- the balance line and the maximum draft); it authorizes nothing (every
 -- action reads again). detail=true adds the source list for Advanced.
+-- The read is display-only (NX-02): its Echo reconciliation may be reused for
+-- under 1 s, so its context generation is non-authoritative; every shown
+-- field is read fresh.
 function M.Status(detail)
-    init();local m,err,failed,stage=inspect();local a=m and m.assignment or failed or assigned()
+    init();local m,err,failed,stage=inspect(true);local a=m and m.assignment or failed or assigned()
+    local resumeRead=m and m.s
+    -- A held run inspects its approved targets, while this view shows the
+    -- current assignment. Separately valid rolled/locked inputs can project
+    -- a combined target that the Orb policy refuses. Keep the held receipt
+    -- readable; the display refusal must not replace or settle that receipt.
+    local shownTargets
+    if m then
+        shownTargets,err=P.Normalize(a.entries)
+        if not shownTargets then m=nil;stage="targets" end
+    end
     local r={state=run.state,reason=run.reason,error=err,running=run.running,pending=run.pending~=nil,
         spent=run.spent,reserved=run.reserved,limit=run.limit,config=copy(config),recent=copy(run.recent),
         assignment=copy(a),targetChanged=run.targetChanged,operationName=run.name,
@@ -2283,7 +2526,7 @@ function M.Status(detail)
     r.charges,r.balanceState,r.balanceReason=B.Balance()
     r.limitDraft=M.LimitDraft()
     if m then
-        r.charges=m.s.charges;r.progress=P.Progress(assert(P.Normalize(a.entries)),m.s)
+        r.charges=m.s.charges;r.progress=P.Progress(shownTargets,m.s)
         r.sourceCount=#m.sources
         if detail~=false then r.sources=copy(m.sources) end
         -- Read-only view of the same read's catalog rows, copied per row on access.
@@ -2299,7 +2542,7 @@ function M.Status(detail)
     else why=err end
     r.canStart=not run.running and not run.pending and run.state~="PAUSED" and run.state~="LIMIT" and can~=nil
     r.startReason=why
-    r.canResume=run.state=="PAUSED" and not (run.pending and (run.targetChanged or run.pending.restored or run.pending.selectionAttempted))
+    r.canResume=resumeOffered(a,resumeRead)
     -- Memory-only bookkeeping of this read; a failure in it changes nothing
     -- shown or allowed.
     pcall(observeReadiness,m and "ok" or stage,a,r.progress)
@@ -2310,7 +2553,20 @@ function M.CompactStatus()
     local remaining=run.displayProgress and run.displayProgress.rolledMissing
     return {state=run.state,running=run.running,pending=run.pending~=nil,spent=run.spent,reserved=run.reserved,
         limit=run.limit,remaining=remaining,reason=run.reason,
-        canResume=run.state=="PAUSED" and not (run.pending and (run.targetChanged or run.pending.restored or run.pending.selectionAttempted))}
+        canResume=resumeOffered()}
 end
 -- The adapter's hook reaches the evidence sink and the immediate notification.
 if type(B.CaptureSink)=="function" then B.CaptureSink(onPickRaw,onOwnerChoice,function() return life.phase,life.epoch end) end
+if type(B.BoundarySink)=="function" then B.BoundarySink(function(event,s)
+    if Nexus.OrbRuntime==M and run and run.pending then journalNote(event,s,run.pending) end
+end) end
+-- Default-off diagnostic dispatcher. The collector preserves callback arity,
+-- returns and errors; no timing/heap read is added while it is disabled.
+do
+    local status=M.Status
+    function M.Status(...)
+        local perf=Nexus.Performance
+        if perf and type(perf.MeasureDiagnostic)=="function" then return perf.MeasureDiagnostic("orb.status",status,...) end
+        return status(...)
+    end
+end

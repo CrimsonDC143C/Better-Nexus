@@ -5,13 +5,15 @@ local frame,index= nil,1
 -- Keep the complete Help window above the Orb dialog's 30-33 layer band.
 local HELP_LEVEL=40
 local pages={
- {id="start",title="Getting started",text=[[This is an experimental build. Back up your Nexus folder and WTF with WoW closed before testing. Reading this guide never spends, assigns, activates, or sends a Sync request.
+ {id="start",title="Getting started",text=[[Start here: the page buttons above open any page directly. Setup / Welcome reopens the first-launch guide; it is information only, saves nothing and never turns Auto ON. Assign Wishlist... opens the Echo Journal with its Wishlist chooser for the Saved Build the Journal shows; nothing is assigned until you choose a Wishlist there.
+
+This is an experimental build. Back up your Nexus folder and WTF with WoW closed before testing. Reading this guide never spends, assigns, activates, or sends a Sync request.
 
 Before you turn Auto ON: With Auto ON, Nexus may replace that active Saved Build with a better finished run; at level 80 after a finished run, that can happen right after you turn Auto ON or change the assignment. Saving edits to the assigned Wishlist can also lead to a replacement without a new run. It treats the slot as a working copy, not a protected archive. Keep Auto OFF if you want it left unchanged. Auto starts OFF each session.
 
 1. Open the Wishlist Editor: click ... on the Nexus panel, then Wishlist Editor, or type /nexus editor. To use a Wishlist code, click Import and paste it. Import opens a draft.
 2. Check exact qualities, copy counts and the planned locked Echo targets.
-3. Click Create Wishlist for a new or imported plan. It saves the plan and makes it the target of the loadout shown in the editor. For an existing Wishlist, click Save Wishlist.
+3. Click Create & assign for a new or imported plan. It saves the plan and makes it the target of the loadout shown in the editor. Create unassigned saves the plan without a target. For an existing Wishlist, click Save changes. It keeps the Wishlist's current target.
 4. To target another Saved Build: in My Builds, select the intended Saved Build and assign the Wishlist to it (click the Wishlist selector and choose the Wishlist). Assigning only chooses the target; by itself it does not change the Saved Build.
 5. Review the recommendations with Auto OFF first. Click Auto OFF only when you accept the warning above; it then shows Auto ON.
 
@@ -19,12 +21,14 @@ What Nexus is for: you choose the Echoes you want (a Wishlist). Nexus counts the
 
 Saving and loading Saved Builds: in the game's own build window, loading a Saved Build makes it your current loadout. Saving writes your current Echoes into the slot you selected and REPLACES what that slot held. Check the selected slot before you save; Nexus cannot undo a save or bring back the old contents. Nexus never loads a Saved Build for you. Its only save is the automatic save with Auto ON, described above. Creating or importing a Wishlist saves only a plan. Assigning a Wishlist by itself changes no Saved Build.
 
-Words: A Wishlist is a desired plan, not proof that you own its Echoes. Saved Builds are server slots. Active Loadout is the selected server loadout. Nexus treats no future random Echo roll as guaranteed.]]},
+Words: A Wishlist is a desired plan, not proof that you own its Echoes. Saved Builds are server slots. Active Loadout is the selected server loadout. Nexus treats no future random Echo roll as guaranteed.
+
+Counts: planned copies (the plan), rolled copies this run, the Wishlist's copies in a Saved Build and locked targets are different counts, and Echo families represented counts a family once. Unavailable is not 0, and a plan is not a finished build. Best known: the best shared DPS record this client holds for the exact same Echoes; it is not a complete or server-wide ranking. My Builds is the game's page of your Saved Builds; in Build Library, the Mine scope lists your Saved Builds and shared listings. Menu and status: the ... button on the Nexus panel.]]},
  {id="wishlists",title="Wishlists and locked targets",text=[[Before you edit: a plan holds up to 79 rolled copies and 6 locked Echo copies (85 total). Counts are copies, not names or rows. Each quality is a different target; a lower-quality copy does not count for a higher-quality target.
 
-1. Open the Wishlist Editor (/nexus editor). Import opens a draft; nothing is kept until you click Create Wishlist (new plan) or Save Wishlist (existing Wishlist).
+1. Open the Wishlist Editor (/nexus editor). Import opens a draft; nothing is kept until you click Create & assign or Create unassigned (new plan) or Save changes (existing Wishlist).
 2. If the editor asks for locked targets, choose them, then click Confirm locked targets & edit (or & assign). You do not need to own the plan already.
-3. Create Wishlist saves a new plan and makes it the target of the loadout shown in the editor; Save Wishlist saves an existing one. In My Builds, the Wishlist selector chooses which Wishlist a Saved Build uses; Unassign Wishlist keeps the Wishlist.
+3. Create & assign saves a new plan and makes it the target of the loadout shown in the editor; Create unassigned saves it without a target; Save changes saves an existing one and keeps its target. A Wishlist opened for a Saved Build that does not use it also offers Save & assign, which saves it and makes it that Saved Build's Wishlist. In My Builds, the Wishlist selector chooses which Wishlist a Saved Build uses; Unassign Wishlist keeps the Wishlist.
 
 Locked Echoes and targets: Currently locked Echoes are what you actually have. Locked Echo targets are what the plan wants. A Frozen offer is a temporary offered card kept by the game's Freeze action; it is not a locked Echo slot. Opening or confirming targets does not lock/unlock anything. Automatic locked-Echo slot changes require both Automation and their separate option, plus ownership and safety checks.
 
@@ -32,12 +36,16 @@ Imports without locked markers use your matching currently locked Echoes by defa
 /nexus currentlocks off: choose future untagged plans manually.
 /nexus currentlocks on: use matching locked targets by default.
 Nexus-only locked-role markers should be imported in Nexus, not assumed compatible with every native importer.]]},
- {id="rolling",title="Auto, rolling and saving",text=[[Before you turn Auto ON, read this. Automatic save is separate from Take, Banish, Reroll and Freeze. After a completed run, Auto may replace your active Saved Build with that run and give it the Wishlist's name. Nexus compares the run with the Wishlist assigned to that loadout. It replaces an existing Saved Build only when overall Wishlist progress is higher than the Saved Build's, or equal with cleanup (some extra copies removed, or an even swap of requested copies). Not every run is saved. Assigning by itself changes nothing, but at level 80 after a finished run, turning Auto ON or changing the assigned Wishlist makes Nexus check again right away, so a replacement can follow within seconds. Saving edits to the assigned Wishlist can also lead to a replacement without a new run. There is no separate automatic-save switch: Auto OFF stops it.
+ {id="rolling",title="Auto, rolling and saving",text=[[Before you turn Auto ON, read this. Automatic save is separate from Take, Banish, Reroll and Freeze. After a completed run, Auto may replace your active Saved Build with that run and give it the Wishlist's name. Nexus compares the run with the Wishlist assigned to that loadout. It replaces an existing Saved Build only when overall Wishlist progress is higher than the Saved Build's, or equal with cleanup (some extra copies removed, or an even swap of requested copies). Not every run is saved. Assigning by itself changes nothing, but at level 80 after a finished run, turning Auto ON or changing the assigned Wishlist makes Nexus check a finished run it has not saved yet against that Wishlist, so a replacement can follow without a new run; how soon is not promised. Saving edits to the assigned Wishlist can also lead to a replacement without a new run. There is no separate automatic-save switch: Auto OFF stops it.
 
 Better means Wishlist progress, not Orb investment or keeping every individual Echo. Example: a run that loses 1 requested copy but gains 3 other requested copies is +2 overall. It can replace the Saved Build even when the lost Echo is one you value or obtained with Orbs. The save itself spends no Orbs, and it does not mean that Echo was judged worthless. Nexus cannot undo a completed save or bring back that Echo or the Orbs spent on it; Unassign does not restore a Saved Build. Keep Auto OFF if you want the current Saved Build left untouched. Auto starts OFF each session.
 
+What Auto may do: with Auto ON, Nexus acts only within these permissions. Take needed Echoes (autoPick), Banish (autoBanish), Reroll (autoReroll), Freeze (autoFreeze), turning tomes off and on (autoDisable) and the automatic save over the active Saved Build (autoSave) are on by default. Locking Wishlist Echoes into locked slots (autoLockEchoes) is off by default; it is its own option in the Wishlist Editor. Nexus never activates or loads a Saved Build (the saved autoActivate value is not used by any action), and Auto never starts an Orb run. To see each current value, click ... on the Nexus panel, then Automation settings; Reroll and Freeze can be changed there or with the commands below. The Auto warning lists the same permissions.
+
+Tomes: with Auto ON and the tome permission (autoDisable) on, once the game's tome data is ready Nexus turns off Echo tomes your Wishlist does not use and turns back on tomes it needs, one change about every half second. It never turns off a tome you opted out of. Nexus does not turn tomes back on when you turn Auto OFF, log out or change the Wishlist: it turns back on only tomes a Wishlist needs (or that you opted out of), and only while Auto is ON. The tome list in the Echo Journal shows their state.
+
 1. Click Auto OFF on the Nexus panel to turn Auto ON. Auto is a permission for your enabled automatic actions. Auto OFF does not turn Nexus off, stop build sharing, or hide the panel.
-2. Choose actions: /nexus reroll on|off and /nexus freeze on|off. They change those permissions, not the Auto button. Each one only allows or forbids that action; it does not choose another strategy. When an action is off, Nexus skips that step and uses the next rule below.
+2. Choose actions: ... > Automation settings, or /nexus reroll on|off and /nexus freeze on|off. They change those permissions, not the Auto button. Each one only allows or forbids that action; it does not choose another strategy. When an action is off, Nexus skips that step and uses the next rule below.
 3. Watch the panel. It shows what Nexus recommends now; with Auto ON, Nexus performs it.
 
 EXPERIMENTAL STRATEGY (the default in this build). The released strategy stays available as a rollback. On an ordinary Echo choice the experimental strategy keeps every permission, charge, pending-action and Orb rule and changes these steps:
@@ -57,12 +65,12 @@ Nexus does not keep rerolls back for later in a run. These rules are not a guara
 
 Reading the panel: Needed, Target already met, Not on Wishlist and Different quality from target describe the current choice. Frozen offer is a card kept by Freeze. Priority numbers in advanced diagnostics are not DPS or percentages. EXTRA COPIES are rolled copies above exact Wishlist targets. Target 2/current 5 means 3 extras. This display deletes nothing. [Guaranteed offer] means the server marks this offer guaranteed. Overlay: [X] meets the requested copy count; [~] some; [ ] none. These symbols are not network or loading states.
 
-When it is blocked: "Waiting for the game to confirm the last Echo action." means an action was sent and has no confirmed result yet. Do not choose again or reload; wait. "Auto waiting" means Auto stays ON and holds its actions for such a result, or for an action the game still shows pending. "Auto rechecking" means it also asks the game again for your granted Echoes, at a slow pace and only while that could settle the wait; a request is not an answer and nothing is resent. The game gives Nexus no receipt for an Echo selection. If the matching grant never appears, or another selection of the same Echo makes it impossible to tell which one was granted, Nexus keeps waiting until a new run. Turning Auto off and on does not end that wait. A reload ends Nexus's tracking of it without learning or cancelling the result. Point at the Auto button to see what Auto is doing now and why. "No Echo choice is showing." means only that no choice is on screen now. It does not mean the run is finished, and it is not a reason to retry. "Auto ON — paused" means Auto stays ON but is not acting; point at the ... button to see the reason in its Status line. Waiting for current Echo data means automatic choices wait for ownership confirmation; it is not Sync status. Ordinary rolling stays paused during active or unknown Orb offers.]]},
- {id="sharing",title="Shared builds and DPS",text=[[1. Click Build Library on the Nexus panel. Use the scope button to switch between All Shared and My Builds.
+When it is blocked: "Waiting for the game to confirm the last Echo action." means an action was sent and has no confirmed result yet. Do not choose again or reload; wait. "Auto waiting" means Auto stays ON and holds its actions for such a result, or for an action the game still shows pending. "Auto rechecking" means it also asks the game again for your granted Echoes, at a slow pace and only while that could settle the wait; a request is not an answer and nothing is resent. The game gives Nexus no receipt for an Echo selection. If the matching grant never appears, or another selection of the same Echo makes it impossible to tell which one was granted, Nexus keeps waiting until a new run. Turning Auto off and on does not end that wait. A reload ends Nexus's tracking of it without learning or cancelling the result. Point at the Auto button to see what Auto is doing now and why. "No Echo choice is showing." means only that no choice is on screen now. It does not mean the run is finished, and it is not a reason to retry. "Auto ON — paused" means Auto stays ON but is not acting; the line below it says why and what helps (the ... button's Status line has it too). When an Auto click leaves Auto OFF, the same place says why. Waiting for current Echo data means automatic choices wait for ownership confirmation; it is not Sync status. Ordinary rolling stays paused during active or unknown Orb offers.]]},
+ {id="sharing",title="Shared builds and DPS",text=[[1. Click Build Library on the Nexus panel. Use the scope buttons to switch between All Shared and Mine (your Saved Builds and shared listings; not the game's My Builds page).
 2. Require both DPS records: when checked, only builds with both a Training Dummy and a Lich King record that this client holds are listed. When unchecked, that requirement is off; other filters still apply. A record shows what this client holds. It is not build quality, outside verification, or finished Sync. While a filter change is applied, the list says Updating results...
 3. Copy into Editor creates a draft; it does not activate or spend. Share Build sends a listing to other users; it is separate from saving a Wishlist or a server Saved Build.
 
-Removing: Stop Sharing, an administrator removing a shared record, and deleting from My Builds are different actions. Read each confirmation. Stop Sharing removes the listing here; removal on other clients is not confirmed. Removing a shared listing does not delete your server build or Wishlist.
+Removing: Stop Sharing, an administrator removing a shared record, and deleting one of your builds under Mine are different actions. Read each confirmation. Stop Sharing removes the listing here; removal on other clients is not confirmed. Removing a shared listing does not delete your server build or Wishlist.
 
 Names: a name shows the player and realm the record states. It is not proof of identity. When a record's owner is not established, its details say "Owner identity not established." Two different records can show the same name.
 
@@ -140,9 +148,16 @@ Advanced commands are troubleshooting tools, not generic fixes. Do not experimen
 Known legacy compatibility and incomplete native validation remain disclosed. Offline tests are not native verification. Back up saved data and test voluntarily.]]},
 }
 H.Pages=pages
+-- Short labels of the direct page buttons, by page id.
+local TAB_LABELS={start="Start",wishlists="Wishlists",rolling="Auto",sharing="Sharing",orbs="Orbs",
+ troubleshooting="Problems",about="About"}
 local function refresh()
     local p=pages[index];frame.title:SetText("Nexus Help - "..p.title);frame.body:SetText(p.text)
     frame.page:SetText("Page "..index.." / "..#pages)
+    -- The current page's button is the disabled one; a page change clears an
+    -- earlier route note.
+    for i,t in ipairs(frame.tabs or {}) do if i==index then t:Disable() else t:Enable() end end
+    if frame.note and frame.noteIndex~=index then frame.note:SetText("");frame.noteIndex=nil end
     if frame.content then
         frame.body:SetHeight(0)
         local measured=frame.body:GetStringHeight()
@@ -163,7 +178,8 @@ local function ensure()
     frame:SetBackdropColor(.035,.04,.05,1)
     frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge");frame.title:SetPoint("TOPLEFT",20,-20)
     local scroll=CreateFrame("ScrollFrame","NexusHelpScroll",frame,"UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT",20,-56);scroll:SetSize(595,414)
+    -- Below the page buttons, the setup row and its one-line route note.
+    scroll:SetPoint("TOPLEFT",20,-108);scroll:SetSize(595,362)
     scroll:SetFrameLevel(HELP_LEVEL+1)
     local child=CreateFrame("Frame",nil,scroll);child:SetSize(590,650);scroll:SetScrollChild(child);frame.content=child
     child:SetPoint("TOPLEFT",scroll,"TOPLEFT",0,0);child:SetFrameLevel(HELP_LEVEL+2)
@@ -179,6 +195,31 @@ local function ensure()
     b(430,95,"Start page",function()index=1;refresh()end)
     b(533,100,"Close",function()frame:Hide()end)
     frame.page=frame:CreateFontString(nil,"OVERLAY","GameFontDisableSmall");frame.page:SetPoint("BOTTOM",0,26)
+    -- Direct page buttons: any page in one click (deep links use H.Show(id)).
+    frame.tabs={}
+    for i,p in ipairs(pages) do
+        local t=CreateFrame("Button",nil,frame,"UIPanelButtonTemplate")
+        t:SetPoint("TOPLEFT",20+(i-1)*83,-44);t:SetSize(79,20);t:SetText(TAB_LABELS[p.id] or p.title)
+        t:SetFrameLevel(HELP_LEVEL+2)
+        t:SetScript("OnClick",function()index=i;refresh();scroll:SetVerticalScroll(0)end)
+        frame.tabs[i]=t
+    end
+    -- The primary setup path. Each button only navigates (H.OpenSetup,
+    -- H.OpenAssignment, H.OpenEditor); none assigns, spends, sends or turns
+    -- Auto ON, and a route that cannot open says why in the note below.
+    local function action(x,w,label,fn)
+        local f=CreateFrame("Button",nil,frame,"UIPanelButtonTemplate");f:SetPoint("TOPLEFT",x,-68);f:SetSize(w,22)
+        f:SetText(label);f:SetFrameLevel(HELP_LEVEL+2);f:SetScript("OnClick",fn);return f
+    end
+    action(20,150,"Setup / Welcome",function()H.OpenSetup()end)
+    action(176,160,"Assign Wishlist...",function()H.OpenAssignment()end)
+    action(342,140,"Wishlist Editor",function()H.OpenEditor()end)
+    frame.note=frame:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall");frame.note:SetPoint("TOPLEFT",20,-93)
+    frame.note:SetSize(615,13);frame.note:SetJustifyH("LEFT");frame.note:SetText("")
+    -- Register the completed window once, including its owned navigation
+    -- controls. Palette changes then repaint the same frame through Theme.
+    if Nexus.Theme and Nexus.Theme.StyleWindow then Nexus.Theme.StyleWindow(frame,0.94) end
+    if Nexus.Theme and Nexus.Theme.StyleTree then Nexus.Theme.StyleTree(frame) end
     frame:Hide();UISpecialFrames=UISpecialFrames or {};UISpecialFrames[#UISpecialFrames+1]="NexusHelpWindow"
 end
 function H.Show(id)
@@ -186,3 +227,65 @@ function H.Show(id)
     frame:Show();refresh();return frame
 end
 function H.Hide()if frame then frame:Hide()end end
+
+-- Setup routes of the Help window. While local start-up is not ready, the
+-- routes that need it say so and open nothing; Help itself stays available
+-- during loading. No route assigns, spends, sends or turns Auto ON.
+local function LocalToolsReady()
+    if type(Nexus.StartupStatus)~="function" then return false end
+    local ok,s=pcall(Nexus.StartupStatus)
+    return ok and type(s)=="table" and s.coreReady==true
+end
+local function Refuse(text)
+    if frame and frame.note then frame.note:SetText("|cffffd200"..text.."|r");frame.noteIndex=index end
+    print("|cffffd200Nexus:|r "..text)
+    return false
+end
+-- Setup / Welcome: the informational replay (QuickStart.ShowSetup).
+function H.OpenSetup()
+    local quick=Nexus.QuickStart
+    if not (quick and type(quick.ShowSetup)=="function") then
+        return Refuse("Setup / Welcome is not available yet.")
+    end
+    local shown,why=quick.ShowSetup()
+    if not shown then
+        return Refuse(why=="warning-open"
+            and "Answer the open Auto warning first (Yes or No); Setup / Welcome opens after it."
+            or "Setup / Welcome is not available right now.")
+    end
+    if frame then frame:Hide() end
+    return true
+end
+-- Assign Wishlist...: the Echo Journal with its Wishlist chooser
+-- (JournalTab.OpenBuilds(true)). Help closes first; the Wishlist editor too,
+-- since the Journal is kept hidden while it is shown.
+function H.OpenAssignment()
+    if not LocalToolsReady() then
+        return Refuse("Assign Wishlist opens after start-up finishes (see the loading panel). Nothing was opened or assigned.")
+    end
+    local journal=Nexus.JournalTab
+    if not (journal and type(journal.OpenBuilds)=="function") then
+        return Refuse("The Echo Journal route is not available. Nothing was assigned.")
+    end
+    if type(journal.CanOpenBuilds)=="function" and not journal.CanOpenBuilds() then
+        return Refuse("The game's Character Progression button was not found. Nothing was opened or assigned.")
+    end
+    if frame then frame:Hide() end
+    local editor=_G.NexusEditorFrame
+    if editor and editor.IsShown and editor:IsShown() then editor:Hide() end
+    journal.OpenBuilds(true)
+    return true
+end
+-- Wishlist Editor: the editor as /nexus editor opens it.
+function H.OpenEditor()
+    if not LocalToolsReady() then
+        return Refuse("The Wishlist Editor opens after start-up finishes (see the loading panel). Nothing was opened.")
+    end
+    local editor=Nexus.WishlistEditor
+    if not (editor and type(editor.Show)=="function") then
+        return Refuse("The Wishlist Editor is not available.")
+    end
+    if frame then frame:Hide() end
+    editor.Show()
+    return true
+end

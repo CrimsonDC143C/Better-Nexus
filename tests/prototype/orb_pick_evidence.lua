@@ -407,12 +407,16 @@ section('18 throwing store',function()
  R.Pick(H2,S.IdQ(OFFER[2]))
  restore()
  check(Nexus.OrbRuntime.RecoveryView().rawPickUnsaved==true,'dirty')
- H2.Advance(.01)
  local state,reason=M2.Status().state,M2.Status().reason
  local owner2=Nexus.MainInternals.StoreAuthorityOwner;local raw2=owner2.UpdateStateV1
- owner2.UpdateStateV1=function() error('store exploded',0) end
+ local flushAttempts=0
+ owner2.UpdateStateV1=function() flushAttempts=flushAttempts+1;error('store exploded',0) end
+ -- Cover this tick too: a healthy retry must not save the evidence before
+ -- the throwing-flush scenario starts, whatever the Orb timer's phase.
+ H2.Advance(.01)
  H2.Advance(1)
  owner2.UpdateStateV1=raw2
+ check(flushAttempts>0,'a throwing flush was attempted')
  check(M2.Status().state==state and M2.Status().reason==reason and not M2.Status().reason:find('internal error',1,true),'a throwing flush changes no run state or text: '..tostring(M2.Status().state))
  check(Nexus.OrbRuntime.RecoveryView().rawPickUnsaved==true,'and the evidence is still reported as unsaved')
  H2.Advance(.5)

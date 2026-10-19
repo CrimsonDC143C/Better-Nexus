@@ -18,6 +18,14 @@ local frame
 -- session that can record it.
 local dismissedThisSession, recordAttempts = false, 0
 local MAX_RECORD_ATTEMPTS = 10
+-- Said once per session when a dismissal could not be saved at once.
+local unsavedNoticeShown = false
+-- The informational replay (M.ShowSetup) states what it is in place of the
+-- first-time title and hint; normal opens restore these exact texts.
+local NORMAL_TITLE = "Welcome to Nexus"
+local NORMAL_HINT = "Reopen Help any time with /nexus help. Automation and Orb spending require separate explicit controls."
+local SETUP_TITLE = "Nexus setup (information only)"
+local SETUP_HINT = "Information only: this guide saves nothing and never turns Auto ON."
 
 -- Unlike the release note in ui/Changelog.lua, this acknowledgement does not
 -- require the shared catalog. A start-up that refused an oversized catalog
@@ -62,6 +70,30 @@ function M.Settled()
     return recordAttempts >= MAX_RECORD_ATTEMPTS
 end
 
+-- The informational replay's routes wait for local start-up as Help's own
+-- routes do (ui/Help.lua H.OpenAssignment/H.OpenEditor): the same rule and
+-- the same words, said before any window is closed. Returns false after
+-- saying why; the replay then stays open.
+local function ReplayRouteReady(kind)
+    local ready = false
+    if type(Nexus.StartupStatus) == "function" then
+        local ok, s = pcall(Nexus.StartupStatus)
+        ready = ok and type(s) == "table" and s.coreReady == true
+    end
+    if not ready then
+        print("|cffffd200Nexus:|r " .. (kind == "assign"
+            and "Assign Wishlist opens after start-up finishes (see the loading panel). Nothing was opened or assigned."
+            or "The Wishlist Editor opens after start-up finishes (see the loading panel). Nothing was opened."))
+        return false
+    end
+    local journal = Nexus.JournalTab
+    if kind == "assign" and journal and type(journal.CanOpenBuilds) == "function" and not journal.CanOpenBuilds() then
+        print("|cffffd200Nexus:|r The game's Character Progression button was not found. Nothing was opened or assigned.")
+        return false
+    end
+    return true
+end
+
 local function CloseOtherSetupWindows()
     local names = { "NexusCommunityBuildsFrame", "NexusLeaderboardFrame", "NexusEditorFrame", "NexusLogViewer", "NexusChangelogPopup" }
     for i = 1, #names do
@@ -88,9 +120,34 @@ local function StartRecordRetry()
 end
 
 local function Finish()
+    -- The informational replay is not the first-time window: closing it or
+    -- following one of its buttons records nothing and dismisses nothing.
+    if frame and frame._informational then
+        frame._informational = nil
+        frame:Hide()
+        return
+    end
     dismissedThisSession = true
-    if not RecordSeen() then StartRecordRetry() end
+    if not RecordSeen() then
+        StartRecordRetry()
+        -- Truthful about a dismissal that is not saved (yet): nothing is
+        -- claimed complete, and the window may be offered again later.
+        if not unsavedNoticeShown then
+            unsavedNoticeShown = true
+            print("|cffffd200Nexus:|r The Welcome is closed, but this cannot be saved right now "
+                .. "(saved data is still loading or is read-only). If it cannot be saved this session, "
+                .. "the Welcome is offered again next time. Setup / Welcome in the ... menu reopens it.")
+        end
+    end
     if frame then frame:Hide() end
+end
+
+-- Normal (first-time or deliberate) presentation: the exact first-time texts.
+local function NormalTexts(f)
+    f._informational = nil
+    if f.title then f.title:SetText(NORMAL_TITLE) end
+    if f.hint then f.hint:SetText(NORMAL_HINT) end
+    return f
 end
 
 local function EnsureFrame()
@@ -110,6 +167,8 @@ local function EnsureFrame()
     frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     frame:Hide()
 
+    -- Fallback if an older installation lacks the Theme module; StyleWindow
+    -- replaces this backdrop when the themed client is present.
     pcall(function()
         frame:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -120,12 +179,13 @@ local function EnsureFrame()
     end)
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    frame.title = title
     title:SetPoint("TOP", 0, -16)
-    title:SetText("|cff7fd5ffWelcome to Nexus|r")
+    title:SetText("Welcome to Nexus")
 
     local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.subtitle = subtitle
     subtitle:SetPoint("TOP", 0, -37)
-    subtitle:SetTextColor(0.7, 0.7, 0.7)
     subtitle:SetText("Plan your Echoes, then choose what to automate.")
 
     local body = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -146,9 +206,12 @@ local function EnsureFrame()
     current:SetPoint("TOPLEFT", 24, -176)
     current:SetText("Set up current build")
     current:SetScript("OnClick", function()
+        if frame and frame._informational and not ReplayRouteReady("assign") then return end
         Finish()
         CloseOtherSetupWindows()
-        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then Nexus.JournalTab.OpenBuilds() end
+        -- The Echo Journal with its Wishlist chooser opened for the Saved
+        -- Build it targets; nothing is assigned until a Wishlist is chosen.
+        if Nexus.JournalTab and Nexus.JournalTab.OpenBuilds then Nexus.JournalTab.OpenBuilds(true) end
     end)
 
     local import = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
@@ -156,6 +219,7 @@ local function EnsureFrame()
     import:SetPoint("TOPRIGHT", -24, -176)
     import:SetText("Import / Create Wishlist")
     import:SetScript("OnClick", function()
+        if frame and frame._informational and not ReplayRouteReady("editor") then return end
         Finish()
         CloseOtherSetupWindows()
         if Nexus.WishlistEditor then Nexus.WishlistEditor.Show() end
@@ -188,6 +252,7 @@ local function EnsureFrame()
     orbs:SetSize(174,26);orbs:SetPoint("TOPRIGHT",-24,-250);orbs:SetText("Orbs / Lost Memories")
     orbs:SetScript("OnClick",function() Finish();if Nexus.OrbPanel then Nexus.OrbPanel.Show() end end)
     local hint = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    frame.hint = hint
     hint:SetPoint("BOTTOMLEFT", 24, 22)
     hint:SetSize(290, 54)
     hint:SetJustifyH("LEFT")
@@ -199,13 +264,59 @@ local function EnsureFrame()
     close:SetText("Later")
     close:SetScript("OnClick", Finish)
 
+    local theme = Nexus.Theme
+    if theme then
+        if theme.StyleWindow then theme.StyleWindow(frame, 0.97) end
+        if theme.StyleTree then theme.StyleTree(frame) end
+        if theme.StyleLabel then
+            theme.StyleLabel(title, "accent")
+            theme.StyleLabel(subtitle, "muted")
+            theme.StyleLabel(body, "text")
+            theme.StyleLabel(hint, "muted")
+        end
+    end
+
     return frame
 end
 
-function M.Show() EnsureFrame():Show() end
+function M.Show()
+    if Nexus.OverwriteWarning and Nexus.OverwriteWarning.EnsureOnboarding() ~= "accepted" then return false end
+    NormalTexts(EnsureFrame()):Show()
+end
+
+-- Setup / Welcome replay (the ... menu and Help). Information only, and not
+-- the warning's consent: it opens after the warning was answered Yes or No,
+-- after the first-time window was seen, and while saved data is read-only or
+-- loading. It records no acknowledgement, writes no saved data, enables
+-- nothing and asks the warning nothing; its buttons only open their views.
+-- While a warning is open and waiting for its answer it does not open over
+-- it. Returns true when shown, else false and why.
+function M.ShowSetup()
+    local warning = Nexus.OverwriteWarning
+    if warning and type(warning.IsOpen) == "function" and warning.IsOpen() then
+        return false, "warning-open"
+    end
+    -- The first-time Welcome is open already: it stays the first-time window
+    -- (closing it is still the first-time dismissal); the replay never turns
+    -- it into information only.
+    if frame and frame:IsShown() and not frame._informational then
+        return true, "first-time-open"
+    end
+    local f = EnsureFrame()
+    f._informational = true
+    if f.title then f.title:SetText(SETUP_TITLE) end
+    if f.hint then f.hint:SetText(SETUP_HINT) end
+    f:Show()
+    return true
+end
 
 -- Returns true when this window needs no further attention in this session.
 function M.ShowIfFirstTime()
+    if Nexus.OverwriteWarning then
+        local outcome = Nexus.OverwriteWarning.EnsureOnboarding()
+        if outcome == "pending" then return false end
+        if outcome == "declined" then return true end
+    end
     if dismissedThisSession then
         -- Closed earlier in this session, possibly before the saved-data
         -- owner was writable. Record it now if that is allowed by then. The
@@ -218,7 +329,7 @@ function M.ShowIfFirstTime()
     end
     local db = NexusDB
     if type(db) == "table" and rawget(db, "hasSeenQuickStart") then return true end
-    EnsureFrame():Show()
+    NormalTexts(EnsureFrame()):Show()
     return false
 end
 

@@ -2,7 +2,7 @@
 -- The qualifier is one fixed-label check box, "Require both DPS records"
 -- (Training Dummy + Lich King): checked requires both eligible records that
 -- this client holds; unchecked imposes no DPS-record requirement. "All
--- Shared" / "My Builds" stay the separate scope controls.
+-- Shared" / "Mine" stay the separate scope controls.
 --
 -- Real TOC boot, catalog, DpsCapture, projection, controller and Community
 -- window handlers; synthetic players (leaderboard_fixture_support.lua). The
@@ -167,9 +167,9 @@ check(not Checked(),'reopen shows it unchecked')
 Click(box);Nexus.CommunityBuilds.Hide();Nexus.CommunityBuilds.Show()
 check(Checked() and Filter()==true,'reopen shows it checked');Expect(CHECKED,'reopened checked')
 Click(frame._myBuildsBtn)
-check(Checked() and Filter()==true,'My Builds keeps the DPS-record filter')
+check(Checked() and Filter()==true,'Mine keeps the DPS-record filter')
 local d2=Settle()
-check(Remote(Shown())=='','My Builds with the filter checked: no remote build is shown')
+check(Remote(Shown())=='','Mine with the filter checked: no remote build is shown')
 Click(frame._scopeBtn);Expect(CHECKED,'All Shared again, still checked')
 check(label:GetText()=='Require both DPS records' and frame._scopeBtn:GetText()=='All Shared','the scope button keeps its own label')
 
@@ -231,7 +231,7 @@ do
  local LM=Nexus.LayoutMetrics
  for _,s in ipairs({0.75,1,1.25,1.5,2}) do
   local layout=LM.Community({width=1040,height=640,fontScale=s,labels={
-   search='Search title, author, or description',scope='All Shared',mine='My Builds',
+   search='Search title, author, or description',scope='All Shared',mine='Mine',
    class='Current Class Only',qualified='Require both DPS records',sort='Sort: Highest DPS',sync='Listening...',share='Share Build'}})
   local q,scope,mine=layout.boxes.qualified,layout.boxes.scope,layout.boxes.mine
   for _,m in ipairs({{'default',6},{'conservative',7}}) do

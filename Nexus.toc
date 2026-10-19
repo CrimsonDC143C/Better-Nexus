@@ -66,6 +66,7 @@ core\OrbAdapter.lua
 core\OrbRuntime.lua
 ui\VirtualList.lua
 ui\Theme.lua
+ui\OverwriteWarning.lua
 ui\Help.lua
 ui\OrbHistory.lua
 ui\OrbPanel.lua

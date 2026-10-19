@@ -124,13 +124,13 @@ local function Icons()
  return count,ids
 end
 local function LockedRevision() return (select(7,A.PresentationRevisions())) end
-C.setup(Region('Locked')~=nil and Region('Rolled copies:')~=nil,'the actual locked strip label and footer exist')
+C.setup(Region('Locked')~=nil and Region('Planned rolled copies:')~=nil,'the actual locked strip label and footer exist')
 C.setup(type(LockedRevision())=='number','the locked presentation revision is readable')
 local actions=#H.actions
 
 local function Show(label,records)
  H.locked=records;H.Notify();A.Poll();r.Refresh()
- local strip,footer=Region('Locked (') or '',Region('Rolled copies:') or ''
+ local strip,footer=Region('Locked (') or '',Region('Planned rolled copies:') or ''
  local count,ids=Icons()
  print('OBSERVED',label,'label='..strip,'footer='..(footer:gsub('\n',' | ')),'locked icons='..count,
   'locked revision='..printable(LockedRevision()))
@@ -479,7 +479,7 @@ C.scenario('CPY7S the same Copy with nothing held, then Save',function()
  local name=c.BeginCandidate(current)
  r.Refresh()
  print('OBSERVED','CPY7S opened='..printable(name),'draft design copies='..PlanDesign(),
-  'footer='..((Region('Rolled copies:') or ''):gsub('\n',' | ')))
+  'footer='..((Region('Planned rolled copies:') or ''):gsub('\n',' | ')))
  H.now=H.now+4
  local data,code,ok,why=Save(name or 'Synthetic copy seven')
  local said=Said(from)

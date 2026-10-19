@@ -7,6 +7,7 @@ local sharedCalls=0
 Nexus.CommunityBuilds.Init=function()sharedCalls=sharedCalls+1;return{state='pending',phase='scan',recordsSeen=sharedCalls}end
 H.Fire('ADDON_LOADED','Nexus');H.Fire('PLAYER_ENTERING_WORLD')
 T.Until(H,function()return Nexus.StartupStatus().coreReady end)
+H.AcknowledgeOverwriteWarnings()
 local st=Nexus.StartupStatus();assert(st.state=='pending')
 local A,E=Nexus.GameAdapter,Nexus.WishlistEditor
 assert(A.SetFirstLoadoutWishlistIdentity('Local planned',{{spellId=200001,quality=1,stacks=2}}))

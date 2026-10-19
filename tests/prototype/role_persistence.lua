@@ -56,7 +56,12 @@ local linked=assert(A.GetLoadoutWishlist(1))
 check(linked.name=='Desired target','correct existing Wishlist associated')
 check(W.DebugDraftState().pendingLock==6,'six unowned desired targets editable')
 local save
-for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible()and f:GetText()=='Save Wishlist'then save=f;break end end
+-- M3: the existing-Wishlist save is labelled by its effect (Save & assign,
+-- else Save changes; legacy Save Wishlist); the primary one is used.
+for _,label in ipairs({'Save & assign','Save changes','Save Wishlist'})do
+ for _,f in ipairs(H.frames)do if f.kind=='Button' and f:IsVisible()and f:GetText()==label then save=f;break end end
+ if save then break end
+end
 check(save~=nil,'real existing-Wishlist Save button available')
 save:Click();H.AcceptPopup()
 check(#H.actions==1 and H.actions[1][1]=='upload' and #H.actions[1][4]==79,'actual save uploads only ordinary79 without owning desired locks')

@@ -24,4 +24,4 @@ Apply user corrections to the current task. For a reusable lesson, propose its e
 
 ## Loading and scope
 
-Keep the shared policy in root `AGENTS.md` and these referenced documents. Confirm that each Claude worker actually loads `AGENTS.md`; when its launcher does not, include a read-`AGENTS.md` instruction in that worker's brief. Do not copy the policy into a second `CLAUDE.md` body. User configuration, plugin installation, telemetry, permissions, cache timers and automatic memory capture are outside this repository change.
+Keep the shared policy in root `AGENTS.md` and these referenced documents. Confirm that each Claude or Codex worker actually reads `AGENTS.md` and the relevant workflow and policy files; when automatic loading is not established, include those explicit reads in its brief. Record the observed reads before claiming workflow uptake. Do not copy the policy into a second `CLAUDE.md` body or reinstall already-present skills to obtain that evidence. User configuration, plugin installation, telemetry, permissions, cache timers and automatic memory capture are outside this repository change.

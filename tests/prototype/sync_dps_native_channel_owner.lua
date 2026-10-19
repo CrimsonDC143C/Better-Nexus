@@ -24,7 +24,7 @@ local function Deliver(N,peer,payload,route,actual,declared,beforeChunk)
  local encoded=N.Codec.Base64Encode(N.Codec.JSONEncode(payload))
  local half=math.floor(#encoded/2)
  if route=='addon' then
-  peer.H.Fire('CHAT_MSG_ADDON',N.SyncWire.PREFIX,'ACK1','WHISPER',actual)
+  P.NegotiateAddon(peer,actual)
  end
  for index,chunk in ipairs({encoded:sub(1,half),encoded:sub(half+1)}) do
   if beforeChunk then route=beforeChunk(index,peer) or route end

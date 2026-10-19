@@ -1051,10 +1051,13 @@ local function PlanLockCommit(pending, pendingLock, fulfilledTargets, existingTa
     for _, row in pairs(type(pendingLock) == "table" and pendingLock or {}) do
         if type(row.replaces) == "number" then replaced[row.replaces] = true end
     end
-    local fulfilledEntries = TargetMapEntries(type(fulfilledTargets) == "table"
-        and fulfilledTargets or {}, catalog) or {}
-    local existingEntries = TargetMapEntries(type(existingTargets) == "table"
-        and existingTargets or {}, catalog) or {}
+    local fulfilledEntries = TargetMapEntries(fulfilledTargets == nil and {} or fulfilledTargets, catalog)
+    local existingEntries = TargetMapEntries(existingTargets == nil and {} or existingTargets, catalog)
+    -- A bad row is not an empty design. Dropping it here would also drop
+    -- unrelated fulfilled targets and let a successful save replace them.
+    if not fulfilledEntries or not existingEntries then
+        return nil, "invalid_locked_design"
+    end
     for _, target in ipairs(fulfilledEntries) do
         for _, replacement in ipairs(target.replacements) do
             replaced[replacement] = true
@@ -1102,7 +1105,8 @@ local function PlanLockCommit(pending, pendingLock, fulfilledTargets, existingTa
     for id, rows in pairs(plannedRows) do
         fresh[id] = TargetRecord(rows, plannedReplacements[id])
     end
-    return TargetMapEntries(fresh, catalog) and fresh or {}
+    if not TargetMapEntries(fresh, catalog) then return nil, "invalid_locked_design" end
+    return fresh
 end
 
 local function ReconcileLocked(pending, pendingLock, fulfilledTargets, lockedBySpell)
@@ -1168,6 +1172,61 @@ local function TrimName(name)
     return name:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+-- Two Wishlist names are the same name when a player cannot tell them apart in
+-- a list: the same text after TrimName, with every run of whitespace read as
+-- one space and the ASCII letters A-Z read without case. Only A-Z are folded,
+-- explicitly, so no client locale decides it; accented, Cyrillic and every
+-- other letter compare byte for byte (no Unicode case folding is claimed).
+local function NameKey(name)
+    local key = TrimName(name):gsub("%s+", " ")
+    return (key:gsub("[A-Z]", function(letter)
+        return string.char(letter:byte() + 32)
+    end))
+end
+
+-- A generated copy name fits the editor's name field (96 letters) and the name
+-- an EBH1 code carries (120 bytes). Only a generated name is cut, at a whole
+-- UTF-8 character; a name the player typed is never shortened here.
+local COPY_NAME_LETTERS, COPY_NAME_BYTES = 96, 120
+
+local function NamePrefix(text, letters, bytes)
+    local index, cut = 1, 0
+    while index <= #text and letters > 0 do
+        local lead = text:byte(index)
+        local width = lead >= 240 and 4 or lead >= 224 and 3 or lead >= 192 and 2 or 1
+        if index + width - 1 > bytes then break end
+        index = index + width
+        cut = index - 1
+        letters = letters - 1
+    end
+    return text:sub(1, cut)
+end
+
+-- The name a NEW Wishlist takes when `requested` is already in use: the first
+-- free "Name (Copy 1)", "Name (Copy 2)", ... (a gap is reused). A requested
+-- name that already ends in "(Copy n)" counts from its own base instead of
+-- nesting a second suffix. `taken` is a set of NameKey values. A free name is
+-- returned unchanged. One more candidate than there are taken names always
+-- holds a free one, so the search is bounded by the names that exist.
+local function UniqueName(requested, taken)
+    requested = TrimName(requested)
+    taken = type(taken) == "table" and taken or {}
+    if requested == "" or not taken[NameKey(requested)] then return requested end
+    local base = requested:match("^(.-)%s*%([Cc][Oo][Pp][Yy]%s+%d+%)$")
+    base = base and TrimName(base) or ""
+    if base == "" then base = requested end
+    local limit = 1
+    for _ in pairs(taken) do limit = limit + 1 end
+    for copy = 1, limit do
+        local suffix = " (Copy " .. copy .. ")"
+        local head = TrimName(NamePrefix(base, COPY_NAME_LETTERS - #suffix,
+            COPY_NAME_BYTES - #suffix))
+        local candidate = head .. suffix
+        if not taken[NameKey(candidate)] then return candidate, copy end
+    end
+    return nil
+end
+
 function Factory.New()
     local Model = {}
     Model.NormalizeEchoName = NormalizeEchoName
@@ -1199,5 +1258,7 @@ function Factory.New()
     Model.PlanLockCommit = PlanLockCommit
     Model.ReconcileLocked = ReconcileLocked
     Model.TrimName = TrimName
+    Model.NameKey = NameKey
+    Model.UniqueName = UniqueName
     return Model
 end

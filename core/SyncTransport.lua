@@ -68,6 +68,7 @@ function Transport.New(options)
         "requester", "requestId", "transferId", "shareId", "buildId", "dpsId",
         "queueClass", "enqueuedAt", "expiresAt", "attempts",
         "chunkOrdinal", "chunkTotal", "category",
+        "dataKind", "bucket",
         "operationKind", "operationId", "operationVersion", "operationKey",
         "manualGrant",
     }
@@ -544,7 +545,8 @@ function Transport.New(options)
         stats.admittedPackets = (stats.admittedPackets or 0) + #payloads
         stats.admittedBytes = (stats.admittedBytes or 0) + admittedBytes
         observe("queue_admitted", {outcome="admitted",chunks=#payloads,
-            queue=QueueDepth(isControl),queueClass=queueClass})
+            queue=QueueDepth(isControl),queueClass=queueClass},
+            CopyMetadata(metadata, queueClass, 1, #payloads))
         return true, nil, operationStatus
     end
 
@@ -630,6 +632,9 @@ function Transport.New(options)
     end
 
     function T.NoteTransportNotice(text)
+        -- Offline notices remain visible. The wire owns localized exact-target
+        -- attribution; its callback cancels both consumers and producers.
+        if type(options.noteOfflineNotice)=="function" and options.noteOfflineNotice(text) then return false end
         if not IsThrottleNotice(text) then return false end
         local current = now()
         if current - lastAttempt > throttleNoticeWindow then return false end
@@ -875,6 +880,9 @@ function Transport.New(options)
     -- Queue housekeeping has no channel, hash or catalog dependency. Keep the
     -- existing bounded cleanup and attempt settlement separate from sending.
     function T.Housekeep()
+        -- Scope cleanup may compact either queue. Run it before selection;
+        -- per-packet wire policy/readiness checks are read-only.
+        if type(options.housekeepWire)=="function" then options.housekeepWire() end
         local current = now()
         ExpireAttemptCancellation(current)
         PruneStaleHeads(current)
@@ -892,12 +900,23 @@ function Transport.New(options)
 
         local packet, isControl, selectedIndex = SelectPacket(current, preparedShareOnly)
         if not packet then return end
+        local function RefreshSelection()
+            if not isControl then return bulk[bulkHead]==packet end
+            if control[selectedIndex or controlHead]==packet then return true end
+            -- An immediate native notice can cancel another peer, compacting
+            -- the mixed control queue. Relocate this exact immutable packet.
+            for index=controlHead,controlTail do
+                if control[index]==packet then selectedIndex=index;return true end
+            end
+            return false
+        end
 
         -- Queued before the saved mode refused it (for example a mode change
         -- by an existing control): end it through the existing dropped
         -- handling with the mode as its reason. It is not held at the head,
         -- where it would stall permitted work, and never released later.
         local permitted, modeWhy = permit(packet.metadata)
+        if not RefreshSelection() then return end
         if not permitted then
             Pop(isControl, selectedIndex)
             stats.modeDropped = (stats.modeDropped or 0) + 1
@@ -909,10 +928,10 @@ function Transport.New(options)
         end
         if type(options.canDispatch)=="function" then
             local allowed=options.canDispatch(packet.payload,packet.metadata)
-            if allowed~=true then return end
+            if allowed~=true or not RefreshSelection() then return end
         end
         local channel = resolveChannel()
-        if not channel then return end
+        if not channel or not RefreshSelection() then return end
         local escaped = packet.payload:gsub("|", "||")
         if #escaped > chatLimit then
             log("TX", "DROPPED oversize msg (%d>%d): %s",
@@ -951,6 +970,13 @@ function Transport.New(options)
             ok, accepted = pcall(options.sendPacket,packet.payload,packet.metadata,channel)
         else
             ok, accepted = pcall(sendChat, escaped, "CHANNEL", nil, channel)
+        end
+        if not RefreshSelection() then
+            -- A synchronous offline/error callback already removed and settled
+            -- this packet. Never pop an unrelated entry or recreate lastSent.
+            lastAttempt=-math.huge
+            stats.cancelledDuringAttempt=(stats.cancelledDuringAttempt or 0)+1
+            return
         end
         if ok and accepted~=false then
             Pop(isControl, selectedIndex)
@@ -1026,6 +1052,40 @@ function Transport.New(options)
             midTransfer=Continues(control[controlHead]) or Continues(bulk[bulkHead]),
             unitsSent=tonumber(stats.unitsSent) or 0,
         }
+    end
+
+    function T.CancelPeer(requester, reason)
+        if type(requester)~="string" or requester=="" then return false end
+        reason=reason or "peer unavailable"
+        -- Settle the latest attempt first: a later throttle notice must never
+        -- PushFront a packet whose peer-owned response has been cancelled.
+        if lastSent and lastSent.packet.metadata.requester==requester then
+            if not lastSent.requeued then
+                ObserveDropped(lastSent.packet,{outcome="dropped",reason=reason,
+                    attempts=lastSent.packet.metadata.attempts,queue=T.Snapshot().outbound})
+            end
+            local scope=RequestScope(lastSent.packet.metadata)
+            lastSent=nil;lastAttempt=-math.huge
+            if not requestIdCounts[scope] then cancelledRequests[scope]=nil end
+        end
+        local removed=0
+        local function Filter(queue,head,tail)
+            local keep={}
+            for index=head,tail do
+                local packet=queue[index]
+                if packet.metadata.requester==requester then
+                    TrackRemove(packet);removed=removed+1
+                    ObserveDropped(packet,{outcome="dropped",reason=reason,
+                        attempts=packet.metadata.attempts,queue=T.Snapshot().outbound})
+                else keep[#keep+1]=packet end
+            end
+            return keep,1,#keep
+        end
+        bulk,bulkHead,bulkTail=Filter(bulk,bulkHead,bulkTail)
+        control,controlHead,controlTail=Filter(control,controlHead,controlTail)
+        preparedCleanupIndex=controlHead
+        stats.peerPacketsCancelled=(stats.peerPacketsCancelled or 0)+removed
+        return removed>0
     end
 
     function T.CancelRequest(requestId, requester)
