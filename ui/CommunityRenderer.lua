@@ -2231,8 +2231,7 @@ local function EnsureFrame()
     frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
 
     local retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
-    local PUMP_INTERVAL = 0.1
-    -- Failure backoff: projection errors must not retry at the 0.1s pump cap.
+    -- Failure backoff: projection errors must not retry on the next frame.
     local FAIL_BACKOFF_BASE, FAIL_BACKOFF_MAX = 0.5, 8
     local failBackoffUntil = 0
     local lastReceiving = false
@@ -2283,7 +2282,9 @@ local function EnsureFrame()
         end
 
         -- Dirty-flag gate: PumpBuilds only while new data, a pending job, a
-        -- cold open, or a saved-loadout import needs work. Cap at 10 Hz.
+        -- cold open, or a saved-loadout import needs work. A saved import is
+        -- a short state machine and has to advance on the frame that needs
+        -- it; holding it to a 10 Hz cap drops slot writes.
         -- Receive-window coalescing: while Sync is receiving, hold dirty
         -- republish (except cold open / import) until the window ends above.
         local coldStart = virtualStats.dataBinds == 0
@@ -2292,49 +2293,43 @@ local function EnsureFrame()
             and not importPending and not coldStart
         local needPump = (not backingOff) and (refreshDirty
             or viewDiagnostic.projectionPending or coldStart or importPending)
-        if not needPump then
-            pumpTicker = 0
-        else
-            pumpTicker = pumpTicker + elapsed
-            if pumpTicker >= PUMP_INTERVAL then
-                pumpTicker = 0
-                local function NoteRefreshOutcome()
-                    if viewDiagnostic.projectionError then
-                        local failures = math.max(1,
-                            tonumber(virtualStats.dataFailures) or 1)
-                        local delay = FAIL_BACKOFF_BASE
-                            * (2 ^ math.min(failures - 1, 4))
-                        if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
-                        failBackoffUntil = now + delay
-                    else
-                        failBackoffUntil = 0
-                    end
+        if needPump then
+            local function NoteRefreshOutcome()
+                if viewDiagnostic.projectionError then
+                    local failures = math.max(1,
+                        tonumber(virtualStats.dataFailures) or 1)
+                    local delay = FAIL_BACKOFF_BASE
+                        * (2 ^ math.min(failures - 1, 4))
+                    if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
+                    failBackoffUntil = now + delay
+                else
+                    failBackoffUntil = 0
                 end
-                if importPending then
-                    local _, pending = PrepareData(false)
-                    if not pending then M.Refresh(); NoteRefreshOutcome() end
-                elseif refreshDirty and not viewDiagnostic.projectionPending
-                    and not receivingNow then
-                    -- MarkDataDirty clears projectionPending; request a job
-                    -- before PumpBuilds can advance one.
+            end
+            if importPending then
+                local _, pending = PrepareData(false)
+                if not pending then M.Refresh(); NoteRefreshOutcome() end
+            elseif refreshDirty and not viewDiagnostic.projectionPending
+                and not receivingNow then
+                -- MarkDataDirty clears projectionPending; request a job
+                -- before PumpBuilds can advance one.
+                M.Refresh()
+                NoteRefreshOutcome()
+            end
+            local projections = Nexus and Nexus.ViewProjections
+            if projections and (not receivingNow or coldStart)
+                and type(projections.PumpBuilds) == "function" then
+                -- A receive window may already be active when the browser
+                -- first opens. Keep that cold persisted projection moving,
+                -- but retain an existing last-good publication until the
+                -- burst becomes quiet.
+                if receivingNow and coldStart then
                     M.Refresh()
                     NoteRefreshOutcome()
                 end
-                local projections = Nexus and Nexus.ViewProjections
-                if projections and (not receivingNow or coldStart)
-                    and type(projections.PumpBuilds) == "function" then
-                    -- A receive window may already be active when the browser
-                    -- first opens. Keep that cold persisted projection moving,
-                    -- but retain an existing last-good publication until the
-                    -- burst becomes quiet.
-                    if receivingNow and coldStart then
-                        M.Refresh()
-                        NoteRefreshOutcome()
-                    end
-                    local ok, published, pumpError = pcall(projections.PumpBuilds)
-                    if ok and published then M.Refresh(); NoteRefreshOutcome() end
-                    if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
-                end
+                local ok, published, pumpError = pcall(projections.PumpBuilds)
+                if ok and published then M.Refresh(); NoteRefreshOutcome() end
+                if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
             end
         end
 
