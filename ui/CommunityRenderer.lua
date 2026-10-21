@@ -2232,9 +2232,42 @@ local function EnsureFrame()
 
     local retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
     -- Failure backoff: projection errors must not retry on the next frame.
+    -- Ordinary refresh stays on interval; a saved import does not use it.
     local FAIL_BACKOFF_BASE, FAIL_BACKOFF_MAX = 0.5, 8
     local failBackoffUntil = 0
     local lastReceiving = false
+    local pump = { now = 0, importHoldUntil = 0, interval = 0.1 }
+    function pump.Note()
+        if viewDiagnostic.projectionError then
+            local failures = math.max(1,
+                tonumber(virtualStats.dataFailures) or 1)
+            local delay = FAIL_BACKOFF_BASE
+                * (2 ^ math.min(failures - 1, 4))
+            if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
+            failBackoffUntil = pump.now + delay
+        else
+            failBackoffUntil = 0
+        end
+    end
+    -- An escaped refresh used to skip the safety ticker. Keep the error on
+    -- the diagnostic the backoff already reads, and remember the message.
+    function pump.Retain(err)
+        viewDiagnostic.projectionPending = false
+        viewDiagnostic.projectionError = true
+        viewDiagnostic.projectionCurrent = false
+        virtualStats.dataFailures =
+            (tonumber(virtualStats.dataFailures) or 0) + 1
+        if err ~= nil then
+            virtualStats.lastDataError = tostring(err):sub(1, 300)
+        end
+        pump.Note()
+    end
+    function pump.GuardedRefresh()
+        local ok, err = pcall(M.Refresh)
+        if ok then return true end
+        pump.Retain(err)
+        return false
+    end
     -- Named so Hide can detach it. Hidden frames already skip OnUpdate in
     -- 3.3.5a; clearing the script makes dormancy explicit and prevents any
     -- accidental re-Show of a child from keeping this pump alive.
@@ -2277,59 +2310,87 @@ local function EnsureFrame()
             virtualStats.deferredRefreshes =
                 virtualStats.deferredRefreshes + 1
             failBackoffUntil = 0
-            M.Refresh()
-            return
+            local refreshOk, refreshErr = pcall(M.Refresh)
+            if refreshOk then return end
+            pump.Retain(refreshErr)
         end
 
-        -- Dirty-flag gate: PumpBuilds only while new data, a pending job, a
-        -- cold open, or a saved-loadout import needs work. A saved import is
-        -- a short state machine and has to advance on the frame that needs
-        -- it; holding it to a 10 Hz cap drops slot writes.
+        -- A saved import is a short state machine and has to advance on the
+        -- frame that needs it; a 10 Hz cap drops slot writes. Ordinary
+        -- refresh and projection work stay on that cadence. A failure is
+        -- recorded before any replacement request, and a contained error
+        -- backs off without stopping a healthy import.
         -- Receive-window coalescing: while Sync is receiving, hold dirty
-        -- republish (except cold open / import) until the window ends above.
+        -- republish (except a gated cold open) until the window ends above.
+        pump.now = now
+        if importPending and pump.now >= pump.importHoldUntil then
+            local imported, advanced, pending = pcall(PrepareData, false)
+            if not imported then
+                pump.Retain(advanced)
+                pump.importHoldUntil = failBackoffUntil
+            else
+                pump.importHoldUntil = 0
+                if not pending and pump.GuardedRefresh() then pump.Note() end
+            end
+        end
         local coldStart = virtualStats.dataBinds == 0
-        local backingOff = now < failBackoffUntil
+        local backingOff = pump.now < failBackoffUntil
             and viewDiagnostic.projectionError
-            and not importPending and not coldStart
-        local needPump = (not backingOff) and (refreshDirty
-            or viewDiagnostic.projectionPending or coldStart or importPending)
-        if needPump then
-            local function NoteRefreshOutcome()
-                if viewDiagnostic.projectionError then
-                    local failures = math.max(1,
-                        tonumber(virtualStats.dataFailures) or 1)
-                    local delay = FAIL_BACKOFF_BASE
-                        * (2 ^ math.min(failures - 1, 4))
-                    if delay > FAIL_BACKOFF_MAX then delay = FAIL_BACKOFF_MAX end
-                    failBackoffUntil = now + delay
-                else
-                    failBackoffUntil = 0
+        local needProjection = (not backingOff) and (refreshDirty
+            or viewDiagnostic.projectionPending or coldStart)
+        if not needProjection then
+            pumpTicker = 0
+        else
+            pumpTicker = pumpTicker + elapsed
+            if pumpTicker >= pump.interval then
+                pumpTicker = 0
+                if not importPending and refreshDirty
+                    and not viewDiagnostic.projectionPending
+                    and not receivingNow then
+                    -- MarkDataDirty clears projectionPending; request a job
+                    -- before PumpBuilds can advance one.
+                    if pump.GuardedRefresh() then pump.Note() end
                 end
-            end
-            if importPending then
-                local _, pending = PrepareData(false)
-                if not pending then M.Refresh(); NoteRefreshOutcome() end
-            elseif refreshDirty and not viewDiagnostic.projectionPending
-                and not receivingNow then
-                -- MarkDataDirty clears projectionPending; request a job
-                -- before PumpBuilds can advance one.
-                M.Refresh()
-                NoteRefreshOutcome()
-            end
-            local projections = Nexus and Nexus.ViewProjections
-            if projections and (not receivingNow or coldStart)
-                and type(projections.PumpBuilds) == "function" then
-                -- A receive window may already be active when the browser
-                -- first opens. Keep that cold persisted projection moving,
-                -- but retain an existing last-good publication until the
-                -- burst becomes quiet.
-                if receivingNow and coldStart then
-                    M.Refresh()
-                    NoteRefreshOutcome()
+                local projections = Nexus and Nexus.ViewProjections
+                if projections and (not receivingNow or coldStart)
+                    and type(projections.PumpBuilds) == "function" then
+                    -- A receive window may already be active when the browser
+                    -- first opens. Keep that cold persisted projection moving
+                    -- at the ordinary cadence, but retain an existing
+                    -- last-good publication until the burst becomes quiet.
+                    if receivingNow and coldStart then
+                        if pump.GuardedRefresh() then pump.Note() end
+                    end
+                    local ok, published, pumpError = pcall(projections.PumpBuilds)
+                    if not ok then
+                        pump.Retain(published)
+                    elseif published then
+                        if pump.GuardedRefresh() then pump.Note() end
+                    elseif pumpError then
+                        -- Requesting again replaces the failed job and clears
+                        -- the error. Record the hold first, then restore it
+                        -- unless that request actually published.
+                        viewDiagnostic.projectionError = true
+                        viewDiagnostic.projectionCurrent = false
+                        virtualStats.dataFailures =
+                            (tonumber(virtualStats.dataFailures) or 0) + 1
+                        virtualStats.lastDataError = tostring(pumpError):sub(1, 300)
+                        pump.Note()
+                        local heldUntil = failBackoffUntil
+                        local heldFailures = virtualStats.dataFailures
+                        local heldError = virtualStats.lastDataError
+                        pcall(M.Refresh)
+                        if viewDiagnostic.projectionCurrent == true then
+                            failBackoffUntil = 0
+                        else
+                            failBackoffUntil = heldUntil
+                            virtualStats.dataFailures = heldFailures
+                            virtualStats.lastDataError = heldError
+                            viewDiagnostic.projectionError = true
+                            viewDiagnostic.projectionCurrent = false
+                        end
+                    end
                 end
-                local ok, published, pumpError = pcall(projections.PumpBuilds)
-                if ok and published then M.Refresh(); NoteRefreshOutcome() end
-                if ok and pumpError then M.Refresh(); NoteRefreshOutcome() end
             end
         end
 
@@ -2363,9 +2424,15 @@ local function EnsureFrame()
             end
             -- A missing/failing dirty probe must retain the old safe behavior:
             -- attempt the refresh instead of treating an unknown state as
-            -- current forever.
-            if not receiving and (refreshDirty or current ~= true) then
-                M.Refresh()
+            -- current forever. An active failure hold already owns the retry,
+            -- so this observation must not clear that error.
+            local holdingFailure = viewDiagnostic.projectionError
+                and now < failBackoffUntil
+            if holdingFailure then
+                virtualStats.periodicSkips = virtualStats.periodicSkips + 1
+            elseif not receiving and (refreshDirty or current ~= true) then
+                local refreshOk, refreshErr = pcall(M.Refresh)
+                if not refreshOk then pump.Retain(refreshErr) end
             else
                 virtualStats.periodicSkips = virtualStats.periodicSkips + 1
             end
@@ -2375,6 +2442,8 @@ local function EnsureFrame()
         frame:SetScript("OnUpdate", nil)
         retryTicker, statusTicker, dataTicker, pumpTicker = 0, 0, 0, 0
         failBackoffUntil = 0
+        pump.importHoldUntil = 0
+        pump.now = 0
         if dropPanel then dropPanel:Hide() end
         if sortPanel then sortPanel:Hide() end
         if dropdownShield then dropdownShield:Hide() end
@@ -3076,6 +3145,7 @@ function M.MarkDataDirty()
     viewDiagnostic.projectionPending = false
     viewDiagnostic.projectionError = false
     viewDiagnostic.projectionCurrent = false
+    virtualStats.lastDataError = nil
     return true
 end
 
@@ -3569,6 +3639,7 @@ function M.Refresh()
     viewDiagnostic.projectionPending = false
     viewDiagnostic.projectionError = false
     viewDiagnostic.projectionCurrent = true
+    virtualStats.lastDataError = nil
     refreshDirty = false
     return true
 end
