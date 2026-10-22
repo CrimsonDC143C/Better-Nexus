@@ -110,4 +110,31 @@ assert(status.state=='STOPPED' and not status.running and view.choicePresence=='
  'a deliberate Orb Stop does not resolve an ordinary open choice')
 assert(H.Count('orb-spend')==0 and H.Count('take')==0,
  'observing and preparing a report sends no Orb or choice')
+-- A bounded summary must keep unresolved action/spend evidence ahead of the
+-- additional passive choice context, even after a large incident history.
+local budgetH=dofile('tests/prototype/orbs_support.lua')
+budgetH.OrbPlan();budgetH.Approve(1,false);budgetH.M.Stop()
+local budgetStatus=budgetH.M.Status()
+assert(budgetStatus.pending and budgetStatus.state=='STOPPED' and budgetStatus.reserved==1,
+ 'budget fixture: a deliberate Stop retains one unresolved fake operation')
+Nexus.SupportIncidents.Clear()
+local readiness={}
+for i=1,12 do readiness['source'..i]=string.rep('d',147)end
+for i=1,20 do
+ Nexus.SupportIncidents.Record('catalog-refusal',{
+  reason=string.rep('r',96)..i,producer=string.rep('p',96),
+  operation='budget fixture',counts={ordinary=80,locked=0,total=80},
+  readiness=readiness,committed=false})
+end
+local summary=Nexus.SupportReport.Summary()
+assert(#summary>7500 and #summary<=Nexus.SupportReport.SUMMARY_MAX_BYTES
+ and (summary:find('context line(s) omitted',1,true)
+  or summary:find('summary shortened to stay under',1,true)),
+ 'fixture reaches the summary budget and reports omitted context')
+assert(summary:find('Orb action: unresolved in this session; state=STOPPED',1,true)
+ and summary:find('client-observed spend=no; choice=none',1,true),
+ 'near-budget summary keeps the unresolved receipt and spend evidence before passive choice context')
+assert(budgetH.Count('orb-spend')==1 and budgetH.Count('take')==0,
+ 'preparing the near-budget summary adds no action to the single fixture spend')
+
 print('PASS orb_choice_observation')

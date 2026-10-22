@@ -467,7 +467,7 @@ function A.ChoicePresenceView()
         choiceReason="unobserved",choiceCurrentEpoch=choiceDiagnostics.epoch,choiceWorld=choiceDiagnostics.world}
     if not s then return v end
     for k,x in pairs(s) do v[k]=x end
-    v.lastChoicePresence=s.choicePresence;v.lastChoiceCount=s.choiceCount
+    v.lastChoicePresence=s.choicePresence;v.lastChoiceCount=s.choiceCount;v.lastChoiceReason=s.choiceReason
     v.choiceObservedAt=type(s.at)=="number" and math.floor(s.at) or nil
     local t=choiceDiagnostics.time()
     local elapsed=t and s.at and t-s.at

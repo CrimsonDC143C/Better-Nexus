@@ -1075,8 +1075,8 @@ function M.Summary(selection)
         end
     end
     -- After the Lua error line, so a nearly full summary keeps that first.
-    for _, line in ipairs(M.ChoicePresenceLines()) do context[#context + 1] = line end
     for _, line in ipairs(M.OrbLines()) do context[#context + 1] = line end
+    for _, line in ipairs(M.ChoicePresenceLines()) do context[#context + 1] = line end
     for _, line in ipairs(M.TargetedDiagnosticLines(true)) do context[#context + 1] = line end
     local omitted = 0
     for _, line in ipairs(context) do
@@ -1225,7 +1225,7 @@ do
     local worlds=codeSet({"unknown","entered","leaving","logged_out"})
     function M.ChoicePresenceLines()
         local view=accessorFacts("GameAdapter","ChoicePresenceView",{"observed","choicePresence","choiceCount",
-            "choiceReason","choiceObservedAt","age","choiceFreshness","lastChoicePresence","lastChoiceCount",
+            "choiceReason","choiceObservedAt","age","choiceFreshness","lastChoicePresence","lastChoiceCount","lastChoiceReason",
             "choiceSampleEpoch","choiceCurrentEpoch","choiceWorld","source","serial"}) or {}
         local service
         pcall(function()
@@ -1248,6 +1248,7 @@ do
                 .." reason="..factCode(view.choiceReason,reasons).." observedAt="..factAge(view.choiceObservedAt)
                 .." age="..factAge(view.age).." freshness="..factCode(view.choiceFreshness,freshness)
                 .." lastPresence="..factCode(view.lastChoicePresence,presence).." lastCount="..factCount(view.lastChoiceCount)
+                .." lastReason="..factCode(view.lastChoiceReason,reasons)
                 .." sampleEpoch="..factCount(view.choiceSampleEpoch).." currentEpoch="..factCount(view.choiceCurrentEpoch)
                 .." world="..factCode(view.choiceWorld,worlds).." read="..factCount(view.serial)
                 .." source="..factCode(view.source,codeSet({"adapter_board","orb_read"}))

@@ -17,7 +17,11 @@ freshness.
   it is a diagnostic sampling bound, never an action or server-response gate.
   A stale sample, unavailable/regressed clock, interrupted/blocked Orb Status
   read, world leave/entry or logout cannot assert current absence/presence.
-  `lastPresence` and `lastCount` preserve the sampled historical result.
+  `lastPresence`, `lastCount` and `lastReason` preserve the sampled historical
+  result, even when the current reason is `stale` or `transition`.
+  `read_blocked` is conservative: an Orb Status read that refuses before reaching
+  the choice getter also invalidates a previous ordinary Board sample. It does
+  not establish that the ordinary choice getter itself failed.
 - `sampleEpoch`, `currentEpoch` and `world` come from events received by the
   existing Main dispatcher since this addon load. They do not identify a
   server session or prove that a service mirror has hydrated after loading.
@@ -36,37 +40,36 @@ freshness.
   receipt for early reporting, as before. An empty uninitialized runtime is
   not constructed merely to inspect Continue or empty history.
 - Boundary comparisons are retained evidence. `changed_age` dates the stored
-  comparison; `read_age` dates the last ordinary read even if values stayed
-  stable. `scope=retained current=no` applies after completion too.
+  comparison; `read_age` dates the latest successful ordinary comparison read
+  even if values stayed stable. A failed read clears that read time to unknown
+  while retaining the older comparison; unknown does not distinguish a failed
+  read from a missing clock or no prior read. `scope=retained current=no` applies
+  after completion too.
 
 The views return detached scalar tables. No raw API error, card contents,
 player identity or payload is retained in the new block. The report formats
 fixed keys/codes. A prepared report is frozen when built: its printed ages do
 not tick afterward. Rebuilding a report does not refresh native state.
 
-## Reviewed scope and remaining gaps
+## Scope and remaining gaps
 
-The source review was pinned to public main
-`18dc5b0313033dbc522bec1ab89c304078aa5645`. Actual Claude Opus 5.5 returned
-all four requested report sections from a 74-file public-source packet. Its
-controller terminated with a local maximum-cost error, so this is retained
-review input, not a successfully completed provider run or approval. Findings
-were checked against source before implementation. No private reports or
-saved player data were shared. Changed implementation requires separate review.
+The diagnostics work is tracked in [#127](https://github.com/Viscerals/Better-Nexus/issues/127).
+The following boundaries describe the implementation, independently of any
+particular review or validation run.
 
-| Review area | Disposition in this change |
+| Area | Disposition in this change |
 | --- | --- |
-| Ordinary choice and error/absence conflation (D1) | Existing-read sampling, tri-state presence, reason and age. Nil stays unknown. |
-| Orb-service capability and offer state (D2) | Separate passive classifier sample and freshness. |
-| Runner state omitted without a receipt (D3) | Pure runner view and uninitialized report guard. A hypothetical nil Store result is not asserted as a production defect. |
-| Retained comparison age (D4) | Changed/read ages and an explicit retained/not-current label. |
-| Lifecycle observer scope (D5) | Main observation context plus explicit Orb-owner observer availability. No gameplay epoch change. |
-| Recovery slot/pick ages and Continue refusal breakdown (D6-D7) | Deferred; new choice block must not be used to reinterpret an older receipt. |
-| Other action-latch history (D8) | Deferred; no latch watchdog or dead-latch behavior change. |
-| General log-export purity and charge wording (D9-D10) | Deferred to a separate log-export audit. This change covers support-report evidence only. |
-| Echo rejection export and roll-trace schema (D11-D12) | Deferred; no trace schema/Sync changes. |
-| Continue-view side effects (D13) | Empty uninitialized reports skip Continue/history constructors. Existing saved-receipt restoration and initialized Continue-view behavior are preserved and deferred. |
-| Board fingerprint comment/behavior and export privacy alignment (D14-D15) | Deferred, outside this diagnostic slice. |
+| Ordinary choice and error/absence conflation | Existing-read sampling, tri-state presence, reason and age. Nil stays unknown. |
+| Orb-service capability and offer state | Separate passive classifier sample and freshness. |
+| Runner state omitted without a receipt | Pure runner view and uninitialized report guard. A hypothetical nil Store result is not asserted as a production defect. |
+| Retained comparison age | Changed/read ages and an explicit retained/not-current label. |
+| Lifecycle observer scope | Main observation context plus explicit Orb-owner observer availability. No gameplay epoch change. |
+| Recovery slot/pick ages and Continue refusal breakdown | Deferred; new choice block must not be used to reinterpret an older receipt. |
+| Other action-latch history | Deferred; no latch watchdog or dead-latch behavior change. |
+| General log-export purity and charge wording | Deferred to a separate log-export audit. This change covers support-report evidence only. |
+| Echo rejection export and roll-trace schema | Deferred; no trace schema/Sync changes. |
+| Continue-view side effects | Empty uninitialized reports skip Continue/history constructors. Existing saved-receipt restoration and initialized Continue-view behavior are preserved and deferred. |
+| Board fingerprint comment/behavior and export privacy alignment | Deferred, outside this diagnostic slice. |
 
 ## Verification and limits
 

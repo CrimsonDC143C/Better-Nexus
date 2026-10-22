@@ -50,12 +50,29 @@ check(seeded>0 and receiver.e.Nexus.BuildCatalog.Get(syntheticRow.buildId)~=nil,
  'captured public build egress established receiver page')
 check(receiver.e.Nexus.DpsCapture.GetCharacterBest('lk','Origin',row.o)==nil,
  'receiver has no synthetic LK record before measured request')
+-- Startup readiness can take a different number of normal frames because its
+-- slices use the host profiler. Exercise one such pre-trace frame difference,
+-- then match both peers' simulated time without replacing any runtime clock.
+if enabled then advance(.05) end
+local measurementAt=1060
+for _,p in ipairs({source,receiver}) do
+ check(p.H.now<measurementAt-.05,'fixed measurement checkpoint follows fixture setup')
+ p.H.Advance(measurementAt-p.H.now-.05,.05)
+ -- Advance's epsilon may leave a repeated .05 step just short of its stop.
+ -- Reserve one final normal frame so min(stop, now + step) reaches it exactly.
+ local finalFrame=measurementAt-p.H.now
+ p.H.Advance(finalFrame,finalFrame)
+end
+check(source.H.now==measurementAt and receiver.H.now==measurementAt,
+ 'both peers reach the same fixed pre-trace measurement checkpoint')
 local saved=F.Serialize(source.e.NexusDB.authorityBundle.dpsCapture)
 for _,p in ipairs({source,receiver}) do
  p.cursor=#p.H.sent
  if enabled then check(p.e.Nexus.PeerDebug.Start()==true,'bounded trace started')
  else p.e.Nexus.PeerDebug.Clear() end
 end
+check(source.H.now==measurementAt and receiver.H.now==measurementAt,
+ 'tracing toggle does not change matched simulated time')
 local requestId
 local transfers,responsePackets={},{}
 local captured,traffic,rawTraffic=0,{},{}
@@ -95,7 +112,11 @@ local function pump(p,q)
   end
  end
 end
+check(source.H.now==measurementAt and receiver.H.now==measurementAt,
+ 'RequestSync starts at the matched measurement time')
 check(receiver.e.Nexus.Sync.RequestSync()==true,'real manual RequestSync accepted')
+check(source.H.now==measurementAt and receiver.H.now==measurementAt,
+ 'RequestSync does not advance either peer clock')
 for _=1,800 do
  source.H.Advance(.05,.05);receiver.H.Advance(.05,.05)
  pump(receiver,source);pump(source,receiver)
