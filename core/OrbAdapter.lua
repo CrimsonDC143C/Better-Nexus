@@ -173,6 +173,38 @@ function O.ServiceState()
     if pending then return capability,"PENDING","Orb offer active -- manual action required" end
     return capability,"IDLE"
 end
+do
+    local sample
+    local classify=O.ServiceState
+    local function clock()
+        if type(GetTime)~="function" then return nil end
+        local ok,t=pcall(GetTime)
+        if ok and type(t)=="number" and t==t and t>=0 and t<math.huge then return t end
+    end
+    local function note(capability,status)
+        local epoch=A.ChoiceObservationContext and A.ChoiceObservationContext() or nil
+        sample={capability=capability,status=status,at=clock(),epoch=epoch,
+            offer=status=="IDLE" and "absent" or status=="PENDING" and "present" or "unknown"}
+    end
+    local function retain(...)
+        pcall(note,...)
+        return ... -- preserve the classifier's original return arity and values
+    end
+    function O.ServiceState(...) return retain(classify(...)) end
+    function O.ServiceStateView()
+        local v={observed=sample~=nil,offer="unknown",freshness="unknown"}
+        if not sample then return v end
+        for k,x in pairs(sample) do v[k]=x end
+        v.lastOffer=sample.offer
+        local t=clock();local age=t and sample.at and t-sample.at
+        if type(age)=="number" and age>=0 then v.age=math.floor(age);v.freshness=age<=1 and "recent" or "stale" end
+        local epoch,world
+        if A.ChoiceObservationContext then epoch,world=A.ChoiceObservationContext() end
+        if epoch~=sample.epoch or world=="leaving" or world=="logged_out" then v.freshness="transition" end
+        if v.freshness~="recent" then v.offer="unknown" end
+        return v
+    end
+end
 function O.Balance()
     local pe=_G.ProjectEbonhold;local orb=pe and pe.OrbService
     if type(orb)~="table" or type(orb.IsStateKnown)~="function" or type(orb.GetCharges)~="function" then
@@ -237,6 +269,7 @@ function O.Read(mode)
         observations.serial=observations.serial+1;observations.grantedRef=rawG;observations.grantedSig=sig
     end
     local okB,rawB=call(svc,"GetCurrentChoice")
+    if type(A.ObserveChoiceRead)=="function" then pcall(A.ObserveChoiceRead,okB,rawB,"orb_read") end
     if not okB or (rawB~=nil and type(rawB)~="table") then return nil,"The current Echo choices are unavailable.","choice" end
     local board,parts={},{}
     for i,c in ipairs(rawB or {}) do

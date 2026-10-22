@@ -370,6 +370,9 @@ local function journalCapture(event,s,p)
         local charge=s and integer(s.charges,0) and s.charges or nil
         local offer,pick,host=journalFlag(s and s.offerPending),journalFlag(s and s.selectInFlight~=nil),journalFlag(s and s.hostPending)
         local last=d.lastRead
+        local sampledAt=s and s.at
+        if type(sampledAt)~="number" or sampledAt~=sampledAt or sampledAt<0 or sampledAt==math.huge then sampledAt=nil end
+        if event=="read" then d.lastReadAt=sampledAt end
         -- Stable recovery/live reads do not allocate a diagnostic row, replace
         -- the snapshot or dirty saved data. Comparisons use the existing read.
         if event=="read" and last and last.epoch==life.epoch and last.phase==life.phase
@@ -380,7 +383,7 @@ local function journalCapture(event,s,p)
         if event=="read" then d.lastRead=entry end
         if s then d.snapshot={chargesBefore=integer(p.chargesBefore,0) and p.chargesBefore or nil,
             chargesNow=integer(s.charges,0) and s.charges or nil,chargeRelation=rel,ownedRelation=own,
-            offerPresent=entry.offer,pickInFlight=entry.pick,hostPending=entry.host,epoch=life.epoch,phase=life.phase} end
+            offerPresent=entry.offer,pickInFlight=entry.pick,hostPending=entry.host,epoch=life.epoch,phase=life.phase,at=sampledAt} end
         local list=d.owner==p and not p.restored and p.boundaryJournal or d.session
         if journalAppend(list,entry,d) and d.owner==p and not p.restored then d.unsaved=true end
 end
@@ -2307,6 +2310,13 @@ end
 -- only, no names. It writes nothing and authorizes nothing. Like
 -- BlocksOrdinary, its init() can start the read-only recovery of a saved
 -- receipt that nothing had loaded yet.
+-- Passive session facts only. Unlike recovery/Continue views this never
+-- initializes a runtime or inspects saved state. Unknown is not no receipt.
+function M.RunnerView()
+    return {initialized=config~=nil,state=run and run.state,
+        running=run and run.running,pending=run and run.pending~=nil,
+        lifecycleObserved=frame~=nil,epoch=frame and life.epoch or nil,phase=frame and life.phase or nil}
+end
 function M.RecoveryView()
     if not config then
         local st=Nexus.Store and Nexus.Store.State and Nexus.Store.State()
@@ -2450,6 +2460,11 @@ function M.BoundaryDiagnostics()
     if d then reason=d.reason
     elseif p then if not saved then reason=p.boundaryJournal~=nil and "foreign_journal" or "older_receipt" end
     else reason="no_receipt" end
+    local t
+    if type(GetTime)=="function" then local ok,value=pcall(GetTime);if ok then t=value end end
+    local function age(at)
+        if type(t)=="number" and t==t and t<math.huge and type(at)=="number" and t>=at then return math.floor(t-at) end
+    end
     return {observed=d~=nil or saved~=nil,receiptPresent=p~=nil,mode=d and d.mode or saved and "retained" or "unavailable",
         reason=reason,
         retained=saved and #saved or 0,durableRetained=p and (p.restored and saved and #saved or d and d.persistedCount) or 0,
@@ -2457,7 +2472,9 @@ function M.BoundaryDiagnostics()
         priorWrittenOmitted=d and d.priorWrittenOmitted or 0,
         dropped=d and d.dropped or 0,captureFailures=d and d.captureFailures or 0,
         unsaved=p and d and d.unsaved==true or false,persisted=p and d and d.persisted==true or false,
-        epoch=life.epoch,phase=life.phase,receiptJournal=saved or {},sessionJournal=d and copy(d.session) or {},
+        epoch=life.epoch,phase=life.phase,lifecycleObserved=frame~=nil,
+        snapshotAge=age(d and d.snapshot and d.snapshot.at),lastReadAge=age(d and d.lastReadAt),
+        receiptJournal=saved or {},sessionJournal=d and copy(d.session) or {},
         snapshot=d and copy(d.snapshot) or nil}
 end
 -- The exact comparison scalars used by OrbAdapter SameOwner/SameContext,
@@ -2506,6 +2523,9 @@ end
 -- under 1 s, so its context generation is non-authoritative; every shown
 -- field is read fresh.
 function M.Status(detail)
+    if type(Nexus.GameAdapter.InvalidateChoiceObservation)=="function" then
+        pcall(Nexus.GameAdapter.InvalidateChoiceObservation)
+    end
     init();local m,err,failed,stage=inspect(true);local a=m and m.assignment or failed or assigned()
     local resumeRead=m and m.s
     -- A held run inspects its approved targets, while this view shows the
