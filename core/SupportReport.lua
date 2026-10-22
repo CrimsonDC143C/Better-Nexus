@@ -1076,8 +1076,8 @@ function M.Summary(selection)
     end
     -- After the Lua error line, so a nearly full summary keeps that first.
     for _, line in ipairs(M.OrbLines()) do context[#context + 1] = line end
-    for _, line in ipairs(M.ChoicePresenceLines()) do context[#context + 1] = line end
     for _, line in ipairs(M.TargetedDiagnosticLines(true)) do context[#context + 1] = line end
+    for _, line in ipairs(M.ChoicePresenceLines()) do context[#context + 1] = line end
     local omitted = 0
     for _, line in ipairs(context) do
         local size = #escape(line) + 1
