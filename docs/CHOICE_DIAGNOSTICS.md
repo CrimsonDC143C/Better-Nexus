@@ -32,6 +32,9 @@ freshness.
   completion, resource exhaustion, no safe sources and recovery. They do not
   imply ordinary choice absence. The Orb-owner lifecycle epoch is unavailable
   until that owner's frame exists; it is distinct from Main's world context.
+  The separate legacy recovery section may still restore a known saved
+  receipt for early reporting, as before. An empty uninitialized runtime is
+  not constructed merely to inspect Continue or empty history.
 - Boundary comparisons are retained evidence. `changed_age` dates the stored
   comparison; `read_age` dates the last ordinary read even if values stayed
   stable. `scope=retained current=no` applies after completion too.
@@ -62,7 +65,7 @@ saved player data were shared. Changed implementation requires separate review.
 | Other action-latch history (D8) | Deferred; no latch watchdog or dead-latch behavior change. |
 | General log-export purity and charge wording (D9-D10) | Deferred to a separate log-export audit. This change covers support-report evidence only. |
 | Echo rejection export and roll-trace schema (D11-D12) | Deferred; no trace schema/Sync changes. |
-| Continue-view side effects (D13) | Uninitialized report no longer calls recovery/Continue/history constructors. Existing initialized Continue-view behavior is deferred. |
+| Continue-view side effects (D13) | Empty uninitialized reports skip Continue/history constructors. Existing saved-receipt restoration and initialized Continue-view behavior are preserved and deferred. |
 | Board fingerprint comment/behavior and export privacy alignment (D14-D15) | Deferred, outside this diagnostic slice. |
 
 ## Verification and limits

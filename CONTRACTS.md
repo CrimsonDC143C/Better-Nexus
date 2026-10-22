@@ -104,8 +104,10 @@ This file has two parts.
   remain labelled separately. The existing Main event dispatcher updates only
   diagnostic world context, including before an Orb recovery frame exists.
   An Orb runner being IDLE or STOPPED does not settle an ordinary Echo choice.
-  Uninitialized runner/receipt state is unknown; report collection does not
-  initialize it to obtain these facts. None of this authorizes recovery or
+  Uninitialized runner/receipt state is unknown; these passive facts never
+  initialize it. The separate legacy recovery section retains early saved
+  receipt restoration; empty uninitialized reports skip Continue/history
+  constructors. None of this authorizes recovery or
   changes gameplay, ownership, saved data or retry policy. See
   `docs/CHOICE_DIAGNOSTICS.md` for sampling and coverage limits.
 - **Occupied locked records.** The client mirrors each SS18 entry flagged

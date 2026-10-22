@@ -774,14 +774,18 @@ function M.OrbLines()
         if not (type(runtime) == "table" and type(runtime.RecoveryView) == "function") then
             return {"Orb action: not available"}
         end
+        local view = runtime.RecoveryView()
+        if type(view) ~= "table" then return unavailable end
+        -- Keep the existing early display of an actual saved receipt: the
+        -- recovery owner restores it on this read. If it found nothing and is
+        -- still uninitialized, do not construct it just to inspect Continue
+        -- or empty history. New passive fields above do not initialize it.
         if type(runtime.RunnerView)=="function" then
             local runner=runtime.RunnerView()
             if type(runner)~="table" or runner.initialized~=true then
-                return {"Orb action: unknown (runtime not initialized; saved receipt not inspected)"}
+                return {"Orb action: unknown (runtime not initialized; no loaded receipt)"}
             end
         end
-        local view = runtime.RecoveryView()
-        if type(view) ~= "table" then return unavailable end
         if view.pending ~= true then
             local none = {"Orb action: none unresolved"}
             -- A continued action stays visible (archive and late events), and so does an attempt.
