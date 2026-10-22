@@ -864,11 +864,13 @@ end
 
 function A.Board()
     projectionStatus.board.calls = projectionStatus.board.calls + 1
+    pcall(A.InvalidateChoiceObservation)
     local svc = PS()
     local getter=svc and svc.GetCurrentChoice
     local ok,ch=false,nil
     if type(getter)=="function" then ok,ch=pcall(getter) end
     pcall(A.ObserveChoiceRead,ok,ch,"adapter_board",not svc and "no_service" or type(getter)~="function" and "no_getter" or nil)
+    if not ok then ch=nil end -- preserve SafeCall's original failed-read result
     if type(ch) ~= "table" or #ch == 0 then return nil end
     local cards, gi = {}, nil
     local sigParts = {}

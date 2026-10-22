@@ -28,6 +28,20 @@ assert(report:find('Echo choice: presence=present',1,true)
 assert(report:find('Orb action: unknown',1,true)
  and not report:find('Orb action: none unresolved',1,true),'uninitialized state is not confirmed absence')
 assert(Nexus.OrbRuntime.RunnerView().initialized==false and reads==1,'report collection initializes and reads nothing')
+local svc=ProjectEbonhold.PerkService
+local ordinaryGetter=svc.GetCurrentChoice
+svc.GetCurrentChoice=function()error({{spellId=410001,quality=1}},0)end
+assert(A.Board()==nil,'a table-valued API error must never become a gameplay board')
+assert(A.ChoicePresenceView().choicePresence=='unknown','table-valued errors remain diagnostic unknown')
+svc.GetCurrentChoice=ordinaryGetter
+A.Board()
+ProjectEbonhold.PerkService=setmetatable({},{__index=function()error('SYNTHETIC_MEMBER_ERROR')end})
+local lookupOk=pcall(A.Board)
+ProjectEbonhold.PerkService=svc
+view=A.ChoicePresenceView()
+assert(not lookupOk and view.choicePresence=='unknown' and view.lastChoicePresence=='present',
+ 'an interrupted service/member lookup invalidates currentness while retaining the preceding observation')
+A.Board()
 for _,case in ipairs({
  {'UNKNOWN',function()return false end,function()error('pending should not be read')end},
  {'INVALID',function()error('SYNTHETIC_SERVICE_ERROR')end,function()return false end},
