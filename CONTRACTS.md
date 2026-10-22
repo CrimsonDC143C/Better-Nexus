@@ -93,6 +93,23 @@ This file has two parts.
   sample keep the shared wait text. The refusal, its stage and every gate are
   the same either way; nothing is read from the game, requested or saved for
   the text.
+- **Choice and runner diagnostics.** `GameAdapter.ChoicePresenceView()`,
+  `OrbAdapter.ServiceStateView()` and `OrbRuntime.RunnerView()` expose separate
+  memory-only observations. Existing `Board()` and Orb adapter reads sample
+  `GetCurrentChoice` without adding a native call. A checked nonempty dense
+  choice is present; an explicit checked empty table is absent; nil, failure,
+  unavailable or malformed data is unknown. Samples older than one client
+  second, invalidated by a loading/logout transition, or without a usable
+  clock cannot assert current presence or absence. Historical sample facts
+  remain labelled separately. The existing Main event dispatcher updates only
+  diagnostic world context, including before an Orb recovery frame exists.
+  An Orb runner being IDLE or STOPPED does not settle an ordinary Echo choice.
+  Uninitialized runner/receipt state is unknown; these passive facts never
+  initialize it. The separate legacy recovery section retains early saved
+  receipt restoration; empty uninitialized reports skip Continue/history
+  constructors. None of this authorizes recovery or
+  changes gameplay, ownership, saved data or retry policy. See
+  `docs/CHOICE_DIAGNOSTICS.md` for sampling and coverage limits.
 - **Occupied locked records.** The client mirrors each SS18 entry flagged
   locked as one record with its own locked stack; granted copies of the same
   spell can be held beside it. The native journal's client-side lock gate

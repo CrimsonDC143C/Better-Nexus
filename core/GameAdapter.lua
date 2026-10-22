@@ -413,6 +413,77 @@ local function DiagnosticTime()
     return nil
 end
 
+-- One bounded sample of an existing GetCurrentChoice read. It is independent
+-- of Orb offers, runner state and action latches, and never grants authority.
+-- Keep this private: projectionStatus exporters only shallow-copy their rows.
+local choiceDiagnostics={epoch=0,world="unknown",serial=0}
+function choiceDiagnostics.time()
+    local t=DiagnosticTime()
+    if type(t)=="number" and t>=0 and t<math.huge then return t end
+end
+function A.ObserveChoiceWorldEvent(event)
+    local phase=event=="PLAYER_LEAVING_WORLD" and "leaving"
+        or event=="PLAYER_ENTERING_WORLD" and "entered"
+        or event=="PLAYER_LOGOUT" and "logged_out" or nil
+    if phase then
+        choiceDiagnostics.epoch=(choiceDiagnostics.epoch+1)%65536
+        choiceDiagnostics.world=phase
+    end
+end
+function A.ChoiceObservationContext() return choiceDiagnostics.epoch,choiceDiagnostics.world end
+function A.InvalidateChoiceObservation() choiceDiagnostics.invalid=true end
+function A.ObserveChoiceRead(ok,value,source,reason)
+    local state,count="unknown",nil
+    if ok and value==nil then reason="nil_response"
+    elseif ok and type(value)=="table" and getmetatable(value)==nil then
+        local n,key,valid=0,nil,true
+        repeat
+            key=next(value,key)
+            if key~=nil then
+                n=n+1
+                if n>3 or type(key)~="number" or key~=math.floor(key) or key<1 or key>3 then valid=false;break end
+                local row=rawget(value,key)
+                local id=type(row)=="table" and getmetatable(row)==nil and rawget(row,"spellId")
+                if type(id)~="number" or id~=math.floor(id) or id<=0 or id==math.huge then valid=false;break end
+            end
+        until key==nil
+        if valid and (n==0 or #value==n) then
+            state=n==0 and "absent" or "present";count=n;reason="observed"
+        else reason="malformed" end
+    elseif ok then reason="malformed" end
+    if reason~="observed" and reason~="nil_response" and reason~="malformed"
+        and reason~="no_service" and reason~="no_getter" then reason="read_failed" end
+    choiceDiagnostics.serial=choiceDiagnostics.serial%999999+1
+    choiceDiagnostics.sample={choicePresence=state,choiceCount=count,choiceReason=reason,
+        at=choiceDiagnostics.time(),choiceSampleEpoch=choiceDiagnostics.epoch,
+        source=source=="adapter_board" and source or "orb_read",serial=choiceDiagnostics.serial}
+    choiceDiagnostics.invalid=false
+end
+-- No game read, constructor, request, save or action. Recency is a one-second
+-- client sampling bound, not server freshness; old facts remain historical.
+function A.ChoicePresenceView()
+    local s=choiceDiagnostics.sample
+    local v={observed=s~=nil,choicePresence="unknown",choiceFreshness="unknown",
+        choiceReason="unobserved",choiceCurrentEpoch=choiceDiagnostics.epoch,choiceWorld=choiceDiagnostics.world}
+    if not s then return v end
+    for k,x in pairs(s) do v[k]=x end
+    v.lastChoicePresence=s.choicePresence;v.lastChoiceCount=s.choiceCount;v.lastChoiceReason=s.choiceReason
+    v.choiceObservedAt=type(s.at)=="number" and math.floor(s.at) or nil
+    local t=choiceDiagnostics.time()
+    local elapsed=t and s.at and t-s.at
+    if type(elapsed)=="number" and elapsed>=0 then
+        v.age=math.floor(elapsed);v.choiceFreshness=elapsed<=1 and "recent" or "stale"
+    end
+    if s.choiceSampleEpoch~=choiceDiagnostics.epoch or choiceDiagnostics.world=="leaving"
+        or choiceDiagnostics.world=="logged_out" then v.choiceFreshness="transition" end
+    if choiceDiagnostics.invalid then v.choiceFreshness="unknown";v.choiceReason="read_blocked"
+    elseif v.choiceFreshness~="recent" then
+        v.choiceReason=v.choiceFreshness=="unknown" and "clock_unavailable" or v.choiceFreshness
+    end
+    if v.choiceFreshness~="recent" then v.choicePresence="unknown";v.choiceCount=nil end
+    return v
+end
+
 ------------------------------------------------------------------------
 -- Revision-aware catalog. Ordinary reads are O(1); the keyed noncritical
 -- scheduler starts a resumable verifier for in-place edits (NX-01). Every
@@ -793,8 +864,13 @@ end
 
 function A.Board()
     projectionStatus.board.calls = projectionStatus.board.calls + 1
+    pcall(A.InvalidateChoiceObservation)
     local svc = PS()
-    local ch = svc and SafeCall(svc.GetCurrentChoice)
+    local getter=svc and svc.GetCurrentChoice
+    local ok,ch=false,nil
+    if type(getter)=="function" then ok,ch=pcall(getter) end
+    pcall(A.ObserveChoiceRead,ok,ch,"adapter_board",not svc and "no_service" or type(getter)~="function" and "no_getter" or nil)
+    if not ok then ch=nil end -- preserve SafeCall's original failed-read result
     if type(ch) ~= "table" or #ch == 0 then return nil end
     local cards, gi = {}, nil
     local sigParts = {}

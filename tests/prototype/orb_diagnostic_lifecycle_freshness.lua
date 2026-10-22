@@ -1,0 +1,17 @@
+local H=dofile('tests/prototype/orbs_support.lua')
+local M=H.M
+local before=M.BoundaryDiagnostics()
+assert(before.lifecycleObserved==false,'no Orb owner lifecycle is invented before its frame starts')
+H.Fire('PLAYER_LEAVING_WORLD');H.Fire('PLAYER_ENTERING_WORLD')
+local summary=Nexus.SupportReport.Summary()
+assert(summary:find('current_epoch=unknown',1,true),'unstarted owner observer is not a global world epoch zero')
+H.OrbPlan();H.Approve(1,false);H.Offer();H.Result(410002,2)
+local d=M.BoundaryDiagnostics()
+assert(d.receiptPresent==false and d.snapshot~=nil,'fixture: completed fake operation retains comparisons')
+H.now=H.now+120
+d=M.BoundaryDiagnostics()
+assert(type(d.snapshotAge)=='number' and d.snapshotAge>=120,'changed comparisons expose their sample age')
+summary=Nexus.SupportReport.Summary()
+assert(summary:find('scope=retained current=no',1,true)
+ and summary:find('changed_age=120',1,true),'summary cannot imply old offer flags are current')
+print('PASS orb_diagnostic_lifecycle_freshness')

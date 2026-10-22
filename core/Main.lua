@@ -843,6 +843,9 @@ EH:RegisterEvent("PLAYER_REGEN_DISABLED")
 EH:RegisterEvent("PLAYER_REGEN_ENABLED")
 EH:SetScript("OnEvent", function(_, event, ...)
     if event=="PLAYER_ENTERING_WORLD" or event=="PLAYER_LEAVING_WORLD" or event=="PLAYER_LOGOUT" then
+        local adapter=Adapter or Nexus.GameAdapter
+        local observe=adapter and adapter.ObserveChoiceWorldEvent
+        if type(observe)=="function" then pcall(observe,event) end
         -- A loading screen inside this session keeps Auto selected and holds
         -- actions; logout or an unclassified entry turns it OFF.
         if AutomationRuntime and AutomationRuntime.OnWorldEvent(event)=="revoked" and Panel.SetAuto then

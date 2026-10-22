@@ -776,6 +776,16 @@ function M.OrbLines()
         end
         local view = runtime.RecoveryView()
         if type(view) ~= "table" then return unavailable end
+        -- Keep the existing early display of an actual saved receipt: the
+        -- recovery owner restores it on this read. If it found nothing and is
+        -- still uninitialized, do not construct it just to inspect Continue
+        -- or empty history. New passive fields above do not initialize it.
+        if type(runtime.RunnerView)=="function" then
+            local runner=runtime.RunnerView()
+            if type(runner)~="table" or runner.initialized~=true then
+                return {"Orb action: unknown (runtime not initialized; no loaded receipt)"}
+            end
+        end
         if view.pending ~= true then
             local none = {"Orb action: none unresolved"}
             -- A continued action stays visible (archive and late events), and so does an attempt.
@@ -883,11 +893,15 @@ function M.TargetedDiagnosticLines(summary)
         ..'; prior_written_omitted='..dn(dg(boundary,'priorWrittenOmitted'))
         ..'; dropped='..dn(dg(boundary,'dropped'))
         ..'; capture_failures='..dn(dg(boundary,'captureFailures'))..'; unsaved='..db(dg(boundary,'unsaved'))
-        ..'; current_epoch='..dn(dg(boundary,'epoch'))..'; current_phase='..dc(dg(boundary,'phase'))
+        ..'; lifecycle_observed='..db(dg(boundary,'lifecycleObserved'))
+        ..'; current_epoch='..dn(dg(boundary,'lifecycleObserved')==true and dg(boundary,'epoch') or nil)
+        ..'; current_phase='..dc(dg(boundary,'lifecycleObserved')==true and dg(boundary,'phase') or nil)
     out[#out+1]='Orb comparisons: before='..dn(dg(snap,'chargesBefore'))..'; now='..dn(dg(snap,'chargesNow'))
         ..'; charge_relation='..dc(dg(snap,'chargeRelation'))..'; owned_relation='..dc(dg(snap,'ownedRelation'))
         ..'; offer='..db(dg(snap,'offerPresent'))..'; pick='..db(dg(snap,'pickInFlight'))
         ..'; host='..db(dg(snap,'hostPending'))..'; epoch='..dn(dg(snap,'epoch'))..'; phase='..dc(dg(snap,'phase'))
+        ..'; changed_age='..dn(dg(boundary,'snapshotAge'))..'; read_age='..dn(dg(boundary,'lastReadAge'))
+        ..'; scope=retained current=no'
     if summary then return out end
     out[#out+1]='Diagnostic durations are inclusive elapsed milliseconds; direct-child residuals are not exclusive addon CPU.'
     out[#out+1]='Heap fields are GLOBAL NET Lua heap KB, not bytes allocated or GC duration. Session and millisecond clocks are separate; frozen/unavailable windows do not establish hitch correlation.'
@@ -1063,6 +1077,7 @@ function M.Summary(selection)
     -- After the Lua error line, so a nearly full summary keeps that first.
     for _, line in ipairs(M.OrbLines()) do context[#context + 1] = line end
     for _, line in ipairs(M.TargetedDiagnosticLines(true)) do context[#context + 1] = line end
+    for _, line in ipairs(M.ChoicePresenceLines()) do context[#context + 1] = line end
     local omitted = 0
     for _, line in ipairs(context) do
         local size = #escape(line) + 1
@@ -1198,6 +1213,57 @@ end
 
 -- The last normal Orb window read (OrbRuntime.ReadinessView). Its facts are
 -- those of that read, not current ones; its age is shown.
+do
+    local presence=codeSet({"present","absent","unknown"})
+    local freshness=codeSet({"recent","stale","transition","unknown"})
+    local reasons=codeSet({"observed","nil_response","malformed","no_service","no_getter",
+        "read_failed","unobserved","read_blocked","clock_unavailable","stale","transition"})
+    local states=codeSet({"IDLE","READY","WAIT_OFFER","WAIT_SELECT","WAIT_RESULT","RECOVERY","PAUSED",
+        "STOPPED","FINISHED","COMPLETE","ROLLED_COMPLETE","OUT_OF_ORBS","NO_SOURCES","LIMIT","ERROR"})
+    local capabilities=codeSet({"NO_ORB_SERVICE","MISSING_STATE","STATE_AWARE","MALFORMED"})
+    local serviceStates=codeSet({"ABSENT","UNAVAILABLE","INVALID","UNKNOWN","PENDING","IDLE"})
+    local worlds=codeSet({"unknown","entered","leaving","logged_out"})
+    function M.ChoicePresenceLines()
+        local view=accessorFacts("GameAdapter","ChoicePresenceView",{"observed","choicePresence","choiceCount",
+            "choiceReason","choiceObservedAt","age","choiceFreshness","lastChoicePresence","lastChoiceCount","lastChoiceReason",
+            "choiceSampleEpoch","choiceCurrentEpoch","choiceWorld","source","serial"}) or {}
+        local service
+        pcall(function()
+            local orb=Nexus.GameAdapter and Nexus.GameAdapter.Orbs
+            if orb and type(orb.ServiceStateView)=="function" then service=orb.ServiceStateView() end
+        end)
+        -- Copy only named fields under protection, including a corrupt owner.
+        local s={}
+        if type(service)=="table" then
+            for _,key in ipairs({"observed","offer","lastOffer","capability","status","age","freshness"}) do
+                local ok,value=pcall(function()return service[key]end)
+                if ok then s[key]=value end
+            end
+        end
+        local runner=accessorFacts("OrbRuntime","RunnerView",{"initialized","state","running","pending",
+            "lifecycleObserved","epoch"}) or {}
+        return {
+            "Echo choice: presence="..factCode(view.choicePresence,presence).." count="..factCount(view.choiceCount)
+                .." observed="..factFlag(view.observed)
+                .." reason="..factCode(view.choiceReason,reasons).." observedAt="..factAge(view.choiceObservedAt)
+                .." age="..factAge(view.age).." freshness="..factCode(view.choiceFreshness,freshness)
+                .." lastPresence="..factCode(view.lastChoicePresence,presence).." lastCount="..factCount(view.lastChoiceCount)
+                .." lastReason="..factCode(view.lastChoiceReason,reasons)
+                .." sampleEpoch="..factCount(view.choiceSampleEpoch).." currentEpoch="..factCount(view.choiceCurrentEpoch)
+                .." world="..factCode(view.choiceWorld,worlds).." read="..factCount(view.serial)
+                .." source="..factCode(view.source,codeSet({"adapter_board","orb_read"}))
+                .." clock=client serverFreshness=unknown (not refreshed)",
+            "Orb service: offer="..factCode(s.offer,presence).." lastOffer="..factCode(s.lastOffer,presence)
+                .." observed="..factFlag(s.observed)
+                .." capability="..factCode(s.capability,capabilities).." status="..factCode(s.status,serviceStates)
+                .." age="..factAge(s.age).." freshness="..factCode(s.freshness,freshness).." (separate last normal read)",
+            "Orb runner: initialized="..factFlag(runner.initialized).." state="..factCode(runner.state,states)
+                .." running="..factFlag(runner.running).." receipt="..factFlag(runner.pending)
+                .." lifecycleObserved="..factFlag(runner.lifecycleObserved).." ownerEpoch="..factCount(runner.epoch)
+                .." (session memory only; IDLE is not choice absence)",
+        }
+    end
+end
 local function readinessLines()
     local view = accessorFacts("OrbRuntime", "ReadinessView", READINESS_KEYS)
     if not view or type(view.observed) ~= "boolean" then
@@ -1754,12 +1820,19 @@ function M.Step(job)
                 end
                 return out
             end},
+            {name = "choice-presence", build = function() return M.ChoicePresenceLines() end},
             {name = "orb", build = function()
                 local out = {"-- Orb history (diagnostic copy; it restores nothing) --"}
                 for _, line in ipairs(M.OrbLines()) do out[#out + 1] = line end
                 local runtime = Nexus.OrbRuntime
                 if not (runtime and type(runtime.RunLog) == "function") then
                     out[#out + 1] = "not available";return out
+                end
+                if type(runtime.RunnerView)=="function" then
+                    local runner=runtime.RunnerView()
+                    if type(runner)~="table" or runner.initialized~=true then
+                        out[#out+1]="session history not inspected (runtime not initialized)";return out
+                    end
                 end
                 local view = runtime.RunLog("current", 1, job.extended and 40 or 8)
                 if not view or not view.runId then
