@@ -296,4 +296,64 @@ K.Run({
         c(S.Toggles(H, R.echo) == 1 and H.disabled[R.echo] == false,
             'prompt_overwrite_interleaved the original valid Yes configures the current required Tome once')
     end},
+    {id = 'prompt_exception_cleanup', fn = function(c)
+        for _, inject in ipairs({false, true}) do
+            local R = S.Lever(1, 'Exception Review Echo', true, true)
+            local H, A = S.Fixture({levers = {R}})
+            c(S.Assign(H, A, 'Exception review plan', {R}),
+                'prompt_exception_cleanup reached: Wishlist assigned')
+            S.ResetToLevel1(H); H.Advance(1, .05)
+            c(H.popup and H.popup.which == 'NEXUS_LEVEL1_AUTO_TOMES' and not Auto(),
+                'prompt_exception_cleanup reached: bound Auto-OFF prompt open')
+            if inject then
+                local original = Nexus.OverwriteWarning.RequestAuto
+                local sentinel = 'Synthetic RequestAuto fault'
+                local calls = 0
+                c(type(original) == 'function',
+                    'prompt_exception_cleanup reached: real RequestAuto seam exists')
+                Nexus.OverwriteWarning.RequestAuto = function()
+                    calls = calls + 1
+                    error(sentinel, 0)
+                end
+                local ok, err = pcall(H.AcceptPopup)
+                Nexus.OverwriteWarning.RequestAuto = original
+                c(calls == 1,
+                    'prompt_exception_cleanup reached: accept reached the RequestAuto seam')
+                c(not ok and err == sentinel,
+                    'prompt_exception_cleanup the original request exception value is preserved exactly')
+            end
+            Nexus.MainInternals.StoreAuthorityOwner.UpdateSettingsV1('autoDisable', false)
+            H.Notify()
+            -- Generic Auto is allowed without Tome permission. Exercise its
+            -- real update path on an empty board before checking side effects.
+            c(Nexus.Store.Settings().autoDisable == false
+                and #(H.perks.currentChoice or {}) == 0 and H.disabled[R.echo] == true,
+                'prompt_exception_cleanup reached: empty board and required Tome disabled without permission')
+            local polls, selectPerk = Nexus.RecomputeStats().polls, H.service.SelectPerk
+            c(type(polls) == 'number' and type(selectPerk) == 'function',
+                'prompt_exception_cleanup reached: real poll counter and Select seam exist')
+            local selects = 0
+            H.service.SelectPerk = function(...)
+                selects = selects + 1
+                return selectPerk(...)
+            end
+            local actions, sent = #H.actions, #H.sent
+            SlashCmdList.NEXUS('auto')
+            c(Auto(), inject
+                and 'prompt_exception_cleanup a failed prompt request does not bind a fresh generic Auto request'
+                or 'prompt_exception_cleanup generic Auto remains available without Tome permission')
+            local started = H.now
+            H.Advance(1, .05)
+            H.service.SelectPerk = selectPerk
+            c(H.now >= started + 1 - 1e-8 and Nexus.RecomputeStats().polls > polls,
+                'prompt_exception_cleanup reached: real automation polls ran during the bounded tick window')
+            c(Auto() and Nexus.Store.Settings().autoDisable == false,
+                'prompt_exception_cleanup generic Auto stays enabled without granting Tome permission')
+            c(#H.trace == 0 and H.disabled[R.echo] == true,
+                'prompt_exception_cleanup no Tome request or mirror change occurs without permission during ticks')
+            c(selects == 0, 'prompt_exception_cleanup empty-board ticks send no Select request')
+            c(#H.actions == actions, 'prompt_exception_cleanup empty-board ticks send no game mutation')
+            c(#H.sent == sent, 'prompt_exception_cleanup generic Auto and empty-board ticks send no network message')
+        end
+    end},
 }, rawget(_G, 'arg'))
