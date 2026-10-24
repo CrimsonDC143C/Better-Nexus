@@ -991,15 +991,32 @@ local function Signature(summary)
     return table.concat(parts, "|")
 end
 
+-- No Ebonhold tracker or objectives API: there is nothing to mirror. The
+-- scanner must not walk the UI or rebuild the HUD on that path. A full panel
+-- refresh from this frame changes how many startup slices fit in one
+-- profiler tick, and that moves later sync request IDs.
+local function CallboardSourcePresent()
+    if type(_G.EbonholdQuestTracker) == "table" then return true end
+    if type(_G.ProjectEbonholdQuestTracker) == "table" then return true end
+    if type(_G.ObjectiveTrackerFrame) == "table" then return true end
+    if type(_G.ProjectEbonhold) == "table" then return true end
+    local api = _G.EbonAPI
+    return type(api) == "table" and type(api.Ebonhold) == "table"
+end
+
 local function RefreshNow()
     local summary = BuildSummary()
     local sig = Signature(summary)
-    if sig ~= cachedSignature then
-        cachedSignature = sig
-        cachedSummary = summary
-        if Nexus.Panel and Nexus.Panel.Refresh then
-            pcall(Nexus.Panel.Refresh)
-        end
+    if sig == cachedSignature then return end
+    local previous = cachedSummary
+    cachedSignature = sig
+    cachedSummary = summary
+    -- Filling the empty cache is not a panel change. Rebuilding the HUD here
+    -- is what shifts a profiler-budgeted sync send by one frame.
+    local wasObserved = type(previous) == "table" and previous.observed == true
+    if not summary.observed and not wasObserved then return end
+    if Nexus.Panel and Nexus.Panel.Refresh then
+        pcall(Nexus.Panel.Refresh)
     end
 end
 
@@ -1041,6 +1058,7 @@ function M.Init()
     scanner:RegisterEvent("QUEST_LOG_UPDATE")
     scanner:RegisterEvent("UNIT_QUEST_LOG_CHANGED")
     scanner:SetScript("OnEvent", function(_, event)
+        if not CallboardSourcePresent() and not remembered then return end
         EnsureEbonholdHooks()
         cachedSignature = ""
         fastPollRemaining = math.max(fastPollRemaining, 10)
@@ -1057,6 +1075,7 @@ function M.Init()
         RefreshNow()
     end)
     scanner:SetScript("OnUpdate", function(_, dt)
+        if not CallboardSourcePresent() and not remembered then return end
         elapsed = elapsed + (tonumber(dt) or 0)
         local interval = fastPollRemaining > 0 and 0.2 or 1.0
         if elapsed < interval then return end
